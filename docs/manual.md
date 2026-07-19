@@ -8,7 +8,8 @@ This manual walks through everyday use. For installing and running the app, see
 the [README](../README.md).
 
 The screenshots below show the phone layout. On a wider screen the same controls
-sit side by side, but everything works the same way.
+sit side by side, but everything works the same way — see
+[Desktop layout](#desktop-layout) for how the pages reflow.
 
 ## Contents
 
@@ -23,6 +24,7 @@ sit side by side, but everything works the same way.
 - [Temperature history](#temperature-history)
 - [Settings](#settings)
 - [Home Assistant](#home-assistant)
+- [Desktop layout](#desktop-layout)
 - [Troubleshooting](#troubleshooting)
 
 ## Opening the app
@@ -223,6 +225,28 @@ bridge off, use **Disable MQTT**.
 If the app has no password set, this section shows a warning: anyone on your
 network can change these broker settings. Set a password first if that matters
 to you.
+
+## Desktop layout
+
+On a computer or tablet, HearthMage uses the full width of the window. Every
+control is the same as on the phone — rooms sit side by side, and forms spread
+into columns — so anything in this manual applies to both.
+
+The rooms screen lays the cards out in a grid:
+
+![The rooms screen on desktop, cards side by side](images/desktop-rooms.png)
+
+Settings arranges its fields into two columns:
+
+![The settings page on desktop with two-column fields](images/desktop-settings.png)
+
+The weekly schedule and its pattern builder:
+
+![The schedule page on desktop](images/desktop-schedule.png)
+
+Energy, with the daily and monthly bars:
+
+![The energy page on desktop](images/desktop-energy.png)
 
 ## Troubleshooting
 
