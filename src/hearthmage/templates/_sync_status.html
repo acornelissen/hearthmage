@@ -1,0 +1,13 @@
+<div id="sync-status" class="sync sync-{{ sync or 'idle' }}"
+     role="{{ 'alert' if sync == 'failed' else 'status' }}" aria-live="{{ 'assertive' if sync == 'failed' else 'polite' }}"
+     {% if sync == 'pending' %}hx-get="/zones/{{ zone_id }}/schedule/sync"
+     hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+  {% if sync == 'pending' %}
+    <span class="sync-dot" aria-hidden="true"></span> Applying to the hub&hellip;
+  {% elif sync == 'synced' %}
+    <span class="sync-dot" aria-hidden="true"></span> Sent to the hub
+  {% elif sync == 'failed' %}
+    <span class="sync-dot" aria-hidden="true"></span>
+    Saved here, but the radiator didn&rsquo;t answer. It&rsquo;ll need re-applying while awake.
+  {% endif %}
+</div>

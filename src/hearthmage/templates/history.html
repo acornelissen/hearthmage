@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#faf4ec" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#14110e" media="(prefers-color-scheme: dark)">
+  <title>History · HearthMage</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 2c1 4-2 5-2 8a2 2 0 1 0 4 0c2 2 3 3 3 6a5 5 0 1 1-10 0c0-5 5-6 5-14z" fill="currentColor"/></svg>
+        </span>
+        <span class="brand-text">
+          <span class="brand-name">HearthMage</span>
+          <span class="brand-sub">History</span>
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <a class="back" href="/">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+      Back to rooms
+    </a>
+
+    <div class="page-head">
+      <h1 class="page-title">Temperature history</h1>
+      <p class="page-sub">Room temperature over time, recorded from the poller.
+        For energy history see the Energy page.</p>
+    </div>
+
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+
+    {% for z in zones %}
+    <section class="panel">
+      <h2 class="panel-title">{{ z.name }}</h2>
+      {% if z.points %}
+      <p class="summary">Now {{ '%.1f'|format(z.latest) }}&deg;C
+        <span class="sep" aria-hidden="true">&middot;</span>
+        range {{ '%.1f'|format(z.low) }}&ndash;{{ '%.1f'|format(z.high) }}&deg;C
+        <span class="sep" aria-hidden="true">&middot;</span>
+        {{ z.count }} readings</p>
+      <svg class="sparkline" viewBox="0 0 320 64" preserveAspectRatio="none"
+           role="img" aria-label="Temperature trend for {{ z.name }}">
+        <polyline points="{{ z.points }}" fill="none" stroke="currentColor"
+                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      {% else %}
+      <p class="panel-note muted">Not enough readings yet. Come back once the poller
+        has collected a few.</p>
+      {% endif %}
+    </section>
+    {% endfor %}
+  </main>
+</body>
+</html>

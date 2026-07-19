@@ -1,0 +1,27 @@
+{% if hubs %}
+<p class="discover-found">
+  Found {{ hubs|length }} hub{{ '' if hubs|length == 1 else 's' }} on your network:
+</p>
+<ul class="discover-list">
+  {% for h in hubs %}
+  <li class="discover-hub">
+    <div class="discover-id">
+      <span class="discover-ip">{{ h.ip }}</span>
+      {% if h.idu %}<span class="discover-idu">IDU {{ h.idu }}</span>{% endif %}
+    </div>
+    <form method="post" action="/settings/hub">
+      <input type="hidden" name="hub_ip" value="{{ h.ip }}">
+      <button type="submit" class="btn">Use this hub</button>
+    </form>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="discover-none">No hub found on this network. Enter the IP manually below.</p>
+{% endif %}
+<button type="button" class="btn btn-ghost btn-sm"
+        hx-get="/settings/discover" hx-target="#discover" hx-swap="innerHTML"
+        hx-indicator="#discover">
+  <span class="scan-label">Scan again</span>
+  <span class="scan-busy">Scanning&hellip;</span>
+</button>

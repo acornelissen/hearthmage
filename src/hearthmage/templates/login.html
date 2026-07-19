@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#faf4ec" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#14110e" media="(prefers-color-scheme: dark)">
+  <title>Sign in · HearthMage</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 2c1 4-2 5-2 8a2 2 0 1 0 4 0c2 2 3 3 3 6a5 5 0 1 1-10 0c0-5 5-6 5-14z" fill="currentColor"/></svg>
+        </span>
+        <span class="brand-text">
+          <span class="brand-name">HearthMage</span>
+          <span class="brand-sub">Sign in</span>
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div class="page-head">
+      <h1 class="page-title">Sign in</h1>
+      <p class="page-sub">Enter the password to control the heating.</p>
+    </div>
+
+    <section class="panel">
+      {% if error %}<p class="error" role="alert">Wrong password. Try again.</p>{% endif %}
+      <form method="post" action="/login">
+        <div class="field">
+          <label class="field-label" for="password">Password</label>
+          <input class="field-input" id="password" name="password" type="password"
+                 autocomplete="current-password" required autofocus>
+        </div>
+        <button type="submit" class="btn">Sign in</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

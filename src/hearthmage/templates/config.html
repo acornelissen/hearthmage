@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#faf4ec" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#14110e" media="(prefers-color-scheme: dark)">
+  <title>{{ zone_name }} settings · HearthMage</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 2c1 4-2 5-2 8a2 2 0 1 0 4 0c2 2 3 3 3 6a5 5 0 1 1-10 0c0-5 5-6 5-14z" fill="currentColor"/></svg>
+        </span>
+        <span class="brand-text">
+          <span class="brand-name">HearthMage</span>
+          <span class="brand-sub">Radiator settings</span>
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <a class="back" href="/">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+      Back to rooms
+    </a>
+
+    <div class="page-head">
+      <h1 class="page-title">{{ zone_name }}</h1>
+      <p class="page-sub">Per-radiator settings on the hub. These change the
+        radiator itself, so you rarely need to touch them.</p>
+    </div>
+
+    {% if saved %}<p class="ok" role="status">Saved to the radiator.</p>{% endif %}
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+
+    {% if config is none %}
+    <section class="panel">
+      <p class="panel-note muted">This radiator isn&rsquo;t answering right now, so its
+        settings can&rsquo;t be read. It may be asleep &mdash; try again shortly.</p>
+    </section>
+    {% else %}
+    <section class="panel">
+      <form method="post" action="/zones/{{ zone_id }}/config">
+        <div class="field field-check">
+          <label>
+            <input type="checkbox" name="keypad_lock" value="1"
+                   {% if config.keypad_lock %}checked{% endif %}>
+            Lock the keypad on the radiator
+          </label>
+          <p class="hint">Stops the buttons on the radiator itself from changing anything.</p>
+        </div>
+
+        <div class="field field-check">
+          <label>
+            <input type="checkbox" name="window_sensor" value="1"
+                   {% if config.window_sensor %}checked{% endif %}>
+            Open-window detection
+          </label>
+          <p class="hint">The radiator pauses heating when it senses a sudden temperature drop.</p>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="offset">Temperature offset calibration</label>
+          <input class="field-input" id="offset" name="offset" type="number"
+                 min="0" max="{{ offset_max }}" step="1" inputmode="numeric"
+                 value="{{ config.offset if config.offset is not none else 7 }}">
+          <p class="hint">Corrects the radiator&rsquo;s own thermometer (0&ndash;{{ offset_max }};
+            a typical default is 7). Adjust only if the room reading is consistently off.</p>
+        </div>
+
+        <button type="submit" class="btn">Save to radiator</button>
+      </form>
+    </section>
+    {% endif %}
+  </main>
+</body>
+</html>

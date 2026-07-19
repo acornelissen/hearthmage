@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#faf4ec" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#14110e" media="(prefers-color-scheme: dark)">
+  <title>Settings · HearthMage</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 2c1 4-2 5-2 8a2 2 0 1 0 4 0c2 2 3 3 3 6a5 5 0 1 1-10 0c0-5 5-6 5-14z" fill="currentColor"/></svg>
+        </span>
+        <span class="brand-text">
+          <span class="brand-name">HearthMage</span>
+          <span class="brand-sub">Settings</span>
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <a class="back" href="/">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+      Back to rooms
+    </a>
+
+    <div class="page-head">
+      <h1 class="page-title">Settings</h1>
+      <p class="page-sub">Point HearthMage at your hub and name your rooms.</p>
+    </div>
+
+    <section class="panel">
+      <h2 class="panel-title">Hub connection</h2>
+      <p class="panel-note">Where HearthMage reaches your heating hub on the network.</p>
+
+      <div id="discover" class="discover">
+        <button type="button" class="btn btn-ghost"
+                hx-get="/settings/discover" hx-target="#discover" hx-swap="innerHTML"
+                hx-indicator="#discover"
+                {% if not hub_ip %}hx-trigger="load, click"{% endif %}>
+          <span class="scan-label">Scan network for hub</span>
+          <span class="scan-busy">Scanning your network&hellip;</span>
+        </button>
+      </div>
+
+      <form method="post" action="/settings/hub">
+        <div class="field-grid two">
+          <div class="field">
+            <label class="field-label" for="hub_ip">Hub IP address</label>
+            <input class="field-input" id="hub_ip" name="hub_ip" value="{{ hub_ip or '' }}"
+                   placeholder="10.0.0.20" inputmode="decimal" required
+                   {% if not hub_ip %}autofocus{% endif %}>
+          </div>
+          <div class="field">
+            <label class="field-label" for="hub_port">Port</label>
+            <input class="field-input" id="hub_port" name="hub_port" type="number"
+                   value="{{ hub_port }}" min="1" max="65535">
+          </div>
+        </div>
+        <button type="submit" class="btn">Save hub</button>
+        {% if not hub_ip %}
+        <p class="hint">Enter your Nexho hub&rsquo;s IP to get started. It answers on UDP
+          6653 &mdash; find it in your router&rsquo;s device list, and reserve a static
+          lease so it doesn&rsquo;t change.</p>
+        {% endif %}
+      </form>
+    </section>
+
+    {% if rooms %}
+    <section class="panel">
+      <h2 class="panel-title">Room names</h2>
+      <p class="panel-note">Give each zone a name you&rsquo;ll recognise.</p>
+      <form method="post" action="/settings/names">
+        <div class="field-grid">
+          {% for room in rooms %}
+          <div class="field">
+            <label class="field-label" for="name_{{ room.id }}">Zone {{ room.id }}</label>
+            <input class="field-input" id="name_{{ room.id }}" name="name_{{ room.id }}"
+                   value="{{ room.name }}" placeholder="Zone {{ room.id }}">
+          </div>
+          {% endfor %}
+        </div>
+        <button type="submit" class="btn">Save names</button>
+        <p class="hint">Leave a name blank to reset it to &ldquo;Zone N&rdquo;.</p>
+      </form>
+    </section>
+    {% endif %}
+
+    <section class="panel">
+      <h2 class="panel-title">Home Assistant (MQTT)</h2>
+      <p class="panel-note">Publish every zone to Home Assistant as a climate entity
+        through an MQTT broker. Leave the host blank to keep the bridge off.</p>
+      {% if not auth_enabled %}
+      <p class="hint" role="note">This UI has no password set, so anyone on your
+        network can change these broker settings. Set
+        <code>HEARTHMAGE_PASSWORD</code> to lock the UI first if that matters here.</p>
+      {% endif %}
+      <form method="post" action="/settings/mqtt">
+        <div class="field-grid two">
+          <div class="field">
+            <label class="field-label" for="mqtt_host">Broker host</label>
+            <input class="field-input" id="mqtt_host" name="host"
+                   value="{{ mqtt_host or '' }}" placeholder="10.0.0.5" required>
+          </div>
+          <div class="field">
+            <label class="field-label" for="mqtt_port">Port</label>
+            <input class="field-input" id="mqtt_port" name="port" type="number"
+                   value="{{ mqtt_port or 1883 }}" min="1" max="65535">
+          </div>
+          <div class="field">
+            <label class="field-label" for="mqtt_username">Username</label>
+            <input class="field-input" id="mqtt_username" name="username"
+                   value="{{ mqtt_username or '' }}" autocomplete="off">
+          </div>
+          <div class="field">
+            <label class="field-label" for="mqtt_password">Password</label>
+            <input class="field-input" id="mqtt_password" name="password"
+                   type="password" autocomplete="off"
+                   placeholder="{% if mqtt_password_set %}(set) leave blank to keep{% else %}Broker password{% endif %}">
+          </div>
+          <div class="field">
+            <label class="field-label" for="mqtt_base_topic">Base topic</label>
+            <input class="field-input" id="mqtt_base_topic" name="base_topic"
+                   value="{{ mqtt_base_topic or 'hearthmage' }}">
+          </div>
+        </div>
+        {% if mqtt_password_set %}
+        <div class="field">
+          <label class="field-label" for="mqtt_clear_password">
+            <input id="mqtt_clear_password" name="clear_password" type="checkbox" value="1">
+            Remove the stored broker password
+          </label>
+        </div>
+        {% endif %}
+        <button type="submit" class="btn">Save MQTT</button>
+      </form>
+      {% if mqtt_enabled %}
+      <form method="post" action="/settings/mqtt/disable">
+        <button type="submit" class="btn btn-ghost">Disable MQTT</button>
+        <p class="hint">Disabling removes the broker settings, including the
+          stored password, and stops the bridge.</p>
+      </form>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">Backup &amp; restore</h2>
+      <p class="panel-note">Your schedules live only here &mdash; the hub can&rsquo;t give
+        them back. Export a copy and keep it somewhere safe. HearthMage also snapshots
+        every change automatically.</p>
+
+      <a class="btn" href="/settings/export" download>Export backup</a>
+
+      <form method="post" action="/settings/import" enctype="multipart/form-data" class="restore-form">
+        {% if import_error %}
+        <p class="hint" role="alert">{{ import_error }}</p>
+        {% endif %}
+        <div class="field">
+          <label class="field-label" for="backup">Restore from a backup file</label>
+          <input class="field-input" id="backup" name="backup" type="file" accept="application/json,.json" required>
+        </div>
+        <button type="submit" class="btn btn-ghost">Restore</button>
+        <p class="hint">Restoring overwrites your current hub settings and schedules.
+          The replaced files are snapshotted first, so this can be undone.</p>
+      </form>
+    </section>
+
+    {% if auth_enabled %}
+    <section class="panel">
+      <h2 class="panel-title">Session</h2>
+      <p class="panel-note">You are signed in.</p>
+      <form method="post" action="/logout">
+        <button type="submit" class="btn btn-ghost">Sign out</button>
+      </form>
+    </section>
+    {% endif %}
+  </main>
+</body>
+</html>

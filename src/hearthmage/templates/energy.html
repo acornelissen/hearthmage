@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#faf4ec" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#14110e" media="(prefers-color-scheme: dark)">
+  <title>Energy · HearthMage</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 2c1 4-2 5-2 8a2 2 0 1 0 4 0c2 2 3 3 3 6a5 5 0 1 1-10 0c0-5 5-6 5-14z" fill="currentColor"/></svg>
+        </span>
+        <span class="brand-text">
+          <span class="brand-name">HearthMage</span>
+          <span class="brand-sub">Energy</span>
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <a class="back" href="/">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+      Back to rooms
+    </a>
+
+    <div class="page-head">
+      <h1 class="page-title">Energy</h1>
+      <p class="page-sub">Estimated consumption per radiator. Readings update in the
+        background as radiators wake, so figures may lag.</p>
+    </div>
+
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+
+    <section class="panel">
+      <h2 class="panel-title">Whole home</h2>
+      <p class="summary">Today {{ '%.1f'|format(home_today_kwh) }}&nbsp;kWh
+        {% if price %}({{ '%.2f'|format(home_today_cost) }}){% endif %}
+        <span class="sep" aria-hidden="true">&middot;</span>
+        Last 7 days {{ '%.1f'|format(home_week_kwh) }}&nbsp;kWh
+        {% if price %}({{ '%.2f'|format(home_week_cost) }}){% endif %}</p>
+    </section>
+
+    {% for z in zones %}
+    <section class="panel">
+      <h2 class="panel-title">{{ z.name }}</h2>
+      {% if not z.has_data %}
+      <p class="panel-note muted">No energy reading yet. This radiator may be asleep;
+        check back shortly.</p>
+      {% else %}
+      <p class="summary">Today {{ '%.1f'|format(z.today_kwh) }}&nbsp;kWh
+        {% if price %}({{ '%.2f'|format(z.today_cost) }}){% endif %}
+        <span class="sep" aria-hidden="true">&middot;</span>
+        7 days {{ '%.1f'|format(z.week_kwh) }}&nbsp;kWh
+        {% if price %}({{ '%.2f'|format(z.week_cost) }}){% endif %}
+        <span class="sep" aria-hidden="true">&middot;</span>
+        {{ z.rated_watts }}&nbsp;W</p>
+
+      {% set day_max = (z.days | max) or 1 %}
+      <h3 class="panel-note">Daily (kWh)</h3>
+      <ul class="bars" aria-label="Daily energy for {{ z.name }}">
+        {% for kwh in z.days %}
+        <li class="bar-row">
+          <span class="bar-label">{% if loop.first %}Today{% else %}-{{ loop.index0 }}d{% endif %}</span>
+          <span class="bar-track" aria-hidden="true">
+            <span class="bar-fill" style="width: {{ '%.0f'|format(kwh / day_max * 100) }}%"></span>
+          </span>
+          <span class="bar-value">{{ '%.1f'|format(kwh) }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+
+      {% set mon_max = (z.months | max) or 1 %}
+      <h3 class="panel-note">Monthly (kWh)</h3>
+      <ul class="bars" aria-label="Monthly energy for {{ z.name }}">
+        {% for kwh in z.months %}
+        <li class="bar-row">
+          <span class="bar-label">{% if loop.first %}This{% else %}-{{ loop.index0 }}mo{% endif %}</span>
+          <span class="bar-track" aria-hidden="true">
+            <span class="bar-fill" style="width: {{ '%.0f'|format(kwh / mon_max * 100) }}%"></span>
+          </span>
+          <span class="bar-value">{{ '%.1f'|format(kwh) }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% if z.fetched_at %}<p class="hint">Last read {{ z.fetched_at }}</p>{% endif %}
+      {% endif %}
+    </section>
+    {% endfor %}
+
+    <section class="panel">
+      <h2 class="panel-title">Unit price</h2>
+      <p class="panel-note">Your electricity price per kWh, for the cost estimates above.</p>
+      <form method="post" action="/settings/price">
+        <div class="field">
+          <label class="field-label" for="price_per_kwh">Price per kWh</label>
+          <input class="field-input" id="price_per_kwh" name="price_per_kwh" type="number"
+                 step="0.01" min="0" inputmode="decimal" value="{{ '%.2f'|format(price) }}">
+        </div>
+        <button type="submit" class="btn">Save price</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,0 +1,22 @@
+[Unit]
+Description=HearthMage local heating control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hearthmage
+Group=hearthmage
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/hearthmage
+WorkingDirectory=/opt/hearthmage
+EnvironmentFile=/opt/hearthmage/.env
+ExecStart=/opt/hearthmage/.venv/bin/python run.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

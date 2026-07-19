@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+.superpowers/
+*.egg-info/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+
+# Ralph loop local state (not shared)
+.claude/ralph-loop.local.md
+
+# Agent and dev tooling (kept local, not published)
+.beads/
+.claude/
+.agents/
+AGENTS.md
+docs/superpowers/
+
+# Project instructions for AI agents (kept local)
+CLAUDE.md

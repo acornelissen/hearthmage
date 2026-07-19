@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent for HearthMage local heating control.
+
+  This is a per-user agent: it runs as your login account and reads the config
+  under ~/.config/hearthmage, so no root and no dedicated service user. Use
+  this on the Mac host (the systemd unit in this directory is for a Linux box).
+
+  Paths below are absolute and host-specific. Replace /Users/albert and the
+  project directory with yours, then install (see README, "Deploy on macoS").
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.hearthmage</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/albert/Development/hearthmage/.venv/bin/python</string>
+        <string>/Users/albert/Development/hearthmage/run.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/albert/Development/hearthmage</string>
+
+    <!-- Start at login and keep it running; restart if it exits. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Config lives in ~/.config/hearthmage/config.json by default; override
+         the hub or bind here only if you are not using the config file. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HEARTHMAGE_BIND</key>
+        <string>0.0.0.0</string>
+        <key>HEARTHMAGE_PORT</key>
+        <string>8080</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/albert/Library/Logs/hearthmage.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/albert/Library/Logs/hearthmage.err.log</string>
+</dict>
+</plist>

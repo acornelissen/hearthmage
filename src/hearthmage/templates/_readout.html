@@ -1,0 +1,50 @@
+<div id="readout-{{ room_id }}" class="readout"
+     hx-get="/rooms/{{ room_id }}/status" hx-trigger="every 4s" hx-swap="outerHTML"
+     {% if room is none or room.status == "loading" %}aria-busy="true"{% endif %}>
+  {% set zone_error = error or (room.error if room else None) %}
+  {% if zone_error %}<p class="zone-error" role="alert">{{ zone_error }}</p>{% endif %}
+
+  {% if room is none or room.status == "loading" %}
+    <div class="reading reading--loading">
+      <span class="temp-big skeleton" aria-hidden="true">--</span>
+      <p class="summary">Reading the room&hellip;</p>
+    </div>
+  {% elif room.status == "unreachable" %}
+    <div class="reading reading--off">
+      <span class="state-chip state-chip--off">Off / not responding</span>
+      <p class="summary muted">This zone isn&rsquo;t answering right now.</p>
+    </div>
+  {% else %}
+    {% set span = (room.max_temp - room.min_temp) or 1 %}
+    {% set cur_raw = ((room.current_temp - room.min_temp) / span * 100) if room.current_temp is not none else 0 %}
+    {% set tgt_raw = ((room.target_temp - room.min_temp) / span * 100) if room.target_temp is not none else 0 %}
+    {% set cur_pct = [[cur_raw, 0]|max, 100]|min %}
+    {% set tgt_pct = [[tgt_raw, 0]|max, 100]|min %}
+    {% set diff = (room.current_temp - room.target_temp)
+                  if (room.current_temp is not none and room.target_temp is not none) else none %}
+    <div class="reading">
+      <div class="reading-head">
+        <span class="temp-big">{{ '%.1f'|format(room.current_temp) if room.current_temp is not none else '--' }}<span class="deg">&deg;</span></span>
+        {% if room.is_off %}
+          <span class="state-chip state-chip--off">Off</span>
+        {% elif diff is not none and diff < -0.5 %}
+          <span class="state-chip state-chip--heating">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2c1 4-2 5-2 8a2 2 0 1 0 4 0c2 2 3 3 3 6a5 5 0 1 1-10 0c0-5 5-6 5-14z" fill="currentColor"/></svg>
+            Heating
+          </span>
+        {% elif diff is not none and diff > 0.5 %}
+          <span class="state-chip state-chip--off">Idle</span>
+        {% else %}
+          <span class="state-chip state-chip--comfort">At target</span>
+        {% endif %}
+      </div>
+
+      <div class="track" aria-hidden="true">
+        <div class="track-fill" style="width: {{ '%.1f'|format(cur_pct) }}%"></div>
+        <span class="track-target" style="left: {{ '%.1f'|format(tgt_pct) }}%"></span>
+      </div>
+
+      <p class="summary">Now {{ '%.1f'|format(room.current_temp) if room.current_temp is not none else '--' }}&deg;C<span class="sep" aria-hidden="true">&middot;</span><span class="tgt">{% if room.is_off %}Off{% else %}Target {{ '%.1f'|format(room.target_temp) if room.target_temp is not none else '--' }}&deg;C{% endif %}</span></p>
+    </div>
+  {% endif %}
+</div>
