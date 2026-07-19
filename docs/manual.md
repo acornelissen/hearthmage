@@ -7,9 +7,9 @@ over your home network, with no cloud account and nothing leaving the house.
 This manual walks through everyday use. For installing and running the app, see
 the [README](../README.md).
 
-The screenshots below show the phone layout. On a wider screen the same controls
-sit side by side, but everything works the same way — see
-[Desktop layout](#desktop-layout) for how the pages reflow.
+Each screen is shown twice: the phone layout on the left and the desktop layout
+on the right. The controls are identical; only the arrangement changes — on a
+wider window the cards sit side by side and forms spread into columns.
 
 ## Contents
 
@@ -24,7 +24,6 @@ sit side by side, but everything works the same way — see
 - [Temperature history](#temperature-history)
 - [Settings](#settings)
 - [Home Assistant](#home-assistant)
-- [Desktop layout](#desktop-layout)
 - [Troubleshooting](#troubleshooting)
 
 ## Opening the app
@@ -44,14 +43,24 @@ If no password is set, the app opens straight to your rooms with no sign-in.
 This is fine on a trusted home network; if you want a password, see
 [Settings](#settings) and the README.
 
-<img src="images/login.png" alt="The sign-in screen with a password field" width="300">
+<table>
+<tr valign="top">
+<td><img src="images/login.png" alt="The sign-in screen on a phone" width="240"></td>
+<td><img src="images/desktop-login.png" alt="The sign-in screen on desktop" width="500"></td>
+</tr>
+</table>
 
 ## The rooms screen
 
 This is the home screen. Each room (the hub calls them zones) is a card showing
 its current temperature, a coloured bar, and a heating status.
 
-<img src="images/rooms.png" alt="The rooms screen with two room cards" width="300">
+<table>
+<tr valign="top">
+<td><img src="images/rooms.png" alt="The rooms screen on a phone" width="240"></td>
+<td><img src="images/desktop-rooms.png" alt="The rooms screen on desktop, cards side by side" width="500"></td>
+</tr>
+</table>
 
 Reading a card:
 
@@ -90,7 +99,12 @@ radiator responds.
 A schedule sets different temperatures at different times of day, repeating every
 week. Open it from a room card's **Schedule** link.
 
-<img src="images/schedule.png" alt="The weekly schedule screen showing days and a pattern builder" width="300">
+<table>
+<tr valign="top">
+<td><img src="images/schedule.png" alt="The weekly schedule on a phone" width="240"></td>
+<td><img src="images/desktop-schedule.png" alt="The weekly schedule on desktop" width="500"></td>
+</tr>
+</table>
 
 The list at the top shows each day of the week and whether it has a program. To
 create or change one, use **New pattern**:
@@ -130,7 +144,12 @@ temperature until a date you choose.
 Each room card's **Settings** link opens per-radiator options. These change the
 radiator hardware itself, so you rarely need them.
 
-<img src="images/radiator-settings.png" alt="Per-radiator settings: keypad lock, window detection, offset" width="300">
+<table>
+<tr valign="top">
+<td><img src="images/radiator-settings.png" alt="Per-radiator settings on a phone" width="240"></td>
+<td><img src="images/desktop-config.png" alt="Per-radiator settings on desktop" width="500"></td>
+</tr>
+</table>
 
 - **Lock the keypad on the radiator** — stops the buttons on the radiator from
   changing anything, useful in a rental or a child's room.
@@ -147,7 +166,12 @@ Tap **Save to radiator** to apply.
 The **Energy** page (lightning icon in the top bar) estimates how much
 electricity each radiator has used.
 
-<img src="images/energy.png" alt="The energy page with daily and monthly usage bars" width="300">
+<table>
+<tr valign="top">
+<td><img src="images/energy.png" alt="The energy page on a phone" width="240"></td>
+<td><img src="images/desktop-energy.png" alt="The energy page on desktop" width="500"></td>
+</tr>
+</table>
 
 - **Whole home** sums today and the last seven days across all radiators.
 - Each room shows **Daily** bars (today and the previous seven days) and
@@ -167,7 +191,12 @@ figure that lags. It catches up on its own.
 The **History** page (chart icon in the top bar) draws each room's temperature
 over time, so you can see how it has tracked through the day.
 
-<img src="images/history.png" alt="The history page with a temperature sparkline per room" width="300">
+<table>
+<tr valign="top">
+<td><img src="images/history.png" alt="The history page on a phone" width="240"></td>
+<td><img src="images/desktop-history.png" alt="The history page on desktop" width="500"></td>
+</tr>
+</table>
 
 Each room shows its current reading, the range (low to high) over the recorded
 period, how many readings there are, and a line chart. History builds up while
@@ -179,7 +208,12 @@ has been watching for a while.
 The **Settings** page (gear icon) is where you connect to the hub, name rooms,
 set up Home Assistant, and manage backups.
 
-<img src="images/settings.png" alt="The settings page: hub connection, room names, MQTT, backup" width="300">
+<table>
+<tr valign="top">
+<td><img src="images/settings.png" alt="The settings page on a phone" width="240"></td>
+<td><img src="images/desktop-settings.png" alt="The settings page on desktop with two-column fields" width="500"></td>
+</tr>
+</table>
 
 **Hub connection.** HearthMage can scan your network and offer any hub it finds
 ("Found 1 hub on your network") — tap **Use this hub**. Or enter the hub's IP
@@ -225,28 +259,6 @@ bridge off, use **Disable MQTT**.
 If the app has no password set, this section shows a warning: anyone on your
 network can change these broker settings. Set a password first if that matters
 to you.
-
-## Desktop layout
-
-On a computer or tablet, HearthMage uses the full width of the window. Every
-control is the same as on the phone — rooms sit side by side, and forms spread
-into columns — so anything in this manual applies to both.
-
-The rooms screen lays the cards out in a grid:
-
-![The rooms screen on desktop, cards side by side](images/desktop-rooms.png)
-
-Settings arranges its fields into two columns:
-
-![The settings page on desktop with two-column fields](images/desktop-settings.png)
-
-The weekly schedule and its pattern builder:
-
-![The schedule page on desktop](images/desktop-schedule.png)
-
-Energy, with the daily and monthly bars:
-
-![The energy page on desktop](images/desktop-energy.png)
 
 ## Troubleshooting
 
