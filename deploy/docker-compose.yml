@@ -19,11 +19,12 @@ services:
     network_mode: host
     restart: unless-stopped
     volumes:
-      # Persistent state: config, schedules, history.db, backups. Created next
-      # to this compose file. The container runs as uid 10001, so this folder
-      # must be writable by that uid (on Synology: give it read/write, or
-      # chown 10001). To reuse an existing install, drop your config.json here.
-      - ./data:/data
+      # Persistent state: config, schedules, history.db, backups. A named volume
+      # (not a host folder) so Docker gives it the image's uid-10001 ownership
+      # automatically - no chown needed, which matters on a NAS. To move data in
+      # or out, use the app's Export / Restore backup buttons on the settings
+      # page rather than touching the volume directly.
+      - hearthmage-data:/data
     environment:
       # All optional. Uncomment and set as needed; these seed the config on
       # first run and are otherwise managed from the settings page.
@@ -34,3 +35,6 @@ services:
       # - HEARTHMAGE_MQTT_USERNAME=hearthmage
       # - HEARTHMAGE_MQTT_PASSWORD=secret
       - HEARTHMAGE_LOG_LEVEL=INFO
+
+volumes:
+  hearthmage-data:

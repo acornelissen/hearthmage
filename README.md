@@ -198,11 +198,12 @@ On a Synology NAS:
    the repo root.
 3. Start the project. Open `http://<nas-ip>:8080`.
 
-State (config, schedules, `history.db`, backups) lives in a `data/` folder
-next to the compose file, mounted at `/data`. The container runs as uid
-`10001`, so that folder must be writable by it — on Synology give the folder
-read/write, or `chown 10001 data`. To carry over an existing install, drop
-your `config.json` into `data/` before the first start.
+State (config, schedules, `history.db`, backups) lives in a named Docker
+volume (`hearthmage-data`) mounted at `/data`. A named volume inherits the
+image's uid-`10001` ownership automatically, so there is no folder to create
+or `chown` — this is what makes it painless on a NAS with no shell access. To
+move settings in or out, use the app's **Export** / **Restore** backup buttons
+on the settings page rather than touching the volume directly.
 
 Set a password and MQTT broker (and, if auto-discovery doesn't find the hub,
 a fixed `HEARTHMAGE_BASE_IP`) by uncommenting the `environment` entries in the
