@@ -1,0 +1,26 @@
+# Keep the build context small and free of local state and secrets.
+.git/
+.gitignore
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Local data and secrets never belong in an image.
+.env
+data/
+*.db
+
+# Tests and docs are not needed at runtime.
+tests/
+docs/
+README.md
+
+# Agent and dev tooling.
+.beads/
+.claude/
+.agents/
+AGENTS.md
+CLAUDE.md
+deploy/

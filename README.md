@@ -178,3 +178,31 @@ Then:
     sudo cp deploy/hearthmage.service /etc/systemd/system/
     sudo systemctl daemon-reload
     sudo systemctl enable --now hearthmage
+
+### Run on a NAS (Docker)
+
+`Dockerfile` and `deploy/docker-compose.yml` run HearthMage as a container.
+The compose file uses **host networking on purpose**: the app finds the hub by
+sweeping the LAN, which only works when the container shares the host's
+network. That also means no port mapping — the app listens on the host
+directly (default 8080; on Synology, DSM's own 5000/5001 don't clash).
+
+On a Synology NAS:
+
+1. Copy this repo to a shared folder on the NAS.
+2. In **Container Manager**, create a **Project** pointing at
+   `deploy/docker-compose.yml`. It builds the image from the `Dockerfile` at
+   the repo root.
+3. Start the project. Open `http://<nas-ip>:8080`.
+
+State (config, schedules, `history.db`, backups) lives in a `data/` folder
+next to the compose file, mounted at `/data`. The container runs as uid
+`10001`, so that folder must be writable by it — on Synology give the folder
+read/write, or `chown 10001 data`. To carry over an existing install, drop
+your `config.json` into `data/` before the first start.
+
+Set a password and MQTT broker (and, if auto-discovery doesn't find the hub,
+a fixed `HEARTHMAGE_BASE_IP`) by uncommenting the `environment` entries in the
+compose file. To build and run it anywhere Docker is present:
+
+    docker compose -f deploy/docker-compose.yml up -d --build
