@@ -9,6 +9,9 @@ worked out by observing the hub on the LAN and validated against real hardware.
 See `docs/nexho-protocol.md` for the wire protocol and how to confirm it against
 your own hub.
 
+**New here?** The [user manual](docs/manual.md) walks through every screen with
+screenshots.
+
 ## Security
 
 - **LAN-only.** The Nexho hub has no auth on its LAN interface. Never
