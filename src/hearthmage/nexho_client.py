@@ -38,6 +38,8 @@ _STALE_INTERVALS = 4
 
 _MIN_TEMP = 5.0
 _MAX_TEMP = 30.0
+# "Off" is sent as a 1 degree setpoint: *T0 did not reliably turn radiators off.
+_OFF_TEMP = 1.0
 
 
 class NexhoLocalClient:
@@ -227,7 +229,8 @@ class NexhoLocalClient:
             name=self._names.get(str(zone), f"Zone {zone}"),
             current_temp=current,
             target_temp=target,
-            is_off=(target == 0.0),  # a 0 setpoint means the heater is off
+            # 0 (*T0) or our 1 degree "off" setpoint both mean the heater is off
+            is_off=(target is not None and target <= _OFF_TEMP),
             min_temp=_MIN_TEMP,
             max_temp=_MAX_TEMP,
             status=status,
@@ -413,12 +416,12 @@ class NexhoLocalClient:
         zone = _zone_int(room_id)
         if not math.isfinite(temperature):
             raise HearthError(f"Invalid temperature: {temperature!r}")
-        # A non-positive request means OFF (setpoint 0). Otherwise clamp to the
-        # supported range and snap to the nearest half degree before it becomes a
-        # wire command - the min/max are otherwise only used for display, so a
+        # A non-positive request means OFF (sent as _OFF_TEMP). Otherwise clamp to
+        # the supported range and snap to the nearest half degree before it becomes
+        # a wire command - the min/max are otherwise only used for display, so a
         # crafted request could send an out-of-range setpoint to the radiator.
         if temperature <= 0:
-            target = 0.0
+            target = _OFF_TEMP
         else:
             temperature = max(_MIN_TEMP, min(_MAX_TEMP, temperature))
             target = round(temperature * 2) / 2
@@ -469,7 +472,7 @@ class NexhoLocalClient:
 
     def _send_once(self, zone: int, target: float) -> bool:
         """Send one setpoint command; True if the hub acknowledged. ``target`` is
-        the display temperature (0.0 = off); it is encoded to the wire value here.
+        the display temperature (_OFF_TEMP = off); it is encoded to the wire value here.
         Resending the same target is idempotent - the radiator ends at that value."""
         wire = _encode_setpoint(target)
         try:

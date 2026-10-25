@@ -61,9 +61,10 @@ def test_set_temperature_off_marks_zone_off():
     client.set_temperature("2", 0)  # Off
     room = next(r for r in client.list_rooms() if r.id == "2")
     assert room.is_off is True
-    _queue_write(client, 2, 0.0)
+    assert room.target_temp == 1.0
+    _queue_write(client, 2, 1.0)
     client._drain_writes(2)
-    assert sent[-1] == "D#2#1#0#0*T0/"  # off sends *T0
+    assert sent[-1] == "D#2#1#0#0*T1/"  # off sends a 1 degree setpoint, not *T0
 
 
 def test_set_temperature_half_degree_rounds_to_nearest_half():

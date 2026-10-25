@@ -58,6 +58,9 @@ to it over the LAN.
   than whole degrees.
   - `*T0` turns the zone **off**: the read-back setpoint is `000` and the
     radiator shows off. (Live test on zone 1: `*T0` -> `…,000`, restored after.)
+    In day-to-day use the app's Off button (`*T0`) appeared to do nothing, so
+    the app now sends Off as `*T1` (1 °C) instead. Why `*T0` fails in practice
+    is not established (inferred, not live-tested).
   - A setpoint **>= 128 is a half degree**: `temp = value - 127.5`, so 20.5 °C
     is sent and read back as `148`. (Live test: `*T148` -> `…,148` = 20.5 °C.)
   - Whole degrees 1..127 pass through unchanged.

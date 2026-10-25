@@ -54,3 +54,11 @@ def test_preset_scene_is_noop_on_fake():
     client.set_scene_membership("1", Scene.BOOST, True)
     room = client.list_rooms()[0]
     assert room.is_off is False
+
+
+def test_set_temperature_off_holds_one_degree():
+    client = make_client()
+    client.set_temperature("1", 0)  # Off
+    room = next(r for r in client.list_rooms() if r.id == "1")
+    assert room.is_off is True
+    assert room.target_temp == 1.0

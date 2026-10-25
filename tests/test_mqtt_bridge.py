@@ -106,3 +106,10 @@ def test_republish_discovery_noop_without_zones():
     assert bridge.has_zones() is False
     bridge.republish_discovery()
     assert published == []
+
+
+def test_publish_state_off_when_setpoint_is_the_off_temperature():
+    bridge, published = _bridge()
+    bridge.publish_state("2", current=18.0, setpoint=1.0)  # Off is sent as 1 degree
+    state = json.loads(published[-1][1])
+    assert state["mode"] == "off"

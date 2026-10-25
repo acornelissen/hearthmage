@@ -25,6 +25,7 @@ _log = logging.getLogger("hearthmage.mqtt")
 
 _MIN_TEMP = 5
 _MAX_TEMP = 30
+_OFF_TEMP = 1  # the client sends Off as a 1 degree setpoint
 
 
 class MqttBridge:
@@ -102,7 +103,7 @@ class MqttBridge:
         payload = {
             "current_temperature": current,
             "temperature": setpoint,
-            "mode": "off" if (setpoint is None or setpoint <= 0) else "heat",
+            "mode": "off" if (setpoint is None or setpoint <= _OFF_TEMP) else "heat",
         }
         self._publish(self._state_topic(str(zone)), json.dumps(payload), retain=True)
 

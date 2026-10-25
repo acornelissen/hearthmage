@@ -29,7 +29,7 @@ class FakeHearthClient:
     def set_temperature(self, room_id: str, temperature: float) -> None:
         room = self._get(room_id)
         off = temperature <= 0
-        target = 0.0 if off else round(temperature * 2) / 2
+        target = 1.0 if off else round(temperature * 2) / 2  # Off is a 1 degree setpoint
         self._rooms[room_id] = replace(room, target_temp=target, is_off=off)
 
     def set_scene_membership(self, room_id: str, scene: Scene, member: bool) -> None:
