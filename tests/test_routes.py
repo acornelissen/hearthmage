@@ -233,6 +233,21 @@ def test_service_worker_is_served_at_root(client: TestClient):
     assert "caches" in resp.text  # it's a real service worker
 
 
+def test_service_worker_cache_name_follows_static_files(monkeypatch):
+    """A stylesheet change must change sw.js, or installed clients keep the old CSS."""
+    import hearthmage.app as appmod
+
+    before = appmod._service_worker_source()
+    monkeypatch.setattr(appmod, "_STATIC_SHELL_FILES", ())  # stands in for changed assets
+    assert appmod._service_worker_source() != before
+
+
+def test_service_worker_fetches_pages_from_the_network_first(client: TestClient):
+    text = client.get("/sw.js").text
+    assert "'/'" not in text.split("const STATIC")[1].split(";")[0]  # home page not cache-first
+    assert "fetch(req).catch(() => caches.match('/'))" in text  # offline fallback kept
+
+
 def test_index_links_manifest_and_registers_sw(client: TestClient):
     resp = client.get("/")
     assert 'rel="manifest"' in resp.text

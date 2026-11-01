@@ -299,15 +299,19 @@ _MANIFEST = {
     ],
 }
 
-# Minimal service worker: cache the app shell, serve the cached home page when a
-# navigation fails offline. The app is LAN-only, so this is about install
-# ergonomics and fast loads, not full offline use.
+# Minimal service worker: static assets are served cache-first, pages always
+# from the network (the cached home page is only the offline fallback). The app
+# is LAN-only, so this is about install ergonomics and fast loads, not full
+# offline use. The cache name carries a hash of the static files, so changing
+# any of them changes sw.js and browsers drop the old cache.
+_STATIC_SHELL_FILES = ("styles.css", "htmx.min.js", "icon.svg")
 _SERVICE_WORKER = """
-const CACHE = 'hearth-v1';
-const SHELL = ['/', '/static/styles.css', '/static/htmx.min.js',
-               '/static/icon.svg', '/manifest.webmanifest'];
+const CACHE = 'hearth-%(version)s';
+const STATIC = ['/static/styles.css', '/static/htmx.min.js', '/static/icon.svg',
+                '/manifest.webmanifest'];
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(STATIC.concat(['/'])))
+    .then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', (e) => {
   e.waitUntil(caches.keys().then((ks) =>
@@ -318,13 +322,20 @@ self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
-  if (SHELL.includes(url.pathname)) {
+  if (STATIC.includes(url.pathname)) {
     e.respondWith(caches.match(req).then((r) => r || fetch(req)));
   } else {
     e.respondWith(fetch(req).catch(() => caches.match('/')));
   }
 });
 """
+
+
+def _service_worker_source() -> str:
+    digest = hashlib.sha256(json.dumps(_MANIFEST, sort_keys=True).encode())
+    for name in _STATIC_SHELL_FILES:
+        digest.update((BASE_DIR / "static" / name).read_bytes())
+    return _SERVICE_WORKER % {"version": digest.hexdigest()[:12]}
 
 
 @app.get("/manifest.webmanifest")
@@ -335,7 +346,7 @@ def manifest() -> JSONResponse:
 @app.get("/sw.js")
 def service_worker() -> Response:
     # Served from the root so its scope covers the whole app.
-    return Response(_SERVICE_WORKER, media_type="text/javascript")
+    return Response(_service_worker_source(), media_type="text/javascript")
 
 
 @app.get("/healthz")
