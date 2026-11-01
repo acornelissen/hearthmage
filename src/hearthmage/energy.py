@@ -9,9 +9,10 @@ so::
 
 and cost is ``kWh * price_per_kWh``. The framing (``OK,<watts>,<counters...>``)
 is inferred from the vendor app and remains **unconfirmed**: a live attempt
-across all zones got ``ER,1`` from every ``*?UD``/``*?UM`` read (only the
-``*UDEL`` pre-probe answered), so on this hardware the counters may not be
-retrievable over the LAN at all. The decode below is guarded so an ``ER`` reply
+across all zones got ``ER,1`` from every ``*?UD``/``*?UM`` read, so on this
+hardware the counters may not be retrievable over the LAN at all. (``*UDEL``,
+which answered ``OK``, is the vendor app's consumption reset, not a probe;
+this app sent it before each read until 2026-11-01.) The decode below is guarded so an ``ER`` reply
 is simply "no reading". See docs/nexho-protocol.md.
 """
 

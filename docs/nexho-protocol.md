@@ -39,7 +39,7 @@ to it over the LAN.
 | `D#<z>#1#0#0*P#…/` | Write a weekly program pattern (see below) | `OK` |
 | `D#<z>#1#0#0*ON/` / `…*OFF/` | Activate / deactivate the zone's weekly program | `OK` |
 | `R#<z>#1#0#0*OD<day>/` | Query one weekday's program (summary only over LAN) | `OK` / `ER,1` |
-| `R#<z>#1#0#0*UDEL/` | Energy reachability pre-probe | `OK` (confirmed live) |
+| `R#<z>#1#0#0*UDEL/` | **Reset** the consumption counters (vendor app: "confirm reset"). Never send it as a probe. | `OK` |
 | `R#<z>#1#0#0*?UD/` | Read daily consumption counters | `OK,<watts>,<8 counters>` / `ER,1` |
 | `R#<z>#1#0#0*?UM/` | Read monthly consumption counters | `OK,<watts>,<counters>` / `ER,1` |
 | `D#200#<z>#<slot>#0#0*Q#<1\|0>/` | Load on/off (no load zones here) | `OK` |
@@ -135,9 +135,10 @@ radiator, and the block temperature uses the same whole-degree encoding as `*T`.
 
 ## Energy consumption (inferred; LAN reads return ER on this hub)
 
-Radiators report consumption as run-time counters. `*UDEL` is a cheap
-reachability pre-probe (returns bare `OK`, **confirmed live**). The heavier
-reads return counters:
+Radiators report consumption as run-time counters. **`*UDEL` resets them**:
+in the vendor app it sits behind a "confirm reset" dialog (`ConsumptionMenu`).
+This app used it as a reachability probe before every hourly energy read until
+2026-11-01, which wiped the counters each time. The reads are:
 
 ```
 R#<zone>#1#0#0*?UD/  ->  OK,<ratedWatts>,<c0..c7>   (8 daily buckets, c0 = today)
@@ -152,7 +153,7 @@ and cost is `kWh * price_per_kWh`. **Status: still unconfirmed, and possibly
 unavailable over LAN on this hardware.** The `OK,<watts>,<counters>` framing and
 the 6-minute unit are inferred from the vendor app. A live attempt across all
 four zones — waking each with a `*?T` read first, trying framing variants, and
-retrying persistently — got `OK` from the `*UDEL` pre-probe but **`ER,1` every
+retrying persistently — got `OK` from `*UDEL` (the reset) but **`ER,1` every
 time** from `*?UD`/`*?UM`. Two variants (`R#1#0#0#0*?UD/` and `R#1#1#0#0*?U/`)
 returned a bare `OK` with no counters. So on this hub the radiators do not return
 energy counters over the LAN (much like schedule block-detail). The app still

@@ -630,16 +630,13 @@ class NexhoLocalClient:
 
     def read_energy(self, room_id: str) -> dict | None:
         """Read a zone's consumption counters, or None if the radiator is asleep.
-
-        Pre-probes with the cheap ``*UDEL`` before the heavier ``*?UD``/``*?UM``
-        reads, so an asleep zone is skipped without three slow RF attempts.
         Returns ``{rated_watts, daily, monthly}`` with raw counters (decode with
-        hearthmage.energy)."""
+        hearthmage.energy).
+
+        Never send ``*UDEL``: in the vendor app it is the consumption RESET,
+        behind a "confirm reset" dialog (it was once used here as a probe)."""
         zone = _zone_int(room_id)
         try:
-            probe = self._ask(f"R#{zone}#1#0#0*UDEL/", _READ_RETRIES, _READ_TIMEOUT)
-            if not probe.startswith("OK"):
-                return None
             ud = self._ask(f"R#{zone}#1#0#0*?UD/", _READ_RETRIES, _READ_TIMEOUT)
             um = self._ask(f"R#{zone}#1#0#0*?UM/", _READ_RETRIES, _READ_TIMEOUT)
         except HearthError:

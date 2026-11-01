@@ -396,7 +396,6 @@ def test_energy_poll_step_invokes_callback_when_due():
         {
             "OPS2/": "OPOK,OPS2,1",
             "R#1#1#0#0*?T/": "OK,20,00,007",
-            "R#1#1#0#0*UDEL/": "OK",
             "R#1#1#0#0*?UD/": "OK,1000,12,40",
             "R#1#1#0#0*?UM/": "OK,1000,300",
         }
@@ -492,22 +491,27 @@ def test_set_config_raises_when_write_not_acked():
         client.set_config("2", window_sensor=True)
 
 
-def test_read_energy_probes_then_reads():
+def test_read_energy_reads_counters_and_never_resets_them():
+    """*UDEL is the vendor app's consumption RESET (behind a "confirm reset"
+    dialog), not a probe: reading energy must never send it."""
+    sent: list[str] = []
     client = make_client(
         {
-            "R#1#1#0#0*UDEL/": "OK",
             "R#1#1#0#0*?UD/": "OK,1000,12,40,35,50,0,22,18,7",
             "R#1#1#0#0*?UM/": "OK,1000,300,280,260",
         }
     )
+    real = client._ask
+    client._ask = lambda cmd, *a, **k: (sent.append(cmd), real(cmd, *a, **k))[1]  # type: ignore[method-assign]
     data = client.read_energy("1")
     assert data["rated_watts"] == 1000
     assert data["daily"] == [12, 40, 35, 50, 0, 22, 18, 7]
     assert data["monthly"] == [300, 280, 260]
+    assert not any("UDEL" in cmd for cmd in sent)
 
 
-def test_read_energy_none_when_probe_fails():
-    client = make_client({"R#3#1#0#0*UDEL/": "ER,1"})
+def test_read_energy_none_when_unreadable():
+    client = make_client({"R#3#1#0#0*?UD/": "ER,1", "R#3#1#0#0*?UM/": "ER,1"})
     assert client.read_energy("3") is None
 
 
