@@ -114,8 +114,13 @@ def restore_bundle(bundle: Any, config_path: str, schedules_path: str) -> None:
     Sections absent from the bundle are left alone. Raises ValueError if the
     payload is not a recognised backup bundle.
     """
+    # Imported here: schedule_store imports this module for rotate_backup.
+    from hearthmage.schedule_store import validate_data
+
     if not isinstance(bundle, dict) or "hearthmage_backup" not in bundle:
         raise ValueError("not a HearthMage backup bundle")
+    # Validate every section before writing any, so a bad file changes nothing.
+    writes: list[tuple[str, dict]] = []
     for key, path in (("config", config_path), ("schedules", schedules_path)):
         if key not in bundle:
             continue  # not part of this bundle: do not touch the file
@@ -126,6 +131,10 @@ def restore_bundle(bundle: Any, config_path: str, schedules_path: str) -> None:
             raise ValueError(f"backup section {key!r} is not an object")
         if key == "config":
             section = _restore_secrets(section, _read_json(path))
+        else:
+            section = validate_data(section)  # an import is untrusted input
+        writes.append((path, section))
+    for path, section in writes:
         rotate_backup(path)  # preserve whatever we are about to overwrite
         write_json_atomic(path, section)
 

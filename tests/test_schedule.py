@@ -1,3 +1,6 @@
+import pytest
+
+
 from hearthmage.schedule import (
     Block,
     build_program_command,
@@ -46,3 +49,52 @@ def test_parse_day_schedule_rejects_non_schedule():
 
     with pytest.raises(ValueError):
         parse_day_schedule("ER,1")
+
+
+def test_block_ending_at_midnight_is_sent_as_hour_zero():
+    # The vendor writer normalises hour 24 to 0, so 22:00-24:00 goes out as 22#0#0#0.
+    cmd = build_program_command(1, [Block(20, 1320, 1440)], [0])
+    assert cmd.startswith("D#1#1#0#0*P#1#20#22#0#0#0#5#24#60#24#60")
+
+
+def test_validate_blocks_sorts_by_start():
+    from hearthmage.schedule import validate_blocks
+
+    blocks = [Block(21, 1020, 1320), Block(20, 420, 540)]
+    assert validate_blocks(blocks) == [Block(20, 420, 540), Block(21, 1020, 1320)]
+
+
+def test_validate_blocks_allows_touching_blocks():
+    from hearthmage.schedule import validate_blocks
+
+    assert validate_blocks([Block(20, 420, 540), Block(16, 540, 600)])
+
+
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        [Block(20, 420, 600), Block(15, 480, 700)],  # overlap
+        [Block(4, 420, 540)],  # below the 5 degree minimum
+        [Block(31, 420, 540)],  # above the 30 degree maximum
+        [Block(200, 420, 540)],  # would collide with the half-degree encoding
+        [Block(20, 600, 600)],  # empty
+        [Block(20, 600, 300)],  # backwards
+        [Block(20, -10, 300)],  # before midnight
+        [Block(20, 300, 1441)],  # past midnight
+        [Block(20, i * 60, i * 60 + 30) for i in range(7)],  # too many
+    ],
+)
+def test_validate_blocks_rejects(blocks):
+    from hearthmage.schedule import validate_blocks
+
+    with pytest.raises(ValueError):
+        validate_blocks(blocks)
+
+
+def test_validate_days():
+    from hearthmage.schedule import validate_days
+
+    assert validate_days([4, 0, 0]) == [0, 4]  # sorted, de-duplicated
+    for bad in ([], [7], [-1]):
+        with pytest.raises(ValueError):
+            validate_days(bad)

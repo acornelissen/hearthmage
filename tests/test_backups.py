@@ -146,3 +146,23 @@ def test_restore_bundle_does_not_inject_mqtt_when_bundle_has_none(tmp_path):
         str(cfg), str(tmp_path / "schedules.json"),
     )
     assert "mqtt" not in json.loads(cfg.read_text())
+
+
+def test_restore_bundle_rejects_invalid_schedules_without_writing(tmp_path):
+    cfg = tmp_path / "config.json"
+    sched = tmp_path / "schedules.json"
+    _write(cfg, {"hub_ip": "old"})
+    _write(sched, {"1": {}})
+    for bad in (
+        {"1": {"0": [[200, 420, 540]]}},  # out-of-range target
+        {"__active__": {"0": [[20, 0, 60]]}},  # junk in the reserved key
+        {"1": {"0": [[20, "a", 5]]}},
+    ):
+        with pytest.raises(ValueError):
+            restore_bundle(
+                {"hearthmage_backup": 1, "config": {"hub_ip": "new"}, "schedules": bad},
+                str(cfg),
+                str(sched),
+            )
+    assert json.loads(cfg.read_text())["hub_ip"] == "old"  # nothing half-restored
+    assert json.loads(sched.read_text()) == {"1": {}}

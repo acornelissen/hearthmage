@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from hearthmage.app import app, get_client
 from hearthmage.domain import HearthError, Room
 from hearthmage.fake_client import FakeHearthClient
+from hearthmage.schedule import Block
 
 
 @pytest.fixture()
@@ -505,22 +506,6 @@ def test_save_schedule_stores_and_redirects(client: TestClient, tmp_path, monkey
     assert appmod.schedules.get_day("1", 2) == day0  # applied to both selected days
 
 
-def test_save_schedule_skips_malformed_rows(client: TestClient, tmp_path, monkeypatch):
-    appmod = _with_store(tmp_path, monkeypatch)
-    client.post(
-        "/zones/1/schedule",
-        data={
-            "days": ["1"],
-            "block_target": ["20", "18"],
-            "block_start": ["07:00", "10:00"],
-            "block_end": ["09:00", "08:00"],  # second row ends before it starts
-        },
-        follow_redirects=False,
-    )
-    day1 = appmod.schedules.get_day("1", 1)
-    assert [(b.target, b.start, b.end) for b in day1] == [(20, 420, 540)]
-
-
 def test_clear_day_removes_from_store(client: TestClient, tmp_path, monkeypatch):
     appmod = _with_store(tmp_path, monkeypatch)
     from hearthmage.schedule import Block
@@ -529,37 +514,6 @@ def test_clear_day_removes_from_store(client: TestClient, tmp_path, monkeypatch)
     resp = client.post("/zones/1/schedule/clear", data={"day": "3"}, follow_redirects=False)
     assert resp.status_code == 303
     assert appmod.schedules.get_day("1", 3) == []
-
-
-def test_push_schedule_syncs_to_client(tmp_path, monkeypatch):
-    appmod = _with_store(tmp_path, monkeypatch)
-    from hearthmage.schedule import Block
-
-    fake = FakeHearthClient(
-        [Room("1", "Living Room", 19.0, 20.0, is_off=False, min_temp=5.0, max_temp=30.0)]
-    )
-    appmod._push_schedule(fake, "1", [Block(20, 420, 540)], [0, 1])
-    assert fake.applied == [("1", [Block(20, 420, 540)], [0, 1])]
-    assert appmod.sync.get("1") == "synced"
-
-
-def test_toggle_program_activate_and_deactivate(client: TestClient, tmp_path, monkeypatch):
-    appmod = _with_store(tmp_path, monkeypatch)
-    fake = FakeHearthClient(
-        [Room("1", "Living Room", 19.0, 20.0, is_off=False, min_temp=5.0, max_temp=30.0)]
-    )
-    appmod.app.dependency_overrides[get_client] = lambda: fake
-    try:
-        resp = TestClient(app).post("/zones/1/program", data={"active": "1"}, follow_redirects=False)
-        assert resp.status_code == 303
-        assert resp.headers["location"] == "/zones/1/schedule"
-        # the background push runs synchronously enough via the helper; verify directly
-        appmod._push_program(fake, "1", False)
-        assert fake.program_active["1"] is False
-        appmod._push_program(fake, "1", True)
-        assert fake.program_active["1"] is True
-    finally:
-        appmod.app.dependency_overrides.clear()
 
 
 def test_activate_controls_only_with_saved_schedule(client: TestClient, tmp_path, monkeypatch):
@@ -582,29 +536,6 @@ def test_source_of_truth_note_only_without_saved_schedule(client, tmp_path, monk
     assert "source of truth" not in client.get("/zones/1/schedule").text  # set: note hidden
 
 
-def test_push_program_marks_failed_on_error(tmp_path, monkeypatch):
-    appmod = _with_store(tmp_path, monkeypatch)
-
-    class Boom:
-        def set_program_active(self, *a):
-            raise HearthError("asleep")
-
-    appmod._push_program(Boom(), "1", True)
-    assert appmod.sync.get("1") == "failed"
-
-
-def test_push_schedule_marks_failed_on_error(tmp_path, monkeypatch):
-    appmod = _with_store(tmp_path, monkeypatch)
-    from hearthmage.schedule import Block
-
-    class Boom:
-        def set_day_pattern(self, *a):
-            raise HearthError("asleep")
-
-    appmod._push_schedule(Boom(), "1", [Block(20, 0, 600)], [0])
-    assert appmod.sync.get("1") == "failed"
-
-
 def test_retry_resyncs_failed_zone_from_stored_schedule(tmp_path, monkeypatch):
     appmod = _with_store(tmp_path, monkeypatch)
     from hearthmage.schedule import Block
@@ -622,6 +553,289 @@ def test_retry_resyncs_failed_zone_from_stored_schedule(tmp_path, monkeypatch):
     assert appmod.sync.get("1") == "synced"  # retry cleared the failure
     assert fake.applied  # the stored pattern was re-pushed
     assert fake.program_active["1"] is True  # program state re-applied
+
+
+def _wait_for_sync() -> None:
+    """Join the background schedule-sync workers a route started."""
+    import threading
+
+    for t in threading.enumerate():
+        if t.name == "schedule-sync":
+            t.join(timeout=5)
+
+
+def _room_fake() -> FakeHearthClient:
+    return FakeHearthClient(
+        [Room("1", "Living Room", 19.0, 20.0, is_off=False, min_temp=5.0, max_temp=30.0)]
+    )
+
+
+def test_save_schedule_rejects_malformed_rows_with_an_error(client, tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    resp = client.post(
+        "/zones/1/schedule",
+        data={
+            "days": ["1"],
+            "block_target": ["20", "18"],
+            "block_start": ["07:00", "10:00"],
+            "block_end": ["09:00", "08:00"],  # second row ends before it starts
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert "Ends before it starts" in resp.text
+    assert 'aria-invalid="true"' in resp.text
+    assert 'value="10:00"' in resp.text  # what the user typed is kept
+    assert appmod.schedules.get_zone("1") == {}  # nothing saved
+
+
+@pytest.mark.parametrize(
+    "data, message",
+    [
+        ({"block_target": "20", "block_start": "07:00", "block_end": "09:00"}, "Choose at least one day"),
+        ({"days": "0"}, "Add at least one time frame"),
+        ({"days": "0", "block_target": "200", "block_start": "07:00", "block_end": "08:00"}, "whole number from 5 to 30"),
+        ({"days": "0", "block_target": "nan", "block_start": "07:00", "block_end": "08:00"}, "whole number from 5 to 30"),
+        ({"days": "0", "block_target": "inf", "block_start": "07:00", "block_end": "08:00"}, "whole number from 5 to 30"),
+        ({"days": "0", "block_target": "20.5", "block_start": "07:00", "block_end": "08:00"}, "whole number from 5 to 30"),
+        ({"days": "9", "block_target": "20", "block_start": "07:00", "block_end": "08:00"}, "Unknown day"),
+        ({"days": "²", "block_target": "20", "block_start": "07:00", "block_end": "08:00"}, "Unknown day"),
+        ({"days": "0", "block_target": "20", "block_start": "07:00", "block_end": ""}, "Fill in the temperature"),
+        ({"days": "0", "block_target": "20", "block_start": "7am", "block_end": "08:00"}, "HH:MM"),
+        ({"days": "0", "block_target": ["20", "18"], "block_start": ["07:00", "08:00"],
+          "block_end": ["09:00", "10:00"]}, "Overlaps another time frame"),
+    ],
+)
+def test_save_schedule_validates_input(client, tmp_path, monkeypatch, data, message):
+    appmod = _with_store(tmp_path, monkeypatch)
+    resp = client.post("/zones/1/schedule", data=data, follow_redirects=False)
+    assert resp.status_code == 400
+    assert message in resp.text
+    assert appmod.schedules.get_zone("1") == {}
+
+
+def test_save_schedule_accepts_a_frame_ending_at_midnight(client, tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    from hearthmage.schedule import Block
+
+    resp = client.post(
+        "/zones/1/schedule",
+        data={"days": "0", "block_target": ["20", "21"], "block_start": ["07:00", "18:00"],
+              "block_end": ["09:00", "00:00"]},
+        follow_redirects=False,
+    )
+    _wait_for_sync()
+    assert resp.status_code == 303
+    assert appmod.schedules.get_day("1", 0) == [Block(20, 420, 540), Block(21, 1080, 1440)]
+    assert "18:00&ndash;24:00" in client.get("/zones/1/schedule").text
+
+
+def test_schedule_routes_reject_non_numeric_zone(client, tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    form = {"days": "0", "block_target": "20", "block_start": "07:00", "block_end": "08:00"}
+    assert client.post("/zones/__active__/schedule", data=form).status_code == 404
+    assert client.post("/zones/abc/program", data={"active": "1"}).status_code == 404
+    assert client.get("/zones/x/schedule").status_code == 404
+    assert appmod.schedules.get_active("0") is None
+
+
+def test_clear_rejects_unknown_day(client, tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    resp = client.post("/zones/1/schedule/clear", data={"day": "-1"}, follow_redirects=False)
+    assert resp.status_code == 400
+    assert appmod.sync.get("1") is None  # no push started, nothing stuck on pending
+
+
+def test_edit_link_preloads_the_days_frames(client, tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    from hearthmage.schedule import Block
+
+    appmod.schedules.set_pattern("1", [Block(20, 420, 540), Block(21, 1020, 1440)], [2])
+    page = client.get("/zones/1/schedule")
+    assert 'href="/zones/1/schedule?edit=2#editor"' in page.text
+    edit = client.get("/zones/1/schedule?edit=2").text
+    assert "Edit Wednesday" in edit
+    assert 'value="17:00"' in edit and 'value="00:00"' in edit  # 24:00 shown as 00:00
+    assert 'name="days" value="2" checked' in edit
+
+
+def test_editing_a_day_then_saving_keeps_every_frame(client, tmp_path, monkeypatch):
+    """The reported bug: adding a second slot to a day must not lose the first."""
+    appmod = _with_store(tmp_path, monkeypatch)
+    from hearthmage.schedule import Block
+
+    appmod.schedules.set_pattern("1", [Block(20, 420, 540)], [0])
+    client.post(
+        "/zones/1/schedule",
+        data={"days": "0", "editing": "1", "block_target": ["20", "21"],
+              "block_start": ["07:00", "17:00"], "block_end": ["09:00", "22:00"]},
+    )
+    _wait_for_sync()
+    assert appmod.schedules.get_day("1", 0) == [Block(20, 420, 540), Block(21, 1020, 1320)]
+
+
+def test_resync_pushes_the_whole_week_with_cleared_days(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    from hearthmage.schedule import Block
+
+    appmod.schedules.set_pattern("1", [Block(20, 420, 540)], [0, 1])
+    appmod.schedules.clear_day("1", 1)
+    fake = _room_fake()
+    assert appmod._resync_zone(fake, "1") is True
+    sent = {d: blocks for _, blocks, days in fake.applied for d in days}
+    assert sorted(sent) == list(range(7))  # every day written
+    assert sent[0] == [Block(20, 420, 540)]
+    assert sent[1] == []  # the cleared day goes out as cleared
+
+
+def test_resync_of_a_fully_cleared_zone_clears_the_hub(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    from hearthmage.schedule import Block
+
+    appmod.schedules.set_pattern("1", [Block(20, 420, 540)], [0])
+    appmod.schedules.clear_day("1", 0)
+    fake = _room_fake()
+    appmod._resync_zone(fake, "1")
+    assert fake.applied == [("1", [], list(range(7)))]
+
+
+def test_resync_leaves_unowned_zone_programs_alone(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_active("1", False)  # program state only, no schedule set here
+    fake = _room_fake()
+    appmod._resync_zone(fake, "1")
+    assert fake.applied == []  # a vendor-app program is not wiped
+    assert fake.program_active["1"] is False
+
+
+def test_sync_status_reflects_every_day_not_the_last_push(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    from hearthmage.schedule import Block
+
+    class MondayAsleep:
+        def set_day_pattern(self, zone, blocks, days):
+            if 0 in days:
+                raise HearthError("asleep")
+
+    appmod.schedules.set_pattern("1", [Block(20, 0, 60)], [0])
+    appmod._request_sync(MondayAsleep(), "1")
+    _wait_for_sync()
+    appmod.schedules.set_pattern("1", [Block(18, 0, 60)], [5])  # Saturday alone would succeed
+    appmod._request_sync(MondayAsleep(), "1")
+    _wait_for_sync()
+    assert appmod.sync.get("1") == "failed"  # Monday still has not reached the hub
+
+
+def test_sync_crash_is_recorded_as_failed(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    from hearthmage.schedule import Block
+
+    class Broken:
+        def set_day_pattern(self, *a):
+            raise RuntimeError("bug")
+
+    appmod.schedules.set_pattern("1", [Block(20, 0, 60)], [0])
+    appmod._request_sync(Broken(), "1")
+    _wait_for_sync()
+    assert appmod.sync.get("1") == "failed"
+    assert "1" not in appmod._sync_running
+
+
+def test_change_during_a_push_is_pushed_again(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    from hearthmage.schedule import Block
+
+    appmod.schedules.set_pattern("1", [Block(20, 0, 60)], [0])
+    pushed: list = []
+
+    class EditsMidPush:
+        def set_day_pattern(self, zone, blocks, days):
+            pushed.append((list(blocks), list(days)))
+            if len(pushed) == 1:  # the user saves again while the first push runs
+                appmod.schedules.set_pattern("1", [Block(22, 0, 60)], [0])
+                appmod._request_sync(self, "1")
+
+    appmod._request_sync(EditsMidPush(), "1")
+    _wait_for_sync()
+    final_monday = [b for b, d in pushed if 0 in d][-1]
+    assert final_monday == [Block(22, 0, 60)]  # the latest state landed last
+    assert appmod.sync.get("1") == "synced"
+
+
+def test_toggle_program_pushes_program_state(client, tmp_path, monkeypatch):
+    _with_store(tmp_path, monkeypatch)
+    fake = app.dependency_overrides[get_client]()
+    client.post("/zones/1/program", data={"active": "1"}, follow_redirects=False)
+    _wait_for_sync()
+    assert fake.program_active["1"] is True
+    client.post("/zones/1/program", data={"active": "0"}, follow_redirects=False)
+    _wait_for_sync()
+    assert fake.program_active["1"] is False
+
+
+def test_retry_loop_follows_the_current_client(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    from hearthmage.schedule import Block
+
+    appmod.schedules.set_pattern("1", [Block(20, 0, 60)], [0])
+    appmod.sync.set("1", "failed")
+    current = _room_fake()
+    monkeypatch.setattr(appmod, "get_client", lambda: current)
+
+    def one_cycle(_seconds):
+        if current.applied:
+            raise SystemExit  # stop the endless loop after one retry
+    monkeypatch.setattr(appmod._retry_wake, "wait", one_cycle)
+    with pytest.raises(SystemExit):
+        appmod._retry_loop()
+    assert current.applied and appmod.sync.get("1") == "synced"
+
+
+def test_import_backup_queues_restored_schedules_for_the_hub(client, tmp_path, monkeypatch):
+    import io
+
+    import hearthmage.app as appmod
+    from hearthmage.settings import Settings
+    from hearthmage.sync_store import SyncStore
+
+    monkeypatch.setattr(appmod, "settings", Settings(str(tmp_path / "c.json"), env={}))
+    monkeypatch.setattr(appmod, "sync", SyncStore(str(tmp_path / "sync.json")))
+    bundle = {"hearthmage_backup": 1, "schedules": {"1": {"0": [[20, 420, 540]]}}}
+    resp = client.post(
+        "/settings/import",
+        files={"backup": ("b.json", io.BytesIO(json.dumps(bundle).encode()), "application/json")},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert appmod.sync.get("1") == "pending"  # queued, without building a hub client here
+    assert appmod._retry_wake.is_set()  # retry loop woken to push it now
+    fake = _room_fake()
+    appmod._retry_failed_syncs(fake)  # what the woken retry loop does
+    assert ("1", [Block(20, 420, 540)], [0]) in fake.applied
+    assert appmod.sync.get("1") == "synced"
+
+
+def test_import_backup_rejects_invalid_schedules(client, tmp_path, monkeypatch):
+    import io
+
+    import hearthmage.app as appmod
+    from hearthmage.settings import Settings
+
+    monkeypatch.setattr(appmod, "settings", Settings(str(tmp_path / "c.json"), env={}))
+    bundle = {"hearthmage_backup": 1, "schedules": {"1": {"0": [[200, 420, 540]]}}}
+    resp = client.post(
+        "/settings/import",
+        files={"backup": ("b.json", io.BytesIO(json.dumps(bundle).encode()), "application/json")},
+    )
+    assert resp.status_code == 400
+
+
+def test_expired_holiday_is_not_shown(client, tmp_path, monkeypatch):
+    appmod = _with_holiday(tmp_path, monkeypatch)
+    _with_store(tmp_path, monkeypatch)
+    appmod.holidays.set("1", day=1, month=1, temp=7.0, prev_setpoint=None, year=2020)
+    assert "Cancel holiday" not in client.get("/zones/1/schedule").text
+    assert appmod.holidays.get("1") is None
 
 
 def _with_holiday(tmp_path, monkeypatch):

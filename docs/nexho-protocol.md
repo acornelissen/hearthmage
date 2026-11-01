@@ -85,7 +85,9 @@ D#<zone>#<modules>#0#0*P#<dayBitmask>#<b1>#<b2>#<b3>#<b4>#<b5>#<b6>/
 - `<dayBitmask>`: `sum(2**dayIndex)` where **Mon=0, Tue=1, Wed=2, Thu=3, Fri=4,
   Sat=5, Sun=6** (confirmed from the app's day-list order).
 - Always exactly **6 block groups**. Each enabled block is
-  `<cmd>#<startH>#<startM>#<endH>#<endM>` (hour 24 is normalised to 0). Each
+  `<cmd>#<startH>#<startM>#<endH>#<endM>` (hour 24 is normalised to 0, so a
+  block ending at midnight is sent as `…#0#0`; this app does the same —
+  inferred from the vendor writer, not live-tested). Each
   disabled block is the sentinel `5#24#60#24#60` for climate zones
   (`253#24#60#24#60` for load/light/blind types).
 - Reply starts `OK` on success.

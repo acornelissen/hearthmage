@@ -10,7 +10,13 @@ def test_set_get_and_persist(tmp_path):
     path = str(tmp_path / "holiday.json")
     HolidayStore(path).set("1", day=5, month=11, temp=7.0, prev_setpoint=21.0)
     got = HolidayStore(path).get("1")
-    assert got == {"day": 5, "month": 11, "temp": 7.0, "prev_setpoint": 21.0}
+    assert got == {"day": 5, "month": 11, "year": None, "temp": 7.0, "prev_setpoint": 21.0}
+
+
+def test_set_keeps_the_year(tmp_path):
+    path = str(tmp_path / "holiday.json")
+    HolidayStore(path).set("1", day=5, month=11, temp=7.0, prev_setpoint=None, year=2026)
+    assert HolidayStore(path).get("1")["year"] == 2026
 
 
 def test_clear_removes_zone(tmp_path):

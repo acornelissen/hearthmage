@@ -557,3 +557,28 @@ def test_cache_persists_last_known_across_restarts(tmp_path):
     assert room.current_temp == 20.4
     assert room.target_temp == 7.0
     assert room.status == "ok"
+
+
+def test_set_day_pattern_rejects_invalid_pattern_as_hearth_error():
+    from hearthmage.schedule import Block
+
+    sent: list[str] = []
+    client = make_client({"D#": "OK"})
+    real = client._ask
+    client._ask = lambda cmd, *a, **k: (sent.append(cmd), real(cmd, *a, **k))[1]  # type: ignore[method-assign]
+    with pytest.raises(HearthError):
+        client.set_day_pattern("1", [Block(200, 0, 60)], [0])
+    with pytest.raises(HearthError):
+        client.set_day_pattern("1", [], [-1])
+    assert sent == []  # nothing invalid reaches the wire
+
+
+def test_stop_ends_the_poller():
+    import time
+
+    client = NexhoLocalClient("10.0.0.99", poll_interval=0.01)
+    client._poll_once = lambda: None  # type: ignore[method-assign]
+    client.start()
+    client.stop()
+    client._thread.join(timeout=3)
+    assert not client._thread.is_alive()

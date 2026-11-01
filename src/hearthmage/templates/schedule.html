@@ -64,12 +64,16 @@
       <div class="sched-day{% if not row.blocks %} is-empty{% endif %}">
         <div class="sched-day-head">
           <h2 class="sched-day-name">{{ row.label }}</h2>
-          {% if row.blocks %}
-          <form method="post" action="/zones/{{ zone_id }}/schedule/clear" class="sched-clear">
-            <input type="hidden" name="day" value="{{ row.day }}">
-            <button type="submit" class="link-btn">Clear</button>
-          </form>
-          {% endif %}
+          <div class="sched-day-actions">
+            <a class="link-btn" href="/zones/{{ zone_id }}/schedule?edit={{ row.day }}#editor"
+               aria-label="{{ 'Edit' if row.blocks else 'Add to' }} {{ row.label }}">{{ 'Edit' if row.blocks else 'Add' }}</a>
+            {% if row.blocks %}
+            <form method="post" action="/zones/{{ zone_id }}/schedule/clear" class="sched-clear">
+              <input type="hidden" name="day" value="{{ row.day }}">
+              <button type="submit" class="link-btn" aria-label="Clear {{ row.label }}">Clear</button>
+            </form>
+            {% endif %}
+          </div>
         </div>
         {% if row.blocks %}
         <ul class="sched-blocks">
@@ -84,42 +88,61 @@
       {% endfor %}
     </section>
 
-    <form class="sched-editor" method="post" action="/zones/{{ zone_id }}/schedule">
-      <h2 class="editor-title">New pattern</h2>
-      <p class="editor-sub">Set the time frames, choose which days, and apply.</p>
+    <form class="sched-editor" id="editor" method="post" action="/zones/{{ zone_id }}/schedule" novalidate>
+      <h2 class="editor-title">{{ editor.title }}</h2>
+      <p class="editor-sub">Saving replaces the time frames on every day you tick.
+        {% if editor.editing %}<a href="/zones/{{ zone_id }}/schedule">Start a new pattern instead</a>{% endif %}</p>
+      {% if editor.editing %}<input type="hidden" name="editing" value="1">{% endif %}
+
+      {% if editor.errors %}
+      <div class="error" id="editor-errors" role="alert" tabindex="-1">
+        <ul class="error-list">
+          {% for message in editor.errors %}<li>{{ message }}</li>{% endfor %}
+        </ul>
+      </div>
+      {% endif %}
 
       <div class="blocks-editor" id="blocks">
-        {% for n in range(6) %}
-        <div class="block-row{% if n > 0 %} is-hidden{% endif %}" data-block-row>
+        {% for n in range(max_blocks) %}
+        {% set r = editor.rows[n] if n < editor.rows|length else none %}
+        {% set err = r.error if r else none %}
+        <div class="block-row{% if not r %} is-hidden{% endif %}{% if err %} has-error{% endif %}" data-block-row>
           <label class="block-field block-temp">
             <span>&deg;C</span>
-            <input type="number" name="block_target" min="5" max="30" step="1"
-                   inputmode="numeric" {% if n == 0 %}value="20"{% endif %}>
+            <input type="number" name="block_target" min="{{ min_target }}" max="{{ max_target }}" step="1"
+                   inputmode="numeric" value="{{ r.target if r else '' }}"
+                   {% if err %}aria-invalid="true" aria-describedby="row-error-{{ n }}"{% endif %}>
           </label>
           <label class="block-field">
             <span>From</span>
-            <input type="time" name="block_start" {% if n == 0 %}value="07:00"{% endif %}>
+            <input type="time" name="block_start" value="{{ r.start if r else '' }}"
+                   {% if err %}aria-invalid="true" aria-describedby="row-error-{{ n }}"{% endif %}>
           </label>
           <label class="block-field">
             <span>To</span>
-            <input type="time" name="block_end" {% if n == 0 %}value="22:00"{% endif %}>
+            <input type="time" name="block_end" value="{{ r.end if r else '' }}"
+                   {% if err %}aria-invalid="true" aria-describedby="row-error-{{ n }}"{% endif %}>
           </label>
           <button type="button" class="block-remove" data-remove-block
-                  aria-label="Remove this time frame" title="Remove">
+                  aria-label="Remove time frame {{ n + 1 }}" title="Remove">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
           </button>
+          {% if err %}<p class="field-error" id="row-error-{{ n }}">{{ err }}</p>{% endif %}
         </div>
         {% endfor %}
       </div>
-      <button type="button" class="add-block" id="add-block">+ Add time frame</button>
+      <button type="button" class="add-block" id="add-block"
+              {% if editor.rows|length >= max_blocks %}hidden{% endif %}>+ Add time frame</button>
+      <p class="editor-hint">To heat until midnight, end at 00:00.</p>
 
       <fieldset class="days-picker">
         <legend>Apply to</legend>
         <div class="day-chips">
           {% for i, label in weekdays %}
           <label class="day-chip">
-            <input type="checkbox" name="days" value="{{ i }}">
-            <span>{{ label[:3] }}</span>
+            <input type="checkbox" name="days" value="{{ i }}"{% if i in editor.days %} checked{% endif %}
+                   aria-label="{{ label }}">
+            <span aria-hidden="true">{{ label[:3] }}</span>
           </label>
           {% endfor %}
         </div>
@@ -162,24 +185,41 @@
     var addBtn = document.getElementById('add-block');
     var blocks = document.getElementById('blocks');
 
-    // Reveal one hidden time-frame row at a time (up to 6). Rows left empty are
-    // ignored on save, so showing/hiding only affects what the user sees.
+    // Reveal one hidden time-frame row at a time (up to 6) and move focus into
+    // it. Rows left empty are ignored on save, so hiding only affects the view.
     addBtn.addEventListener('click', function () {
       var hidden = blocks.querySelector('.block-row.is-hidden');
-      if (hidden) hidden.classList.remove('is-hidden');
+      if (hidden) {
+        hidden.classList.remove('is-hidden');
+        hidden.querySelector('input').focus();
+      }
       if (!blocks.querySelector('.block-row.is-hidden')) addBtn.setAttribute('hidden', '');
     });
 
-    // Remove a time frame: clear its inputs (so it is not saved) and hide it,
-    // and make sure "Add time frame" is available again.
+    // Remove a time frame: clear its inputs (so it is not saved), hide it, and
+    // put focus on "Add time frame" so keyboard users are not dropped to <body>.
     blocks.addEventListener('click', function (e) {
       var btn = e.target.closest('[data-remove-block]');
       if (!btn) return;
       var row = btn.closest('[data-block-row]');
-      row.querySelectorAll('input').forEach(function (i) { i.value = ''; });
+      row.querySelectorAll('input').forEach(function (i) {
+        i.value = '';
+        i.removeAttribute('aria-invalid');
+      });
+      var msg = row.querySelector('.field-error');
+      if (msg) msg.remove();
+      row.classList.remove('has-error');
       row.classList.add('is-hidden');
       addBtn.removeAttribute('hidden');
+      addBtn.focus();
     });
+
+    // After a failed save, take the user straight to what needs fixing.
+    var errors = document.getElementById('editor-errors');
+    if (errors) {
+      errors.scrollIntoView({ block: 'center' });
+      errors.focus({ preventScroll: true });
+    }
   </script>
 </body>
 </html>

@@ -25,3 +25,11 @@ def test_corrupt_file_is_ignored(tmp_path):
     path.write_text("{ not json")
     store = SyncStore(str(path))
     assert store.get("1") is None  # falls back to empty, does not crash
+
+
+def test_pending_from_a_previous_run_loads_as_failed(tmp_path):
+    path = str(tmp_path / "sync.json")
+    SyncStore(path).set("1", "pending")  # the process died mid-push
+    reloaded = SyncStore(path)
+    assert reloaded.get("1") == "failed"
+    assert reloaded.failed_zones() == ["1"]  # so the retry loop picks it up

@@ -6,8 +6,9 @@ the frost temperature rather than the setpoint it had before. So we keep, per
 zone, the intended end date (for display) and the setpoint to restore when the
 user cancels early. It is a convenience record, not a source of truth.
 
-Shape on disk: ``{"<zone>": {"day": int, "month": int, "temp": float,
-"prev_setpoint": float | null}}``.
+Shape on disk: ``{"<zone>": {"day": int, "month": int, "year": int | null,
+"temp": float, "prev_setpoint": float | null}}``. ``year`` (absent in older
+records) lets the app drop the record once the hold has ended.
 """
 
 from __future__ import annotations
@@ -42,11 +43,14 @@ class HolidayStore:
             value = self._data.get(str(zone_id))
             return dict(value) if value is not None else None
 
-    def set(self, zone_id: str, day: int, month: int, temp: float, prev_setpoint) -> None:
+    def set(
+        self, zone_id: str, day: int, month: int, temp: float, prev_setpoint, year: int | None = None
+    ) -> None:
         with self._lock:
             self._data[str(zone_id)] = {
                 "day": int(day),
                 "month": int(month),
+                "year": int(year) if year is not None else None,
                 "temp": float(temp),
                 "prev_setpoint": prev_setpoint,
             }

@@ -84,6 +84,7 @@ class NexhoLocalClient:
         self._writers: set[int] = set()  # zones with a live single-flight write worker
         self._zones: list[int] | None = None  # cached zone list (it is fixed)
         self._poller_started = False
+        self._stop = threading.Event()  # set by stop(): the poller exits
         # Observability: monotonic timestamps for health reporting.
         self._thread: threading.Thread | None = None
         self._started_at: float | None = None
@@ -257,13 +258,18 @@ class NexhoLocalClient:
         self._thread = threading.Thread(target=self._poll_loop, name="nexho-poller", daemon=True)
         self._thread.start()
 
+    def stop(self) -> None:
+        """Stop the poller (e.g. the app switched to a different hub). A poll
+        already talking to the hub finishes first; nothing new starts."""
+        self._stop.set()
+
     def _poll_loop(self) -> None:
-        while True:
+        while not self._stop.is_set():
             try:
                 self._poll_once()
             except Exception:  # noqa: BLE001 - a bad poll must not kill the poller
                 _log.exception("poll cycle failed; poller continues")
-            time.sleep(self._sleep_until_due())
+            self._stop.wait(self._sleep_until_due())
 
     def _sleep_until_due(self) -> float:
         """Sleep until the soonest zone is due, so the hub sits idle in between
@@ -641,8 +647,12 @@ class NexhoLocalClient:
     def set_day_pattern(self, room_id: str, blocks: list[Block], days: list[int]) -> None:
         """Write a block pattern to every weekday in ``days`` (via ``*P``)."""
         zone = _zone_int(room_id)
+        try:
+            cmd = build_program_command(zone, blocks, days)
+        except ValueError as exc:
+            raise HearthError(f"Invalid schedule for zone {zone}: {exc}") from exc
         resp = self._ask(
-            build_program_command(zone, blocks, days),
+            cmd,
             _WRITE_RETRIES,
             _WRITE_TIMEOUT,
             priority=True,

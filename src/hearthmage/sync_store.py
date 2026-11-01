@@ -31,7 +31,11 @@ class SyncStore:
             with open(self._path, encoding="utf-8") as handle:
                 loaded = json.load(handle)
             if isinstance(loaded, dict):
-                self._data = {str(k): str(v) for k, v in loaded.items()}
+                # A push cannot still be in flight from a previous process: a
+                # leftover "pending" was interrupted, so retry it as failed.
+                self._data = {
+                    str(k): "failed" if v == "pending" else str(v) for k, v in loaded.items()
+                }
         except (OSError, ValueError):
             self._data = {}  # corrupt: start empty rather than crash
 
@@ -47,3 +51,9 @@ class SyncStore:
     def failed_zones(self) -> list[str]:
         with self._lock:
             return [z for z, status in self._data.items() if status == "failed"]
+
+    def unsettled_zones(self) -> list[str]:
+        """Zones not yet confirmed on the hub: failed, or pending (queued for the
+        retry loop, e.g. after a backup import)."""
+        with self._lock:
+            return [z for z, status in self._data.items() if status in ("failed", "pending")]

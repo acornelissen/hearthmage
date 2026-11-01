@@ -35,6 +35,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 MAX_BLOCKS = 6
+MIN_TARGET = 5  # same range as the manual setpoint (nexho_client _MIN_TEMP/_MAX_TEMP)
+MAX_TARGET = 30
+DAY_MINUTES = 24 * 60
 DISABLED_CMD = 5  # climate "off"/disabled block sentinel (f1/h.java:287)
 DISABLED_BLOCK = f"{DISABLED_CMD}#24#60#24#60"
 _EMPTY_CMD_THRESHOLD = 240  # cmd > 240 (i.e. 253) marks an empty slot on read (b1/j.java:915)
@@ -62,18 +65,46 @@ def weekday_bitmask(days: list[int]) -> int:
     return mask
 
 
+def validate_blocks(blocks: list[Block]) -> list[Block]:
+    """Return ``blocks`` sorted by start, or raise ValueError if they cannot be
+    written: more than six, a target outside 5..30, times outside the day, an
+    empty or backwards window, or two windows that overlap (touching is fine)."""
+    if len(blocks) > MAX_BLOCKS:
+        raise ValueError(f"a day can hold at most {MAX_BLOCKS} time frames")
+    ordered = sorted(blocks, key=lambda b: b.start)
+    for b in ordered:
+        if not (MIN_TARGET <= b.target <= MAX_TARGET):
+            raise ValueError(f"temperature must be {MIN_TARGET}-{MAX_TARGET} degrees")
+        if not (0 <= b.start < b.end <= DAY_MINUTES):
+            raise ValueError(f"invalid block times: start={b.start} end={b.end}")
+    for prev, nxt in zip(ordered, ordered[1:]):
+        if nxt.start < prev.end:
+            raise ValueError("time frames overlap")
+    return ordered
+
+
+def validate_days(days: list[int]) -> list[int]:
+    """Return the weekday indexes sorted and de-duplicated; each must be 0..6."""
+    if not days:
+        raise ValueError("a schedule pattern needs at least one day")
+    for day in days:
+        if not (0 <= day <= 6):
+            raise ValueError(f"invalid weekday: {day}")
+    return sorted(set(days))
+
+
 def _hm(minute: int) -> tuple[int, int]:
-    return minute // 60, minute % 60
+    # The vendor writer normalises hour 24 to 0, so a block ending at midnight
+    # goes out as 0:00 (inferred from the decompiled app, not live-tested).
+    return (minute // 60) % 24, minute % 60
 
 
 def build_program_command(
     zone: int, blocks: list[Block], days: list[int], modules: int = 1
 ) -> str:
     """Build the ``D#...*P#`` command applying ``blocks`` to every day in ``days``."""
-    if not days:
-        raise ValueError("a schedule pattern needs at least one day")
-    used = list(blocks)[:MAX_BLOCKS]
-    parts = [f"D#{zone}#{modules}#0#0*P#{weekday_bitmask(days)}"]
+    used = validate_blocks(list(blocks))
+    parts = [f"D#{zone}#{modules}#0#0*P#{weekday_bitmask(validate_days(days))}"]
     for block in used:
         sh, sm = _hm(block.start)
         eh, em = _hm(block.end)

@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
+import math
 import threading
-import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -27,7 +28,14 @@ from hearthmage.energy_store import EnergyStore
 from hearthmage.fake_client import FakeHearthClient
 from hearthmage.history import HistoryStore
 from hearthmage.holiday_store import HolidayStore
-from hearthmage.schedule import Block, WEEKDAY_NAMES
+from hearthmage.schedule import (
+    DAY_MINUTES,
+    MAX_BLOCKS,
+    MAX_TARGET,
+    MIN_TARGET,
+    WEEKDAY_NAMES,
+    Block,
+)
 from hearthmage.schedule_store import ScheduleStore
 from hearthmage.settings import Settings, config_path
 from hearthmage.sync_store import SyncStore
@@ -199,6 +207,8 @@ def get_client() -> HearthClient:
         if _client is None or _client_hub != hub:
             from hearthmage.nexho_client import NexhoLocalClient
 
+            _stop_client(_client)  # hub changed: the old poller must not keep running
+
             client = NexhoLocalClient(
                 settings.hub_ip,
                 settings.hub_port,
@@ -210,7 +220,7 @@ def get_client() -> HearthClient:
             client.start()  # begin background polling
             _client = client
             _client_hub = hub
-            _start_retry_loop(client)
+            _start_retry_loop()
             if mqtt_bridge is None and settings.mqtt_enabled:
                 _restart_mqtt()  # startup: nothing running yet, so this just starts it
             elif mqtt_bridge is not None and not mqtt_bridge.has_zones():
@@ -223,13 +233,27 @@ def get_client() -> HearthClient:
         return _client
 
 
-def _start_retry_loop(client: HearthClient) -> None:
+def _start_retry_loop() -> None:
     """Start the background schedule-sync retry thread once."""
     global _retry_started
     if _retry_started:
         return
     _retry_started = True
-    threading.Thread(target=_retry_loop, args=(client,), name="sync-retry", daemon=True).start()
+    threading.Thread(target=_retry_loop, name="sync-retry", daemon=True).start()
+
+
+def _stop_client(client: HearthClient | None) -> None:
+    stop = getattr(client, "stop", None)
+    if stop is not None:
+        stop()
+
+
+def _drop_client() -> None:
+    """Forget the hub client (stopping its poller); the next request rebuilds it."""
+    global _client, _client_hub
+    with _client_lock:
+        old, _client, _client_hub = _client, None, None
+    _stop_client(old)
 
 
 def _safe_rooms(client: HearthClient) -> tuple[list, str | None]:
@@ -466,10 +490,8 @@ def discover_hub(request: Request) -> HTMLResponse:
 
 @app.post("/settings/hub")
 def save_hub(hub_ip: str = Form(...), hub_port: int = Form(6653)) -> RedirectResponse:
-    global _client, _client_hub
     settings.set_hub(hub_ip, hub_port)
-    _client = None  # force a rebuild against the new hub
-    _client_hub = None
+    _drop_client()  # force a rebuild against the new hub
     return RedirectResponse("/", status_code=303)
 
 
@@ -505,7 +527,7 @@ def export_backup() -> Response:
 @app.post("/settings/import")
 async def import_backup(request: Request, backup: UploadFile = File(...)) -> Response:
     """Restore a previously exported bundle, then reload the live stores."""
-    global settings, schedules, _client, _client_hub
+    global settings, schedules
     raw = await backup.read()
     try:
         bundle = json.loads(raw.decode("utf-8"))
@@ -527,8 +549,12 @@ async def import_backup(request: Request, backup: UploadFile = File(...)) -> Res
     # same path we wrote, not the default, so a relocated config file is honoured.
     settings = Settings(settings.config_file)
     schedules = ScheduleStore(settings.schedules_path)
-    _client = None
-    _client_hub = None
+    _drop_client()
+    # The restored schedules are now the source of truth: queue every zone for
+    # the retry loop to push (it resolves the rebuilt client itself).
+    for zone in schedules.zone_ids():
+        sync.set(zone, "pending")
+    _retry_wake.set()
     return RedirectResponse("/settings", status_code=303)
 
 
@@ -734,85 +760,193 @@ def save_price(price_per_kwh: float = Form(...)) -> RedirectResponse:
 
 # ---- weekly schedule ----------------------------------------------------
 
+_sched_log = logging.getLogger("hearthmage.schedule")
 
-def _hhmm_to_minutes(value: str) -> int | None:
-    try:
-        hh, mm = value.split(":")
-        minutes = int(hh) * 60 + int(mm)
-    except (ValueError, AttributeError):
-        return None
-    return minutes if 0 <= minutes <= 24 * 60 else None
-
-
-def _minutes_to_hhmm(minutes: int) -> str:
-    return f"{minutes // 60:02d}:{minutes % 60:02d}"
-
-
-def _push_schedule(client: HearthClient, zone: str, blocks: list[Block], days: list[int]) -> None:
-    """Write a stored pattern to the hub in the background, tracking sync state."""
-    apply = getattr(client, "set_day_pattern", None)
-    if apply is None:
-        sync.set(zone, "synced")  # fake/offline client: nothing to push
-        return
-    try:
-        apply(zone, blocks, days)
-        sync.set(zone, "synced")
-    except HearthError:
-        sync.set(zone, "failed")  # persisted; the retry task re-pushes it later
-
-
-def _push_program(client: HearthClient, zone: str, active: bool) -> None:
-    """Turn a zone's whole program on/off on the hub, in the background."""
-    toggle = getattr(client, "set_program_active", None)
-    if toggle is None:
-        sync.set(zone, "synced")
-        return
-    try:
-        toggle(zone, active)
-        sync.set(zone, "synced")
-    except HearthError:
-        sync.set(zone, "failed")
+# Every schedule change re-sends the zone's whole week and program state from
+# the store (the source of truth), through at most one worker per zone. So
+# pushes cannot land out of order, and the final status always describes a full
+# push of the latest state: a later success can never hide an earlier failure.
+_sync_lock = threading.Lock()
+_sync_gen: dict[str, int] = {}  # zone -> bumped on every change
+_sync_running: set[str] = set()  # zones with a live sync worker
+_retry_wake = threading.Event()  # set to run the retry loop now instead of in 60s
 
 
 def _resync_zone(client: HearthClient, zone: str) -> bool:
-    """Re-push a zone's stored schedule and program state from the source of
-    truth. Returns True if everything was accepted by the hub."""
+    """Push a zone's stored week and program state to the hub. Returns True if
+    the hub accepted everything. Days missing from an owned week are sent as
+    cleared, so a cleared day can never survive on the hub."""
     ok = True
     apply = getattr(client, "set_day_pattern", None)
-    if apply is not None:
+    if apply is not None and schedules.owns(zone):
+        stored = schedules.get_zone(zone)
         # Group days that share an identical block list into one write each.
         groups: dict[tuple, list[int]] = {}
-        for day, blocks in schedules.get_zone(zone).items():
-            key = tuple((b.target, b.start, b.end) for b in blocks)
+        for day in range(7):
+            key = tuple((b.target, b.start, b.end) for b in stored.get(day, []))
             groups.setdefault(key, []).append(day)
         for key, days in groups.items():
             try:
                 apply(zone, [Block(*t) for t in key], days)
-            except HearthError:
+            except HearthError as exc:
+                _sched_log.warning("zone %s schedule push for days %s failed: %s", zone, days, exc)
                 ok = False
     toggle = getattr(client, "set_program_active", None)
     active = schedules.get_active(zone)
     if toggle is not None and active is not None:
         try:
             toggle(zone, active)
-        except HearthError:
+        except HearthError as exc:
+            _sched_log.warning("zone %s program on/off push failed: %s", zone, exc)
             ok = False
     return ok
 
 
+def _sync_until_settled(client: HearthClient, zone: str) -> None:
+    """Sync worker body; the caller has already added ``zone`` to _sync_running.
+    Pushes again if the schedule changed mid-push, then records the result."""
+    try:
+        while True:
+            with _sync_lock:
+                gen = _sync_gen.get(zone, 0)
+            ok = _resync_zone(client, zone)
+            with _sync_lock:
+                if _sync_gen.get(zone, 0) == gen:  # nothing changed while pushing
+                    _sync_running.discard(zone)
+                    sync.set(zone, "synced" if ok else "failed")
+                    return
+    except Exception:  # noqa: BLE001 - never leave the zone stuck on "pending"
+        _sched_log.exception("zone %s schedule sync crashed", zone)
+        with _sync_lock:
+            _sync_running.discard(zone)
+            try:
+                sync.set(zone, "failed")
+            except OSError:
+                pass
+
+
+def _request_sync(client: HearthClient, zone: str) -> None:
+    """Mark a zone pending and push it in the background (or let the running
+    worker pick the change up)."""
+    with _sync_lock:
+        _sync_gen[zone] = _sync_gen.get(zone, 0) + 1
+        sync.set(zone, "pending")
+        if zone in _sync_running:
+            return
+        _sync_running.add(zone)
+    threading.Thread(
+        target=_sync_until_settled, args=(client, zone), name="schedule-sync", daemon=True
+    ).start()
+
+
 def _retry_failed_syncs(client: HearthClient) -> None:
-    """Re-push every zone whose last sync failed; clear the ones that succeed."""
-    for zone in sync.failed_zones():
-        sync.set(zone, "synced" if _resync_zone(client, zone) else "failed")
+    """Push every zone not yet confirmed on the hub (failed, or queued as
+    pending), skipping any a worker is already pushing."""
+    for zone in sync.unsettled_zones():
+        with _sync_lock:
+            if zone in _sync_running:
+                continue
+            _sync_running.add(zone)
+        _sync_until_settled(client, zone)
 
 
-def _retry_loop(client: HearthClient) -> None:
+def _retry_loop() -> None:
     while True:
-        time.sleep(60)
+        _retry_wake.wait(60)
+        _retry_wake.clear()
         try:
-            _retry_failed_syncs(client)
-        except Exception:  # noqa: BLE001 - a bad retry cycle must not kill the loop
+            # Resolve the client each cycle so retries follow a hub change.
+            _retry_failed_syncs(get_client())
+        except NotConfigured:
             pass
+        except Exception:  # noqa: BLE001 - a bad retry cycle must not kill the loop
+            _sched_log.exception("schedule retry cycle failed")
+
+
+def _check_zone(zone_id: str) -> None:
+    """Zone ids are numeric; anything else is not a zone (and must never reach
+    the store, where non-numeric keys are reserved)."""
+    if not (zone_id.isascii() and zone_id.isdigit()):
+        raise HTTPException(status_code=404)
+
+
+def _hhmm_to_minutes(value: str, is_end: bool = False) -> int | None:
+    """Parse ``HH:MM`` to minutes of day. An end of 00:00 (or 24:00) means
+    midnight at the end of the day, 1440."""
+    hh, sep, mm = value.strip().partition(":")
+    if not (sep and hh.isascii() and hh.isdigit() and mm.isascii() and mm.isdigit()):
+        return None
+    h, m = int(hh), int(mm)
+    if h == 24 and m == 0 and is_end:
+        return DAY_MINUTES
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    minutes = h * 60 + m
+    return DAY_MINUTES if (is_end and minutes == 0) else minutes
+
+
+def _minutes_to_hhmm(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _parse_target(value: str) -> int | None:
+    try:
+        number = float(value)
+    except ValueError:
+        return None
+    if not math.isfinite(number) or number != int(number):
+        return None
+    target = int(number)
+    return target if MIN_TARGET <= target <= MAX_TARGET else None
+
+
+def _parse_schedule_form(form) -> tuple[list[dict], list[int], list[Block], list[str]]:
+    """Read the editor form. Returns (rows to re-render, days, blocks, general
+    errors); a row with a problem carries its own ``error`` message. Fully
+    blank rows are ignored; nothing else is dropped silently."""
+    errors: list[str] = []
+    rows: list[dict] = []
+    for target, start, end in zip(
+        form.getlist("block_target"), form.getlist("block_start"), form.getlist("block_end")
+    ):
+        row = {"target": str(target).strip(), "start": str(start).strip(),
+               "end": str(end).strip(), "error": None}
+        if not (row["target"] or row["start"] or row["end"]):
+            continue
+        rows.append(row)
+        if not (row["target"] and row["start"] and row["end"]):
+            row["error"] = "Fill in the temperature, start and end."
+            continue
+        t = _parse_target(row["target"])
+        smin = _hhmm_to_minutes(row["start"])
+        emin = _hhmm_to_minutes(row["end"], is_end=True)
+        if t is None:
+            row["error"] = f"Temperature must be a whole number from {MIN_TARGET} to {MAX_TARGET}."
+        elif smin is None or emin is None:
+            row["error"] = "Enter times as HH:MM."
+        elif emin <= smin:
+            row["error"] = ("Ends before it starts. To heat overnight, end this day at 00:00 "
+                            "and add a frame from 00:00 on the next day.")
+        else:
+            row["block"] = Block(t, smin, emin)
+    valid = sorted((r for r in rows if "block" in r), key=lambda r: r["block"].start)
+    for prev, nxt in zip(valid, valid[1:]):
+        if nxt["block"].start < prev["block"].end:
+            nxt["error"] = prev["error"] = "Overlaps another time frame."
+    if len(rows) > MAX_BLOCKS:
+        errors.append(f"A day can hold at most {MAX_BLOCKS} time frames.")
+    raw_days = [str(d) for d in form.getlist("days")]
+    days = [int(d) for d in raw_days if d.isascii() and d.isdigit() and int(d) <= 6]
+    if len(days) != len(raw_days):
+        errors.append("Unknown day selected.")
+    if not raw_days:
+        errors.append("Choose at least one day.")
+    if not rows:
+        errors.append("Add at least one time frame. To remove a day's schedule, use Clear on that day.")
+    blocks = [r["block"] for r in rows if "block" in r and not r["error"]]
+    if any(r["error"] for r in rows):
+        errors.insert(0, "Some time frames need fixing.")
+    return rows, sorted(set(days)), blocks, errors
 
 
 def _schedule_view(zone: str):
@@ -829,7 +963,7 @@ def _schedule_view(zone: str):
                     {
                         "target": b.target,
                         "start": _minutes_to_hhmm(b.start),
-                        "end": _minutes_to_hhmm(b.end),
+                        "end": _minutes_to_hhmm(b.end),  # 1440 shows as 24:00
                     }
                     for b in blocks
                 ],
@@ -838,9 +972,33 @@ def _schedule_view(zone: str):
     return rows
 
 
-@app.get("/zones/{zone_id}/schedule", response_class=HTMLResponse)
-def schedule_page(
-    request: Request, zone_id: str, client: HearthClient = Depends(get_client)
+def _editor_for_day(zone: str, day: int) -> dict:
+    """Editor state preloaded with one day's stored time frames."""
+    rows = [
+        {"target": str(b.target), "start": _minutes_to_hhmm(b.start),
+         "end": _minutes_to_hhmm(b.end % DAY_MINUTES), "error": None}  # 24:00 -> 00:00 input
+        for b in schedules.get_day(zone, day)
+    ]
+    return {
+        "title": f"Edit {WEEKDAY_NAMES[day]}",
+        "editing": True,
+        "rows": rows or [{"target": "20", "start": "07:00", "end": "22:00", "error": None}],
+        "days": [day],
+        "errors": [],
+    }
+
+
+_NEW_EDITOR = {
+    "title": "New pattern",
+    "editing": False,
+    "rows": [{"target": "20", "start": "07:00", "end": "22:00", "error": None}],
+    "days": [],
+    "errors": [],
+}
+
+
+def _render_schedule(
+    request: Request, zone_id: str, client: HearthClient, editor: dict, status_code: int = 200
 ) -> HTMLResponse:
     room = _find_room(client, zone_id)
     name = room.name if room else f"Zone {zone_id}"
@@ -856,52 +1014,61 @@ def schedule_page(
             "active": schedules.get_active(zone_id),
             "weekdays": list(enumerate(WEEKDAY_NAMES)),
             "sync": sync.get(zone_id),
-            "holiday": holidays.get(zone_id),
+            "holiday": _current_holiday(zone_id),
+            "editor": editor,
+            "max_blocks": MAX_BLOCKS,
+            "min_target": MIN_TARGET,
+            "max_target": MAX_TARGET,
         },
+        status_code=status_code,
     )
+
+
+@app.get("/zones/{zone_id}/schedule", response_class=HTMLResponse)
+def schedule_page(
+    request: Request, zone_id: str, edit: str = "", client: HearthClient = Depends(get_client)
+) -> HTMLResponse:
+    _check_zone(zone_id)
+    if edit.isascii() and edit.isdigit() and int(edit) <= 6:
+        editor = _editor_for_day(zone_id, int(edit))
+    else:
+        editor = _NEW_EDITOR
+    return _render_schedule(request, zone_id, client, editor)
 
 
 @app.post("/zones/{zone_id}/schedule")
 async def save_schedule(
     request: Request, zone_id: str, client: HearthClient = Depends(get_client)
-) -> RedirectResponse:
+) -> Response:
+    _check_zone(zone_id)
     form = await request.form()
-    days = [int(d) for d in form.getlist("days") if str(d).isdigit()]
-    blocks: list[Block] = []
-    for target, start, end in zip(
-        form.getlist("block_target"), form.getlist("block_start"), form.getlist("block_end")
-    ):
-        if not (target and start and end):
-            continue
-        smin, emin = _hhmm_to_minutes(str(start)), _hhmm_to_minutes(str(end))
-        if smin is None or emin is None or smin >= emin:
-            continue  # skip malformed rows rather than fail the whole save
-        blocks.append(Block(int(round(float(target))), smin, emin))
-
-    if days and blocks:
-        schedules.set_pattern(zone_id, blocks, days)
-        sync.set(zone_id, "pending")
-        threading.Thread(
-            target=_push_schedule,
-            args=(client, zone_id, blocks, days),
-            name="schedule-sync",
-            daemon=True,
-        ).start()
+    rows, days, blocks, errors = _parse_schedule_form(form)
+    if errors:
+        editor = {
+            "title": (
+                (f"Edit {WEEKDAY_NAMES[days[0]]}" if len(days) == 1 else "Edit pattern")
+                if form.get("editing") == "1" else "New pattern"
+            ),
+            "editing": form.get("editing") == "1",
+            "rows": rows[:MAX_BLOCKS] or _NEW_EDITOR["rows"],
+            "days": days,
+            "errors": errors,
+        }
+        return _render_schedule(request, zone_id, client, editor, status_code=400)
+    schedules.set_pattern(zone_id, blocks, days)
+    _request_sync(client, zone_id)
     return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
 
 
 @app.post("/zones/{zone_id}/schedule/clear")
 def clear_schedule_day(
     zone_id: str, day: int = Form(...), client: HearthClient = Depends(get_client)
-) -> RedirectResponse:
+) -> Response:
+    _check_zone(zone_id)
+    if not 0 <= day <= 6:
+        return PlainTextResponse("Unknown day", status_code=400)
     schedules.clear_day(zone_id, day)
-    sync.set(zone_id, "pending")
-    threading.Thread(
-        target=_push_schedule,
-        args=(client, zone_id, [], [day]),  # empty pattern = disabled blocks
-        name="schedule-sync",
-        daemon=True,
-    ).start()
+    _request_sync(client, zone_id)
     return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
 
 
@@ -909,19 +1076,15 @@ def clear_schedule_day(
 def toggle_program(
     zone_id: str, active: int = Form(...), client: HearthClient = Depends(get_client)
 ) -> RedirectResponse:
+    _check_zone(zone_id)
     schedules.set_active(zone_id, bool(active))  # our app is the source of truth for this
-    sync.set(zone_id, "pending")
-    threading.Thread(
-        target=_push_program,
-        args=(client, zone_id, bool(active)),
-        name="program-toggle",
-        daemon=True,
-    ).start()
+    _request_sync(client, zone_id)
     return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
 
 
 @app.get("/zones/{zone_id}/schedule/sync", response_class=HTMLResponse)
 def schedule_sync_status(request: Request, zone_id: str) -> HTMLResponse:
+    _check_zone(zone_id)
     return templates.TemplateResponse(
         request,
         "_sync_status.html",
@@ -932,6 +1095,21 @@ def schedule_sync_status(request: Request, zone_id: str) -> HTMLResponse:
 # ---- holiday hold -------------------------------------------------------
 
 
+def _current_holiday(zone_id: str) -> dict | None:
+    """The zone's holiday record, or None once its end date has passed (the hub
+    resumes on its own then, so the record would only mislead)."""
+    record = holidays.get(zone_id)
+    if record and record.get("year"):
+        try:
+            ended = date(record["year"], record["month"], record["day"]) < date.today()
+        except (TypeError, ValueError):
+            ended = True
+        if ended:
+            holidays.clear(zone_id)
+            return None
+    return record
+
+
 @app.post("/zones/{zone_id}/holiday")
 def start_holiday(
     zone_id: str,
@@ -939,11 +1117,13 @@ def start_holiday(
     temp: float = Form(7.0),
     client: HearthClient = Depends(get_client),
 ) -> Response:
+    _check_zone(zone_id)
     setter = getattr(client, "set_holiday", None)
     try:
-        year, month, day = (int(p) for p in until.split("-"))
-    except (ValueError, AttributeError):
+        until_date = date.fromisoformat(until)
+    except ValueError:
         return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
+    year, month, day = until_date.year, until_date.month, until_date.day
     if setter is not None:
         try:
             setter(zone_id, day=day, month=month, temp=temp)
@@ -952,12 +1132,13 @@ def start_holiday(
     # Remember the setpoint to restore if the hold is cancelled early.
     room = _find_room(client, zone_id)
     prev = room.target_temp if (room and not room.is_off) else None
-    holidays.set(zone_id, day=day, month=month, temp=temp, prev_setpoint=prev)
+    holidays.set(zone_id, day=day, month=month, temp=temp, prev_setpoint=prev, year=year)
     return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
 
 
 @app.post("/zones/{zone_id}/holiday/cancel")
 def cancel_holiday(zone_id: str, client: HearthClient = Depends(get_client)) -> Response:
+    _check_zone(zone_id)
     clearer = getattr(client, "clear_holiday", None)
     if clearer is not None:
         try:
