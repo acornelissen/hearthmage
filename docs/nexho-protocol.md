@@ -161,25 +161,31 @@ decodes and displays whatever a real reply would contain, guarded so the `ER`
 case is simply "no reading". If a radiator ever does answer `*?UD`, capture the
 payload and confirm the field order here. See `src/hearthmage/energy.py`.
 
-## Holiday hold (`*RH`, confirmed live)
+## Holiday hold (`*RH`; fields from the vendor app)
 
-A zone can be held at a frost temperature until a date, on the hub itself (it
-auto-resumes), decoded live:
+The hub holds a zone until the occupants are back, then switches to an
+"arrival" temperature or back to the weekly program. Field meanings come from
+the decompiled vendor app (`AdvConfigHoliday`, `a0/j.java`; screen labels
+"Arrival date", "Arrival time", "Arrival temperature"):
 
 ```
-D#<zone>#1#0#0*RH#<day>#<month>#0#<tempEncoded>/  ->  OK   (hold until day/month)
-D#<zone>#1#0#0*RH#0#0#0#251/                      ->  OK   (cancel; reads back 253)
-R#<zone>#1#0#0*?RH/  ->  OK,RH,<...,day@10,month@11,_,tempEncoded@13,...>
+D#<zone>#<mod>#0#0*RH#<days from today>#<hour>#<minute>#<arrival>/  ->  OK
+D#<zone>#<mod>#0#0*RH#0#0#0#251/                                     ->  OK   (cancel)
+R#<zone>#1#0#0*?RH/  ->  OK,RH,<status...>,<days left>@10,<hour>@11,<minute>@12,<arrival>@13,...
 ```
 
-- The temperature uses the same whole/half encoding as `*T`.
-- The third write field was `0` in the live test; its meaning (year or hour) is
-  unknown and left at 0.
-- **Live test** (zone 1): `*RH#5#11#0#7` set the hold and the read-back showed
-  `...,5,11,0,7,...` with the active setpoint dropping to 7 °C; `*RH#0#0#0#251`
-  cleared it (fields read back as `253`). Note cancelling leaves the zone at the
-  frost temperature rather than the prior setpoint, so this app restores the
-  pre-holiday setpoint itself on cancel.
+- `<arrival>` uses the `*T` encoding (half degree = value + 127.5); `251` means
+  "resume the weekly program" (the vendor sends it for zones with a program).
+- Read-back: `[10]` days left, `<= 240` means a hold is set and `253` none;
+  `[13]` `251` = program. Live 2026-11-01, no holds: `...,253,0,0,253,...`.
+- What the zone runs at *during* the hold is not stated by the app; presumably
+  its anti-ice temperature (`1#20`, 7 °C by default). Not live-tested.
+- Before 2026-11-01 this app sent `*RH#<day of month>#<month>#0#<temp>`, which
+  the hub reads as "<day-of-month> days from now at <month>:00". The earlier
+  live test (`*RH#5#11#0#7`, setpoint dropping to 7) fits either reading.
+- Cancelling was seen live to leave the zone at its holiday level, so this app
+  restores the previous target on cancel unless a weekly program is running
+  (the vendor app restores nothing).
 
 ## Radiator status and clock (`*?F`, live read; fields partly inferred)
 

@@ -87,20 +87,18 @@ class FakeHearthClient:
         if sensor_offset is not None:
             cfg["sensor_offset"] = round(float(sensor_offset), 1)
 
-    def set_holiday(self, room_id: str, day: int, month: int, temp: float) -> None:
+    def set_holiday(self, room_id: str, days: int, hour: int, minute: int, arrival_temp) -> None:
         self._get(room_id)
-        self.holiday[room_id] = {"active": True, "day": int(day), "month": int(month),
-                                 "temp": float(temp)}
+        self.holiday[room_id] = {"active": True, "days": int(days), "hour": int(hour),
+                                 "minute": int(minute), "arrival_temp": arrival_temp}
 
     def clear_holiday(self, room_id: str) -> None:
         self._get(room_id)
-        self.holiday[room_id] = {"active": False, "day": None, "month": None, "temp": None}
+        self.holiday[room_id] = {"active": False}
 
     def read_holiday(self, room_id: str) -> dict | None:
         self._get(room_id)
-        return self.holiday.get(
-            room_id, {"active": False, "day": None, "month": None, "temp": None}
-        )
+        return self.holiday.get(room_id, {"active": False})
 
     def read_energy(self, room_id: str) -> dict | None:
         self._get(room_id)  # validate the zone exists

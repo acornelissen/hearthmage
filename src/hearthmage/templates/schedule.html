@@ -200,30 +200,42 @@
       <button type="submit" class="apply apply-wide">Save &amp; apply</button>
     </form>
 
-    <section class="panel">
-      <h2 class="panel-title">Holiday</h2>
+    <section class="panel" id="holiday" aria-labelledby="holiday-title">
+      <h2 class="panel-title" id="holiday-title">Holiday</h2>
+      {% if holiday_error %}<p class="error" role="alert">{{ holiday_error }}</p>{% endif %}
       {% if holiday %}
-      <p class="panel-note">Holding at <strong>{{ '%.1f'|format(holiday.temp) }}&deg;C</strong>
-        until <strong>{{ '%02d'|format(holiday.day) }}/{{ '%02d'|format(holiday.month) }}</strong>.
-        The hub keeps this even if this app is off, and resumes on its own.</p>
+      <p class="panel-note">Away until <strong>{{ holiday.until_label }}</strong>, then
+        {% if holiday.arrival_temp is none %}back to the <strong>weekly schedule</strong>.
+        {% else %}<strong>{{ '%g'|format(holiday.arrival_temp) }}&deg;C</strong>.{% endif %}
+        The hub keeps this even if this app is off.</p>
       <form method="post" action="/zones/{{ zone_id }}/holiday/cancel">
         <button type="submit" class="btn btn-ghost">Cancel holiday</button>
       </form>
       {% else %}
-      <p class="panel-note">Hold this zone at a frost temperature until a date, on the
-        hub itself &mdash; so it works even while this app is switched off.</p>
+      <p class="panel-note">Tell the hub when you&rsquo;re back. Until then it keeps the room
+        low; at that time it switches to the schedule or a temperature you choose. This runs
+        on the hub itself, so it works even while this app is switched off.</p>
       <form method="post" action="/zones/{{ zone_id }}/holiday">
         <div class="field-grid two">
           <div class="field">
-            <label class="field-label" for="until">Until</label>
+            <label class="field-label" for="until">Back on</label>
             <input class="field-input" id="until" name="until" type="date" required>
           </div>
           <div class="field">
-            <label class="field-label" for="temp">Hold at &deg;C</label>
-            <input class="field-input" id="temp" name="temp" type="number"
-                   step="0.5" min="5" max="30" value="7" inputmode="decimal">
+            <label class="field-label" for="until_time">At</label>
+            <input class="field-input" id="until_time" name="until_time" type="time" value="12:00" required>
           </div>
         </div>
+        <fieldset class="days-picker holiday-arrival">
+          <legend>When you&rsquo;re back</legend>
+          <label class="radio"><input type="radio" name="arrival" value="program"
+                 {% if active is true %}checked{% endif %}> Go back to the weekly schedule</label>
+          <label class="radio"><input type="radio" name="arrival" value="temp"
+                 {% if active is not true %}checked{% endif %}> Heat to
+            <input class="field-input inline-temp" name="arrival_temp" type="number" min="{{ min_target }}"
+                   max="{{ max_target }}" step="1" value="20" inputmode="numeric"
+                   aria-label="Temperature when you're back, in degrees C"> &deg;C</label>
+        </fieldset>
         <button type="submit" class="btn">Start holiday</button>
       </form>
       {% endif %}

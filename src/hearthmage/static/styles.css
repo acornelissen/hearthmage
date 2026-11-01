@@ -885,3 +885,10 @@ a.link-btn:hover { text-decoration: underline; }
 .waste-table th, .waste-table td { text-align: left; padding: .25rem .9rem .25rem 0; }
 .waste-table thead th { color: var(--muted); font-size: .8rem; }
 .waste-diag .raw code { overflow-wrap: anywhere; font-size: .8rem; }
+
+/* ---- holiday ------------------------------------------------------------ */
+
+.holiday-arrival { margin: .4rem 0 1rem; display: grid; gap: .5rem; }
+.holiday-arrival .radio { display: flex; align-items: center; gap: .5rem; min-height: var(--tap); }
+.holiday-arrival input[type="radio"] { width: 1.2rem; height: 1.2rem; accent-color: var(--heat-b); }
+.inline-temp { width: 4.5rem; min-height: 2.5rem; padding: 0 .5rem; }

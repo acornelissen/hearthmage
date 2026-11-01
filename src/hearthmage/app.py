@@ -1194,6 +1194,7 @@ def _render_schedule(
     editor: dict,
     status_code: int = 200,
     loaded: dict | None = None,
+    holiday_error: str | None = None,
 ) -> HTMLResponse:
     room = _find_room(client, zone_id)
     name = room.name if room else f"Zone {zone_id}"
@@ -1210,6 +1211,7 @@ def _render_schedule(
             "weekdays": list(enumerate(WEEKDAY_NAMES)),
             "sync": sync.get(zone_id),
             "holiday": _current_holiday(zone_id),
+            "holiday_error": holiday_error,
             "editor": editor,
             "loaded": loaded,
             "can_load": hasattr(client, "read_day_pattern"),
@@ -1361,45 +1363,78 @@ def schedule_sync_status(request: Request, zone_id: str) -> HTMLResponse:
 
 # ---- holiday hold -------------------------------------------------------
 
+_HOLIDAY_MAX_DAYS = 240  # the hub's limit (*RH days field)
+
 
 def _current_holiday(zone_id: str) -> dict | None:
-    """The zone's holiday record, or None once its end date has passed (the hub
-    resumes on its own then, so the record would only mislead)."""
+    """The zone's holiday hold for display, or None. Records whose end has
+    passed (the hub resumes on its own) or that predate the corrected hub
+    encoding (no "until") are dropped."""
     record = holidays.get(zone_id)
-    if record and record.get("year"):
-        try:
-            ended = date(record["year"], record["month"], record["day"]) < date.today()
-        except (TypeError, ValueError):
-            ended = True
-        if ended:
-            holidays.clear(zone_id)
-            return None
-    return record
+    if not record:
+        return None
+    try:
+        until = datetime.fromisoformat(record["until"])
+    except (KeyError, TypeError, ValueError):
+        holidays.clear(zone_id)
+        return None
+    if until <= datetime.now():
+        holidays.clear(zone_id)
+        return None
+    return {
+        "until_label": f"{until:%a %d %b}, {until:%H:%M}",
+        "arrival_temp": record.get("arrival_temp"),
+    }
+
+
+def _parse_holiday_form(form) -> tuple[datetime, float | None]:
+    """Validate the holiday form; raises ValueError with a message for the user."""
+    try:
+        end_date = date.fromisoformat(str(form.get("until", "")))
+    except ValueError:
+        raise ValueError("Choose the date you're back.") from None
+    minutes = _hhmm_to_minutes(str(form.get("until_time") or "12:00"))
+    if minutes is None:
+        raise ValueError("Enter the time you're back as HH:MM.")
+    until = datetime(end_date.year, end_date.month, end_date.day, minutes // 60, minutes % 60)
+    if until <= datetime.now():
+        raise ValueError("The return date and time must be in the future.")
+    if (until.date() - date.today()).days > _HOLIDAY_MAX_DAYS:
+        raise ValueError(f"The hub can hold a zone for at most {_HOLIDAY_MAX_DAYS} days.")
+    if form.get("arrival") == "program":
+        return until, None
+    arrival = _parse_target(str(form.get("arrival_temp", "")))
+    if arrival is None:
+        raise ValueError(f"The temperature for your return must be {MIN_TARGET} to {MAX_TARGET} °C.")
+    return until, float(arrival)
 
 
 @app.post("/zones/{zone_id}/holiday")
-def start_holiday(
-    zone_id: str,
-    until: str = Form(...),
-    temp: float = Form(7.0),
-    client: HearthClient = Depends(get_client),
+async def start_holiday(
+    request: Request, zone_id: str, client: HearthClient = Depends(get_client)
 ) -> Response:
     _check_zone(zone_id)
-    setter = getattr(client, "set_holiday", None)
+    form = await request.form()
     try:
-        until_date = date.fromisoformat(until)
-    except ValueError:
-        return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
-    year, month, day = until_date.year, until_date.month, until_date.day
+        until, arrival = _parse_holiday_form(form)
+    except ValueError as exc:
+        return _render_schedule(
+            request, zone_id, client, _NEW_EDITOR, status_code=400, holiday_error=str(exc)
+        )
+    setter = getattr(client, "set_holiday", None)
     if setter is not None:
         try:
-            setter(zone_id, day=day, month=month, temp=temp)
-        except HearthError:
-            return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
+            setter(zone_id, days=(until.date() - date.today()).days, hour=until.hour,
+                   minute=until.minute, arrival_temp=arrival)
+        except HearthError as exc:
+            return _render_schedule(
+                request, zone_id, client, _NEW_EDITOR, status_code=502,
+                holiday_error=f"The hub didn't accept the holiday: {exc}",
+            )
     # Remember the setpoint to restore if the hold is cancelled early.
     room = _find_room(client, zone_id)
     prev = room.target_temp if (room and not room.is_off) else None
-    holidays.set(zone_id, day=day, month=month, temp=temp, prev_setpoint=prev, year=year)
+    holidays.set(zone_id, until=f"{until:%Y-%m-%dT%H:%M}", arrival_temp=arrival, prev_setpoint=prev)
     return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
 
 
@@ -1410,10 +1445,11 @@ def cancel_holiday(zone_id: str, client: HearthClient = Depends(get_client)) -> 
     if clearer is not None:
         try:
             clearer(zone_id)
-            # Cancelling leaves the zone at the frost temp; restore what it held.
+            # Cancelling was seen live to leave the zone at its holiday level, so
+            # restore the target it had, unless a weekly program is driving it.
             record = holidays.get(zone_id)
             prev = record.get("prev_setpoint") if record else None
-            if prev is not None:
+            if prev is not None and schedules.get_active(zone_id) is not True:
                 client.set_temperature(zone_id, prev)
         except HearthError:
             pass

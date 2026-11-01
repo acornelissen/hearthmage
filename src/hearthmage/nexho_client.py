@@ -596,37 +596,46 @@ class NexhoLocalClient:
             self._write_element(zone, *self._EL_OFFSET, round(sensor_offset * 10) & 0xFF, op="R")
 
     # ---- holiday hold (*RH) ----------------------------------------------
-    # Confirmed live: D#<z>#1#0#0*RH#<day>#<month>#0#<tempEncoded>/ holds the zone
-    # at the frost temp until the date; *RH#0#0#0#251 clears it (reads back 253).
-    # The read *?RH returns OK,RH,<...>, with day/month/temp at fixed offsets.
-    _RH_OFF_SENTINELS = (0, 251, 253)
+    # From the decompiled vendor app (AdvConfigHoliday, a0/j.java):
+    #   D#<z>#<mod>#0#0*RH#<days from today>#<hour>#<minute>#<arrival temp>/
+    # sets the date and time the occupants are back and the temperature to
+    # switch to then (251 = resume the weekly program); *RH#0#0#0#251 clears it.
+    # The read *?RH returns OK,RH,... with [10] days left (<= 240 means a hold is
+    # set, 253 none), [11] hour, [12] minute, [13] arrival temp (251 = program).
+    _RH_RESUME_PROGRAM = 251
+    _RH_MAX_DAYS = 240
 
-    def set_holiday(self, room_id: str, day: int, month: int, temp: float) -> None:
-        """Hold a zone at ``temp`` until ``day``/``month`` (hub-side, auto-resumes)."""
+    def set_holiday(
+        self, room_id: str, days: int, hour: int, minute: int, arrival_temp: float | None
+    ) -> None:
+        """Away until ``days`` from today at ``hour``:``minute``; then switch to
+        ``arrival_temp``, or back to the weekly program if it is None."""
         zone = _zone_int(room_id)
-        resp = self._ask(
-            f"D#{zone}#1#0#0*RH#{int(day)}#{int(month)}#0#{_encode_setpoint(temp)}/",
-            _WRITE_RETRIES,
-            _WRITE_TIMEOUT,
-            priority=True,
+        if not (0 <= days <= self._RH_MAX_DAYS and 0 <= hour <= 23 and 0 <= minute <= 59):
+            raise HearthError(f"Invalid holiday end: {days} days, {hour}:{minute:02d}")
+        if arrival_temp is None:
+            arrival = self._RH_RESUME_PROGRAM
+        elif _MIN_TEMP <= arrival_temp <= _MAX_TEMP:
+            arrival = _encode_setpoint(arrival_temp)
+        else:
+            raise HearthError(f"Arrival temperature {arrival_temp} out of range")
+        resp = self._ask_until_answered(
+            f"D#{zone}#1#0#0*RH#{int(days)}#{int(hour)}#{int(minute)}#{arrival}/", "OK", priority=True
         )
-        if not resp.startswith("OK"):
+        if resp != "OK":
             raise HearthError(f"Holiday set failed for zone {zone}: {resp!r}")
 
     def clear_holiday(self, room_id: str) -> None:
-        """Cancel a zone's holiday hold (the off sentinel 251)."""
+        """Cancel a zone's holiday hold (the vendor's clear: *RH#0#0#0#251)."""
         zone = _zone_int(room_id)
-        resp = self._ask(
-            f"D#{zone}#1#0#0*RH#0#0#0#251/", _WRITE_RETRIES, _WRITE_TIMEOUT, priority=True
+        resp = self._ask_until_answered(
+            f"D#{zone}#1#0#0*RH#0#0#0#{self._RH_RESUME_PROGRAM}/", "OK", priority=True
         )
-        if not resp.startswith("OK"):
+        if resp != "OK":
             raise HearthError(f"Holiday clear failed for zone {zone}: {resp!r}")
 
     def read_holiday(self, room_id: str) -> dict | None:
-        """Read a zone's holiday hold; None if the radiator did not answer.
-
-        The reply is ``OK,RH,<fields>`` with day at index 10, month at 11 and the
-        (encoded) hold temperature at 13; an off hold reads those as sentinels."""
+        """Read a zone's holiday hold; None if the radiator did not answer."""
         zone = _zone_int(room_id)
         try:
             resp = self._ask(f"R#{zone}#1#0#0*?RH/", _READ_RETRIES, _READ_TIMEOUT)
@@ -635,14 +644,16 @@ class NexhoLocalClient:
         parts = resp.split(",")
         if not resp.startswith("OK,RH,") or len(parts) < 14:
             return None
-        temp_field = _as_int(parts[13])
-        if temp_field is None or temp_field in self._RH_OFF_SENTINELS:
-            return {"active": False, "day": None, "month": None, "temp": None}
+        days, hour, minute, arrival = (_as_int(p) for p in parts[10:14])
+        if days is None or days > self._RH_MAX_DAYS:
+            return {"active": False}
         return {
             "active": True,
-            "day": _as_int(parts[10]),
-            "month": _as_int(parts[11]),
-            "temp": _decode_setpoint(temp_field),
+            "days_left": days,
+            "hour": hour,
+            "minute": minute,
+            "arrival_temp": None if arrival == self._RH_RESUME_PROGRAM or arrival is None
+            else _decode_setpoint(arrival),
         }
 
     def read_energy(self, room_id: str) -> dict | None:

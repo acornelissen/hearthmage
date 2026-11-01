@@ -414,42 +414,67 @@ def test_energy_poll_step_skips_when_no_callback():
     assert client._energy_queue == []
 
 
-def test_set_holiday_sends_rh_with_encoded_temp():
+def _holiday_client(reply: str = "OK"):
     sent: list[str] = []
     client = NexhoLocalClient("10.0.0.99")
-    client._ask = lambda cmd, r, t, priority=False: sent.append(cmd) or "OK"  # type: ignore[method-assign]
-    client.set_holiday("1", day=5, month=11, temp=7.0)
-    assert sent == ["D#1#1#0#0*RH#5#11#0#7/"]
+    client._ask = lambda cmd, *a, **k: sent.append(cmd) or reply  # type: ignore[method-assign]
+    return client, sent
 
 
-def test_set_holiday_half_degree_temp_encoded():
-    sent: list[str] = []
-    client = NexhoLocalClient("10.0.0.99")
-    client._ask = lambda cmd, r, t, priority=False: sent.append(cmd) or "OK"  # type: ignore[method-assign]
-    client.set_holiday("2", day=1, month=1, temp=7.5)
-    assert sent == ["D#2#1#0#0*RH#1#1#0#135/"]  # 7.5 -> 135 (whole/half encoding)
+def test_set_holiday_sends_days_hour_minute_and_arrival_temp():
+    # Vendor (AdvConfigHoliday): *RH#<days from today>#<hour>#<minute>#<arrival temp>
+    client, sent = _holiday_client()
+    client.set_holiday("1", days=4, hour=17, minute=30, arrival_temp=20.0)
+    assert sent == ["D#1#1#0#0*RH#4#17#30#20/"]
 
 
-def test_clear_holiday_sends_off_sentinel():
-    sent: list[str] = []
-    client = NexhoLocalClient("10.0.0.99")
-    client._ask = lambda cmd, r, t, priority=False: sent.append(cmd) or "OK"  # type: ignore[method-assign]
+def test_set_holiday_half_degree_and_resume_program():
+    client, sent = _holiday_client()
+    client.set_holiday("2", days=1, hour=8, minute=0, arrival_temp=20.5)
+    client.set_holiday("2", days=1, hour=8, minute=0, arrival_temp=None)
+    assert sent == ["D#2#1#0#0*RH#1#8#0#148/", "D#2#1#0#0*RH#1#8#0#251/"]  # 251 = resume program
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"days": 241, "hour": 8, "minute": 0, "arrival_temp": 20.0},
+    {"days": -1, "hour": 8, "minute": 0, "arrival_temp": 20.0},
+    {"days": 3, "hour": 24, "minute": 0, "arrival_temp": 20.0},
+    {"days": 3, "hour": 8, "minute": 60, "arrival_temp": 20.0},
+    {"days": 3, "hour": 8, "minute": 0, "arrival_temp": 3.0},
+])
+def test_set_holiday_rejects_bad_values(kwargs):
+    client, sent = _holiday_client()
+    with pytest.raises(HearthError):
+        client.set_holiday("1", **kwargs)
+    assert sent == []
+
+
+def test_clear_holiday_sends_the_vendor_clear():
+    client, sent = _holiday_client()
     client.clear_holiday("1")
     assert sent == ["D#1#1#0#0*RH#0#0#0#251/"]
 
 
-def test_set_holiday_raises_when_not_acked():
-    client = make_client({"D#1#1#0#0*RH": "ER,1"})
-    with pytest.raises(HearthError):
-        client.set_holiday("1", day=5, month=11, temp=7.0)
+def test_set_holiday_needs_a_bare_ok(monkeypatch):
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc.time, "sleep", lambda s: None)
+    for reply in ("ER,1", "OK,1"):
+        client, _ = _holiday_client(reply)
+        with pytest.raises(HearthError):
+            client.set_holiday("1", days=4, hour=17, minute=30, arrival_temp=20.0)
 
 
-def test_read_holiday_active_and_inactive():
-    active = make_client({"R#1#1#0#0*?RH/": "OK,RH,17,1,7,10,53,32,6,0,5,11,0,7,6,1,0,0"})
-    assert active.read_holiday("1") == {"active": True, "day": 5, "month": 11, "temp": 7.0}
-
-    off = make_client({"R#2#1#0#0*?RH/": "OK,RH,17,1,13,10,53,28,6,0,253,0,0,253,6,1"})
-    assert off.read_holiday("2") == {"active": False, "day": None, "month": None, "temp": None}
+def test_read_holiday_follows_the_vendor_fields():
+    # [10] days left (<= 240 = a hold is set), [11] hour, [12] minute, [13] arrival temp
+    live_none = "OK,RH,14,5,5,22,1,47,6,11,253,0,0,253,6,1,0,0,0,0,0,0,0,0,0"  # 2026-11-01
+    client = make_client({"R#1#1#0#0*?RH/": live_none})
+    assert client.read_holiday("1") == {"active": False}
+    held = make_client({"R#1#1#0#0*?RH/": "OK,RH,14,5,5,22,1,47,6,11,4,17,30,148,6,1,0"})
+    assert held.read_holiday("1") == {"active": True, "days_left": 4, "hour": 17, "minute": 30,
+                                      "arrival_temp": 20.5}
+    program = make_client({"R#1#1#0#0*?RH/": "OK,RH,14,5,5,22,1,47,6,11,0,9,0,251,6,1,0"})
+    assert program.read_holiday("1")["arrival_temp"] is None  # resume the weekly program
 
 
 def test_read_config_decodes_every_setting():

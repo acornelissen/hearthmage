@@ -947,10 +947,18 @@ def test_import_backup_rejects_invalid_schedules(client, tmp_path, monkeypatch):
 def test_expired_holiday_is_not_shown(client, tmp_path, monkeypatch):
     appmod = _with_holiday(tmp_path, monkeypatch)
     _with_store(tmp_path, monkeypatch)
-    appmod.holidays.set("1", day=1, month=1, temp=7.0, prev_setpoint=None, year=2020)
+    appmod.holidays.set("1", until="2020-01-01T08:00", arrival_temp=20.0, prev_setpoint=None)
     assert "Cancel holiday" not in client.get("/zones/1/schedule").text
     assert appmod.holidays.get("1") is None
 
+
+def test_old_format_holiday_record_is_dropped(client, tmp_path, monkeypatch):
+    # Records from before 2026-11-01 were sent to the hub with the wrong fields.
+    appmod = _with_holiday(tmp_path, monkeypatch)
+    _with_store(tmp_path, monkeypatch)
+    appmod.holidays._data["1"] = {"day": 5, "month": 11, "temp": 7.0, "prev_setpoint": None}
+    assert "Cancel holiday" not in client.get("/zones/1/schedule").text
+    assert appmod.holidays.get("1") is None
 
 def test_push_is_verified_by_reading_the_hub_back(tmp_path, monkeypatch):
     appmod = _with_store(tmp_path, monkeypatch)
@@ -1068,43 +1076,99 @@ def _with_holiday(tmp_path, monkeypatch):
     return appmod
 
 
-def test_start_holiday_sets_hub_and_store(client: TestClient, tmp_path, monkeypatch):
+def _in_days(n: int) -> str:
+    from datetime import date, timedelta
+
+    return (date.today() + timedelta(days=n)).isoformat()
+
+
+def test_start_holiday_sends_days_from_today(client: TestClient, tmp_path, monkeypatch):
     appmod = _with_holiday(tmp_path, monkeypatch)
-    _with_store(tmp_path, monkeypatch)  # schedule page reads sync/schedules too
+    _with_store(tmp_path, monkeypatch)
     resp = client.post(
         "/zones/1/holiday",
-        data={"until": "2026-11-05", "temp": "7"},
+        data={"until": _in_days(4), "until_time": "17:30", "arrival": "temp", "arrival_temp": "20"},
         follow_redirects=False,
     )
     assert resp.status_code == 303
     assert resp.headers["location"] == "/zones/1/schedule"
     fake = app.dependency_overrides[get_client]()
-    assert fake.holiday["1"] == {"active": True, "day": 5, "month": 11, "temp": 7.0}
+    assert fake.holiday["1"] == {"active": True, "days": 4, "hour": 17, "minute": 30,
+                                 "arrival_temp": 20.0}
     stored = appmod.holidays.get("1")
-    assert stored["day"] == 5 and stored["month"] == 11
+    assert stored["until"] == f"{_in_days(4)}T17:30"
+    assert stored["arrival_temp"] == 20.0
     assert stored["prev_setpoint"] == 21.0  # the room's target before the hold
+
+
+def test_start_holiday_can_resume_the_schedule(client: TestClient, tmp_path, monkeypatch):
+    _with_holiday(tmp_path, monkeypatch)
+    _with_store(tmp_path, monkeypatch)
+    client.post("/zones/1/holiday",
+                data={"until": _in_days(2), "until_time": "08:00", "arrival": "program"})
+    fake = app.dependency_overrides[get_client]()
+    assert fake.holiday["1"]["arrival_temp"] is None
+
+
+@pytest.mark.parametrize("data, message", [
+    ({"until": _in_days(-1), "until_time": "08:00", "arrival": "program"}, "in the future"),
+    ({"until": _in_days(300), "until_time": "08:00", "arrival": "program"}, "240 days"),
+    ({"until": "not-a-date", "until_time": "08:00", "arrival": "program"}, "date"),
+    ({"until": _in_days(2), "until_time": "8am", "arrival": "program"}, "HH:MM"),
+    ({"until": _in_days(2), "until_time": "08:00", "arrival": "temp", "arrival_temp": "99"}, "5 to 30"),
+])
+def test_start_holiday_rejects_bad_input(client, tmp_path, monkeypatch, data, message):
+    appmod = _with_holiday(tmp_path, monkeypatch)
+    _with_store(tmp_path, monkeypatch)
+    resp = client.post("/zones/1/holiday", data=data, follow_redirects=False)
+    assert resp.status_code == 400
+    assert message in resp.text
+    assert "1" not in app.dependency_overrides[get_client]().holiday  # nothing sent
+    assert appmod.holidays.get("1") is None
 
 
 def test_cancel_holiday_clears_and_restores_setpoint(client: TestClient, tmp_path, monkeypatch):
     appmod = _with_holiday(tmp_path, monkeypatch)
-    appmod.holidays.set("1", day=5, month=11, temp=7.0, prev_setpoint=21.0)
+    _with_store(tmp_path, monkeypatch)
+    appmod.holidays.set("1", until=f"{_in_days(3)}T08:00", arrival_temp=20.0, prev_setpoint=21.0)
+    fake = app.dependency_overrides[get_client]()
+    fake.set_temperature("1", 7)
     resp = client.post("/zones/1/holiday/cancel", follow_redirects=False)
     assert resp.status_code == 303
     assert appmod.holidays.get("1") is None
-    fake = app.dependency_overrides[get_client]()
     assert fake.holiday["1"]["active"] is False  # hub hold cleared
     room = next(r for r in fake.list_rooms() if r.id == "1")
     assert room.target_temp == 21.0  # setpoint restored
 
 
-def test_schedule_page_shows_active_holiday(client: TestClient, tmp_path, monkeypatch):
+def test_cancel_holiday_leaves_a_running_program_alone(client, tmp_path, monkeypatch):
     appmod = _with_holiday(tmp_path, monkeypatch)
     _with_store(tmp_path, monkeypatch)
-    appmod.holidays.set("1", day=5, month=11, temp=7.0, prev_setpoint=21.0)
-    resp = client.get("/zones/1/schedule")
-    assert resp.status_code == 200
-    assert "Cancel holiday" in resp.text
-    assert "05/11" in resp.text
+    appmod.schedules.set_pattern("1", [Block(20, 420, 540)], [0])
+    appmod.schedules.set_active("1", True)
+    appmod.holidays.set("1", until=f"{_in_days(3)}T08:00", arrival_temp=None, prev_setpoint=21.0)
+    fake = app.dependency_overrides[get_client]()
+    fake.set_temperature("1", 7)
+    client.post("/zones/1/holiday/cancel")
+    room = next(r for r in fake.list_rooms() if r.id == "1")
+    assert room.target_temp == 7.0  # not forced to a manual target over the program
+
+
+def test_schedule_page_shows_active_holiday(client: TestClient, tmp_path, monkeypatch):
+    from datetime import date, timedelta
+
+    appmod = _with_holiday(tmp_path, monkeypatch)
+    _with_store(tmp_path, monkeypatch)
+    until = date.today() + timedelta(days=3)
+    appmod.holidays.set("1", until=f"{until.isoformat()}T17:30", arrival_temp=20.0,
+                        prev_setpoint=21.0)
+    page = client.get("/zones/1/schedule").text
+    assert "Cancel holiday" in page
+    assert f"{until:%a %d %b}, 17:30" in page
+    assert "20&deg;C" in page
+    appmod.holidays.set("1", until=f"{until.isoformat()}T17:30", arrival_temp=None,
+                        prev_setpoint=None)
+    assert "weekly schedule" in client.get("/zones/1/schedule").text
 
 
 def test_retry_keeps_failed_when_still_unreachable(tmp_path, monkeypatch):

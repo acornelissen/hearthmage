@@ -1,14 +1,16 @@
 """Local record of holiday holds.
 
-The hub holds a zone at a frost temperature until a date and auto-resumes, but it
-does not hand back a friendly end date, and cancelling a hold leaves the zone at
-the frost temperature rather than the setpoint it had before. So we keep, per
-zone, the intended end date (for display) and the setpoint to restore when the
-user cancels early. It is a convenience record, not a source of truth.
+The hub holds a zone until the occupants are back (a date and time) and then
+switches to an arrival temperature or back to the weekly program. Its read-back
+gives only days left, so we keep, per zone, the intended end (for display) and
+the setpoint to restore if the user cancels early. A convenience record, not a
+source of truth.
 
-Shape on disk: ``{"<zone>": {"day": int, "month": int, "year": int | null,
-"temp": float, "prev_setpoint": float | null}}``. ``year`` (absent in older
-records) lets the app drop the record once the hold has ended.
+Shape on disk: ``{"<zone>": {"until": "YYYY-MM-DDTHH:MM", "arrival_temp":
+float | null, "prev_setpoint": float | null}}``. ``until`` is local time;
+``arrival_temp`` null means "resume the weekly program". Records written
+before 2026-11-01 used day/month keys (sent to the hub with the wrong fields)
+and are dropped by the app.
 """
 
 from __future__ import annotations
@@ -43,15 +45,11 @@ class HolidayStore:
             value = self._data.get(str(zone_id))
             return dict(value) if value is not None else None
 
-    def set(
-        self, zone_id: str, day: int, month: int, temp: float, prev_setpoint, year: int | None = None
-    ) -> None:
+    def set(self, zone_id: str, until: str, arrival_temp: float | None, prev_setpoint) -> None:
         with self._lock:
             self._data[str(zone_id)] = {
-                "day": int(day),
-                "month": int(month),
-                "year": int(year) if year is not None else None,
-                "temp": float(temp),
+                "until": str(until),
+                "arrival_temp": float(arrival_temp) if arrival_temp is not None else None,
                 "prev_setpoint": prev_setpoint,
             }
             write_json_atomic(self._path, self._data)
