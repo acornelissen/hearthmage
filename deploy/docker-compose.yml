@@ -35,6 +35,8 @@ services:
       # - HEARTHMAGE_MQTT_USERNAME=hearthmage
       # - HEARTHMAGE_MQTT_PASSWORD=secret
       - HEARTHMAGE_LOG_LEVEL=INFO
+      # Local time zone for times shown in the app (default UTC).
+      # - TZ=Europe/London
 
 volumes:
   hearthmage-data:

@@ -12,6 +12,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Time zone data, so times shown in the UI follow TZ (e.g. -e TZ=Europe/London);
+# without TZ the container stays on UTC.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install first with just the metadata + source needed, for layer caching.
 COPY pyproject.toml ./
 COPY src ./src
