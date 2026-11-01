@@ -861,3 +861,27 @@ a.link-btn:hover { text-decoration: underline; }
 .loaded-week strong { margin-right: .4rem; }
 .loaded-actions { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
 #radiator [tabindex="-1"]:focus { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+/* ---- heating nobody asked for ------------------------------------------ */
+
+.waste-note {
+  margin: 0 0 1rem;
+  padding: .75rem 1rem;
+  border-radius: var(--radius-sm);
+  background: var(--heat-bg);
+  color: var(--heat-fg);
+}
+.waste-note a { color: inherit; font-weight: 700; }
+.waste-title { margin: 1.1rem 0 .4rem; font-size: .95rem; font-weight: 700; scroll-margin-top: 6rem; }
+.waste-list { list-style: none; margin: 0; padding: 0; display: grid; gap: .3rem; }
+.waste-list li {
+  display: flex; flex-wrap: wrap; justify-content: space-between; gap: .25rem .75rem;
+  padding: .4rem .6rem; border-radius: 10px; background: var(--paper-2);
+}
+.waste-diag { margin-top: .8rem; }
+.waste-diag summary { cursor: pointer; font-weight: 700; min-height: 2.75rem; display: flex; align-items: center; }
+.waste-diag summary:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+.waste-table { border-collapse: collapse; margin: .3rem 0 .6rem; font-variant-numeric: tabular-nums; }
+.waste-table th, .waste-table td { text-align: left; padding: .25rem .9rem .25rem 0; }
+.waste-table thead th { color: var(--muted); font-size: .8rem; }
+.waste-diag .raw code { overflow-wrap: anywhere; font-size: .8rem; }

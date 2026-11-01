@@ -56,6 +56,47 @@
       <p class="panel-note muted">Not enough readings yet. Come back once the poller
         has collected a few.</p>
       {% endif %}
+
+      <h3 class="waste-title" id="waste-{{ z.id }}">Heating nobody asked for</h3>
+      {% if z.waste.events %}
+      <p class="panel-note">{{ z.waste.events|length }} time{{ 's' if z.waste.events|length != 1 }}
+        in the last 30 days, {{ z.waste.total_minutes }} min in all: the room warmed quickly
+        while its target was well below the room temperature.</p>
+      <ul class="waste-list">
+        {% for e in z.waste.events %}
+        <li>
+          <span class="sched-time">{{ e.when }}</span>
+          <span>{{ e.minutes }} min, {{ '%+.1f'|format(e.rise) }}&deg;C, target {{ '%g'|format(e.setpoint) }}&deg;C{% if e.ongoing %} (ongoing){% endif %}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% if z.waste.captured %}
+      <details class="waste-diag">
+        <summary>Radiator status during the latest one</summary>
+        {% if z.waste.changes %}
+        <p class="panel-note">Status fields that differed from the radiator at rest
+          (room temperature and clock left out):</p>
+        <table class="waste-table">
+          <thead><tr><th scope="col">Field</th><th scope="col">At rest</th><th scope="col">Heating</th></tr></thead>
+          <tbody>
+            {% for c in z.waste.changes %}
+            <tr><th scope="row">{{ c.label }}</th><td>{{ c.rest }}</td><td>{{ c.heating }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% elif z.waste.captured.rest %}
+        <p class="panel-note">No status field changed while it heated (room temperature
+          and clock left out).</p>
+        {% else %}
+        <p class="panel-note">No resting snapshot to compare with yet.</p>
+        {% endif %}
+        <p class="panel-note raw">Heating: <code>{{ z.waste.captured.heating }}</code>
+          {% if z.waste.captured.rest %}<br>At rest: <code>{{ z.waste.captured.rest }}</code>{% endif %}</p>
+      </details>
+      {% endif %}
+      {% else %}
+      <p class="panel-note muted">No heating without being asked in the last 30 days.</p>
+      {% endif %}
     </section>
     {% endfor %}
   </main>

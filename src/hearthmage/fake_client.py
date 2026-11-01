@@ -49,6 +49,12 @@ class FakeHearthClient:
         self._get(room_id)
         return list(self.programs.get((room_id, day), []))
 
+    def read_status_raw(self, room_id: str) -> str:
+        room = self._get(room_id)
+        whole = int(room.current_temp or 0)
+        tenths = int(round(((room.current_temp or 0) - whole) * 10))
+        return f"OK,{whole},{tenths},{int(room.target_temp or 0)},12,0,0,0,11,50,0,0,0,0,1,0,44,244,0,30,v000000"
+
     def read_cloud_reporting(self) -> bool:
         return self.cloud_reporting
 

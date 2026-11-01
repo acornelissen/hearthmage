@@ -289,6 +289,98 @@ def test_record_reading_hook_writes_to_history(tmp_path, monkeypatch):
     assert len(appmod.history.temp_series("1")) == 1
 
 
+def _with_waste(tmp_path, monkeypatch, hub_client=None):
+    from hearthmage.waste import WasteDetector
+
+    appmod = _with_history(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "waste", WasteDetector())
+    monkeypatch.setattr(appmod, "_client", hub_client or FakeHearthClient(
+        [Room("1", "Living Room", 13.0, 5.0, is_off=False, min_temp=5.0, max_temp=30.0)]))
+    return appmod
+
+
+def _join_status_captures() -> None:
+    import threading
+
+    for t in threading.enumerate():
+        if t.name == "status-capture":
+            t.join(timeout=5)
+
+
+_DAY = 1_793_000_000.0  # a fixed timestamp (late October 2026)
+
+
+def _fast_rise(appmod, zone="1", start=_DAY):
+    for minute, temp in [(0, 13.0), (5, 13.0), (10, 13.3), (15, 13.6), (20, 14.0)]:
+        appmod._check_waste(zone, start + minute * 60, temp, 5.0)
+
+
+def test_heating_with_a_low_target_is_recorded_with_radiator_status(tmp_path, monkeypatch):
+    appmod = _with_waste(tmp_path, monkeypatch)
+    _fast_rise(appmod)
+    _join_status_captures()
+    [event] = appmod.history.waste_events("1")
+    assert (event["start_temp"], event["peak_temp"], event["setpoint"]) == (13.0, 14.0, 5.0)
+    snapshot = appmod.history.status_for_event(event["id"])
+    assert snapshot["kind"] == "heating" and snapshot["raw"].startswith("OK,")
+    assert appmod.history.latest_status("1", "rest") is not None  # baseline before it
+
+
+def test_waste_check_never_breaks_the_reading_hook(tmp_path, monkeypatch):
+    appmod = _with_waste(tmp_path, monkeypatch)
+
+    def boom(*a, **k):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(appmod.waste, "feed", boom)
+    appmod._record_reading(1, 20.4, 21.0)  # does not raise
+    assert len(appmod.history.temp_series("1")) == 1
+
+
+def test_status_capture_failure_is_tolerated(tmp_path, monkeypatch):
+    class Asleep(FakeHearthClient):
+        def read_status_raw(self, room_id):
+            raise HearthError("asleep")
+
+    appmod = _with_waste(tmp_path, monkeypatch, Asleep(
+        [Room("1", "Living Room", 13.0, 5.0, is_off=False, min_temp=5.0, max_temp=30.0)]))
+    _fast_rise(appmod)
+    _join_status_captures()
+    assert len(appmod.history.waste_events("1")) == 1  # the event is kept anyway
+
+
+def test_history_page_lists_waste_events_and_status_changes(client, tmp_path, monkeypatch):
+    appmod = _with_waste(tmp_path, monkeypatch)
+    now = appmod.datetime.now(appmod.timezone.utc).timestamp()
+    appmod.history.record_status("1", now - 7200, "rest",
+                                 "OK,13,0,5,21,19,17,6,11,69,0,0,0,0,1,0,44,244,0,33,v200110")
+    event_id = appmod.history.start_waste_event("1", now - 3600, 13.3, 5.0, now - 2640, 14.5)
+    appmod.history.update_waste_event(event_id, now - 2640, 14.5, open_=False)
+    appmod.history.record_status("1", now - 3500, "heating",
+                                 "OK,13,5,5,3,13,40,6,11,72,0,1,0,0,1,0,44,244,0,33,v200110",
+                                 event_id=event_id)
+    page = client.get("/history").text
+    assert "Heating nobody asked for" in page
+    assert "16 min" in page and "+1.2" in page and "target 5" in page
+    assert "Field 9" in page and "69" in page and "72" in page  # changed while heating
+    assert "Clock" not in page  # the clock always moves; not listed
+
+
+def test_history_page_says_when_nothing_was_wasted(client, tmp_path, monkeypatch):
+    _with_waste(tmp_path, monkeypatch)
+    assert "No heating without being asked in the last 30 days" in client.get("/history").text
+
+
+def test_home_page_flags_recent_waste(client, tmp_path, monkeypatch):
+    appmod = _with_waste(tmp_path, monkeypatch)
+    assert "heated without being asked" not in client.get("/").text
+    now = appmod.datetime.now(appmod.timezone.utc).timestamp()
+    appmod.history.start_waste_event("1", now - 600, 13.0, 5.0, now - 60, 13.8)
+    page = client.get("/").text
+    assert "Living Room heated without being asked" in page
+    assert 'href="/history#waste-1"' in page
+
+
 # ---- per-radiator config -------------------------------------------------
 
 

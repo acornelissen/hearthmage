@@ -45,6 +45,12 @@
     <p class="error" role="alert">HearthMage hasn&rsquo;t heard back from the hub for a while.
       Readings below may be out of date. Check that the hub is powered and on the network.</p>
     {% endif %}
+    {% for room in wasting %}
+    <p class="waste-note" role="status">
+      <strong>{{ room.name }} heated without being asked</strong> in the last day.
+      <a href="/history#waste-{{ room.id }}">See when</a>
+    </p>
+    {% endfor %}
     {% include "_rooms.html" %}
   </main>
 

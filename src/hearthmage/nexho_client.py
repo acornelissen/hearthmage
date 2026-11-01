@@ -671,6 +671,16 @@ class NexhoLocalClient:
         except ValueError as exc:
             raise HearthError(f"Zone {zone} day {day}: {exc}") from exc
 
+    def read_status_raw(self, room_id: str) -> str:
+        """The radiator's full status reply (``*?F``), unparsed: room temperature,
+        setpoint, its clock and weekday, firmware, and fields not yet mapped.
+        Stored verbatim when diagnosing heating nobody asked for."""
+        zone = _zone_int(room_id)
+        resp = self._ask_until_answered(f"R#{zone}#1#0#0*?F/", "OK,", priority=False)
+        if not resp.startswith("OK,"):
+            raise HearthError(f"Zone {zone} status read failed: {resp!r}")
+        return resp
+
     def set_day_pattern(self, room_id: str, blocks: list[Block], days: list[int]) -> None:
         """Write a block pattern to every weekday in ``days`` (via ``*P``)."""
         zone = _zone_int(room_id)

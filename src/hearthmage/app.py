@@ -39,6 +39,7 @@ from hearthmage.schedule import (
 from hearthmage.schedule_store import ScheduleStore
 from hearthmage.settings import Settings, config_path
 from hearthmage.sync_store import SyncStore
+from hearthmage.waste import WasteDetector, status_diff
 
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -51,6 +52,9 @@ schedules = ScheduleStore(settings.schedules_path)
 energy = EnergyStore(settings.energy_path)
 history = HistoryStore(settings.history_path)
 holidays = HolidayStore(settings.holiday_path)
+waste = WasteDetector()
+history.close_open_waste_events()  # a restart forgets what was being tracked
+_waste_log = logging.getLogger("hearthmage.waste")
 
 _TEMP_RETAIN_DAYS = 30  # keep a month of temperature readings
 
@@ -68,11 +72,54 @@ def _record_reading(zone: int, current, setpoint) -> None:
     now = datetime.now(timezone.utc).timestamp()
     history.record_temp(str(zone), current, setpoint, ts=now)
     history.prune_temp(before_ts=now - _TEMP_RETAIN_DAYS * 86400)
+    try:
+        _check_waste(str(zone), now, current, setpoint)
+    except Exception:  # noqa: BLE001 - waste detection must not disturb polling
+        _waste_log.exception("waste check failed for zone %s", zone)
     if mqtt_bridge is not None:
         try:
             mqtt_bridge.publish_state(str(zone), current, setpoint)
         except Exception:  # noqa: BLE001 - MQTT must not disturb polling
             pass
+
+
+def _check_waste(zone: str, ts: float, current, setpoint) -> None:
+    """Feed a reading to the waste detector; store events and capture the
+    radiator's status when one starts (and now and then at rest, to compare)."""
+    change = waste.feed(zone, ts, current, setpoint)
+    if change is None:
+        if waste.baseline_due(zone, ts, current, setpoint):
+            _capture_status(zone, "rest")
+        return
+    kind, event = change
+    if kind == "start":
+        event.id = history.start_waste_event(
+            zone, event.start_ts, event.start_temp, event.setpoint, event.peak_ts, event.peak_temp
+        )
+        _waste_log.warning(
+            "zone %s heating with target %s: %.1f -> %.1f C", zone, event.setpoint,
+            event.start_temp, event.peak_temp,
+        )
+        _capture_status(zone, "heating", event.id)
+    elif event.id is not None:
+        history.update_waste_event(event.id, event.peak_ts, event.peak_temp, open_=kind == "update")
+
+
+def _capture_status(zone: str, kind: str, event_id: int | None = None) -> None:
+    """Read the radiator's raw status (``*?F``) in the background and keep it."""
+    read = getattr(_client, "read_status_raw", None)
+    if read is None:
+        return
+
+    def capture() -> None:
+        try:
+            raw = read(zone)
+        except HearthError as exc:
+            _waste_log.info("zone %s %s status capture failed: %s", zone, kind, exc)
+            return
+        history.record_status(zone, datetime.now(timezone.utc).timestamp(), kind, raw, event_id)
+
+    threading.Thread(target=capture, name="status-capture", daemon=True).start()
 
 
 class _MqttCommandHandler:
@@ -280,8 +327,17 @@ def _readout(request: Request, room_id: str, room, error: str | None = None) -> 
 def index(request: Request, client: HearthClient = Depends(get_client)) -> HTMLResponse:
     rooms, error = _safe_rooms(client)
     hub_stale = getattr(client, "hub_stale", lambda: False)()
+    day_ago = datetime.now(timezone.utc).timestamp() - 86400
+    wasting = set(history.zones_with_waste(since_ts=day_ago))
     return templates.TemplateResponse(
-        request, "index.html", {"rooms": rooms, "error": error, "hub_stale": hub_stale}
+        request,
+        "index.html",
+        {
+            "rooms": rooms,
+            "error": error,
+            "hub_stale": hub_stale,
+            "wasting": [r for r in rooms if r.id in wasting],
+        },
     )
 
 
@@ -627,6 +683,39 @@ def _sparkline_points(values: list[float], width: int = 320, height: int = 64, p
     return " ".join(pts)
 
 
+_WASTE_DAYS = 30  # how far back the history page lists waste events
+
+
+def _waste_view(zone: str) -> dict:
+    """A zone's recent heating-nobody-asked-for events, for the history page."""
+    since = datetime.now(timezone.utc).timestamp() - _WASTE_DAYS * 86400
+    events = []
+    for e in history.waste_events(zone, since_ts=since, limit=20):
+        start = datetime.fromtimestamp(e["start_ts"])
+        end = datetime.fromtimestamp(e["peak_ts"])
+        events.append({
+            "when": f"{start:%a %d %b, %H:%M}–{end:%H:%M}",
+            "minutes": round((e["peak_ts"] - e["start_ts"]) / 60),
+            "rise": e["peak_temp"] - e["start_temp"],
+            "setpoint": e["setpoint"],
+            "ongoing": bool(e["open"]),
+        })
+    changes, captured = [], None
+    for e in history.waste_events(zone, since_ts=since, limit=20):
+        heating = history.status_for_event(e["id"])
+        if heating:  # the most recent event that has a status capture
+            rest = history.rest_status_before(zone, heating["ts"])
+            changes = status_diff(rest["raw"] if rest else None, heating["raw"])
+            captured = {"heating": heating["raw"], "rest": rest["raw"] if rest else None}
+            break
+    return {
+        "events": events,
+        "total_minutes": sum(ev["minutes"] for ev in events),
+        "changes": changes,
+        "captured": captured,
+    }
+
+
 @app.get("/history", response_class=HTMLResponse)
 def history_page(request: Request, client: HearthClient = Depends(get_client)) -> HTMLResponse:
     rooms, error = _safe_rooms(client)
@@ -643,6 +732,7 @@ def history_page(request: Request, client: HearthClient = Depends(get_client)) -
                 "latest": currents[-1] if currents else None,
                 "low": min(currents) if currents else None,
                 "high": max(currents) if currents else None,
+                "waste": _waste_view(room.id),
             }
         )
     return templates.TemplateResponse(

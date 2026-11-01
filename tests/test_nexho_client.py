@@ -646,3 +646,13 @@ def test_program_write_gives_up_after_repeated_er(monkeypatch):
     with pytest.raises(HearthError):
         client.set_program_active("1", True)
     assert 1 < len(calls) <= 5  # retried, but bounded
+
+
+def test_read_status_raw_returns_the_f_reply(monkeypatch):
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc.time, "sleep", lambda s: None)
+    live = "OK,14,9,5,21,19,17,6,11,69,0,0,0,0,1,0,44,244,0,33,v200110"  # 2026-11-01
+    assert make_client({"R#1#1#0#0*?F/": live}).read_status_raw("1") == live
+    with pytest.raises(HearthError):
+        make_client({"R#1#1#0#0*?F/": "ER,1"}).read_status_raw("1")
