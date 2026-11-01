@@ -110,6 +110,12 @@ R#<zone>#1#0#0*OD<day>/  ->  35 comma-separated fields, or ER,<n> if none set
   the cloud sync. So this app owns schedule definitions locally, writes them to
   the hub with `*P#`, and can show which days are programmed, but cannot import
   the existing block detail over the LAN.
+- Re-checked live 2026-11-01 (read-only): each zone 1-4 answered a `*?T` wake
+  read, then `*OD0`..`*OD6` returned `ER,1` for all 28 zone-days (no programs
+  stored, consistent with zone 1 having been cleared on 2026-10-28). Variant
+  `R#1#0#0#0*OD0/` returned a bare `OK` with no fields; `R#1#1#1#0*OD0/`
+  returned `ER,1`. No LAN read returned block detail. Untested routes: hub
+  memory reads (the address map would need the vendor app) and the cloud API.
 
 **Program on/off (confirmed live):** `D#<zone>#<modules>#0#0*ON/` activates the
 zone's stored weekly program (the hub then drives the setpoint from the
