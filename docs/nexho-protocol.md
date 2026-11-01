@@ -92,30 +92,28 @@ D#<zone>#<modules>#0#0*P#<dayBitmask>#<b1>#<b2>#<b3>#<b4>#<b5>#<b6>/
   (`253#24#60#24#60` for load/light/blind types).
 - Reply starts `OK` on success.
 
-**Read** one weekday's program:
+**Read** one weekday's program block detail (**confirmed live 2026-11-01**):
 
 ```
-R#<zone>#1#0#0*OD<day>/  ->  35 comma-separated fields, or ER,<n> if none set
+R#<zone>#1#0#0*?P<day>/  ->  OK,P<day>,11,<b1>,<b2>,<b3>,<b4>,<b5>,<b6>
 ```
 
-- Fields: for block `i` in 0..5 at offset `i*5`, `[i*5+1]`=cmd,
-  `[i*5+2]`=startH, `[i*5+3]`=startM, `[i*5+4]`=endH, `[i*5+5]`=endM; `[34]` is a
-  status flag. An empty block reads back as cmd `253`.
-- On this Nexho NT hub, `*OD<day>` over LAN returns only a **day-level summary**,
-  not the 35-field block detail the Android app expects: bare `OK` = that day is
-  programmed, `ER,1` = not programmed (or the radiator is asleep for the read).
-  Cross-checked against the iOS app's day list on zone 1: Mon/Sat (`ER,1`) show
-  "Not programmed"; Tue/Fri (`OK`) show "Activated". The per-block detail
-  (start/end/temp) is **not retrievable over LAN here** — the iOS app gets it via
-  the cloud sync. So this app owns schedule definitions locally, writes them to
-  the hub with `*P#`, and can show which days are programmed, but cannot import
-  the existing block detail over the LAN.
-- Re-checked live 2026-11-01 (read-only): each zone 1-4 answered a `*?T` wake
-  read, then `*OD0`..`*OD6` returned `ER,1` for all 28 zone-days (no programs
-  stored, consistent with zone 1 having been cleared on 2026-10-28). Variant
-  `R#1#0#0#0*OD0/` returned a bare `OK` with no fields; `R#1#1#1#0*OD0/`
-  returned `ER,1`. No LAN read returned block detail. Untested routes: hub
-  memory reads (the address map would need the vendor app) and the cloud API.
+- Found in the decompiled HeatApp 4.1.1 (`uk.co.southwestheatingsolutions.heatapp`,
+  the UK build of the Nexho app; `a0/y0.java`, its "resynchronise programs"
+  path). Each block is `cmd,startH,startM,endH,endM`, the same shape `*P#`
+  writes. The app keeps a block when `cmd <= 240` and `startH <= 23`, and reads
+  an end of `0:00` as 1440 (midnight), matching the write-side normalisation.
+- Live, all 28 zone-days returned six disabled blocks (`5,24,60,24,60`), which
+  matches every zone's program having been cleared. The `11` after `P<day>` is
+  unknown (constant on all four radiators).
+- So block detail **is** readable over the LAN. Earlier notes said it was not
+  because they used `*OD`, which is a different read (below).
+
+`R#<zone>#1#0#0*OD<day>/` is the older per-day read the app uses on its
+normal sync path, expecting `OK,` plus 35 fields; a bare `OK` is treated by the
+app as a command error. On this hub it returns only `ER,1` or a bare `OK`
+(live 2026-11-01: `ER,1` for all 28 zone-days; `R#1#0#0#0*OD0/` gave bare `OK`).
+Do not use it for block detail.
 
 **Program on/off (confirmed live):** `D#<zone>#<modules>#0#0*ON/` activates the
 zone's stored weekly program (the hub then drives the setpoint from the
@@ -175,6 +173,33 @@ R#<zone>#1#0#0*?RH/  ->  OK,RH,<...,day@10,month@11,_,tempEncoded@13,...>
   cleared it (fields read back as `253`). Note cancelling leaves the zone at the
   frost temperature rather than the prior setpoint, so this app restores the
   pre-holiday setpoint itself on cancel.
+
+## Radiator status and clock (`*?F`, live read; fields partly inferred)
+
+```
+R#<zone>#1#0#0*?F/  ->  OK,14,9,5,21,19,17,6,11,69,0,0,0,0,1,0,44,244,0,33,v200110
+```
+
+Live on all four zones 2026-11-01. Fields after `OK`: `[1],[2]` room temperature
+whole/tenths and `[3]` setpoint (same as `*?T`), `[4..6]` the radiator's clock
+`HH,MM,SS`, `[7]` weekday (Mon=0; read 6 on a Sunday), `[8]` read `11` on all
+four (the app treats `> 11` as a feature/firmware threshold; also matches the
+month, so unconfirmed), last field a firmware string (`v200110`, `v200825`).
+`[9]` and `[16..19]` vary per radiator and are unknown. The four clocks were
+within a minute of local time and already on GMT after the 2026-10-25 change.
+
+**Set the clock** (from the app's "Set the time" button; not live-tested):
+`OPH<hh><mm><ss><weekday>/<dd>,<mm>,<yy>/` with two-digit fields, weekday
+Mon=0, year minus 2000.
+
+## Hub memory and cloud reporting
+
+`OPMR<addr>/` reads and `OPMW<addr>,<value>/` writes hub memory. Address
+`3898` is the app's **"Send data to external server"** toggle (`1` = on).
+Live read 2026-11-01: `OPMR3898/` -> `OPOK,1`, i.e. on. The app also has a
+remote connection path that sends this same protocol through a gateway at
+`49.13.37.164`. Other `OPMW` addresses the app writes are per-zone tables
+(base 120/240/360 for climate zones, 608/609 for load zones); not mapped here.
 
 ## Per-radiator element config (confirmed live)
 

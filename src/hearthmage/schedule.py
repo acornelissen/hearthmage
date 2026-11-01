@@ -22,12 +22,10 @@ f1/o.java block model, ProgDaySelection day list); see docs/nexho-protocol.md:
   wrote a block at cmd 14 covering the current time; the zone's setpoint changed
   to 14 C within ~4s, then reverted when cleared. Same encoding as *T.
 
-Note: over the LAN this hub returns only a day-level summary from *OD (bare
-``OK`` = that day is programmed, ``ER,1`` = not programmed / asleep), not the
-35-field block detail the Android app parses (that reaches the iOS app via the
-cloud). So this app owns schedule definitions (stored locally) and writes them
-to the hub; it does not read block detail back. parse_day_schedule is kept for
-completeness / other program types. See docs/nexho-protocol.md.
+Over the LAN, ``*OD`` returns only a bare ``OK``/``ER,1`` on this hub, but
+``R#<zone>#1#0#0*?P<day>/`` returns the day's six blocks (``OK,P<day>,11,`` then
+the blocks), confirmed live 2026-11-01; see docs/nexho-protocol.md. This app
+still owns schedule definitions and does not import them yet.
 """
 
 from __future__ import annotations

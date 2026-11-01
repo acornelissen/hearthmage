@@ -1,10 +1,9 @@
 """Local persistence for weekly schedule definitions.
 
-The Nexho hub does not reliably serve stored programs back over the LAN (an
-`*OD` read returns only a programmed/not-programmed summary; the block detail is
-cloud-delivered), so this app owns the schedule definitions. They are kept here
-as JSON and written to the hub with `*P#`; the hub is a write target, not the
-source of truth. See docs/nexho-protocol.md.
+This app owns the schedule definitions. They are kept here as JSON and written
+to the hub with `*P#`; the hub is a write target, not the source of truth. (The
+hub can return block detail with `*?P<day>`, but nothing imports it yet.) See
+docs/nexho-protocol.md.
 
 Shape on disk: ``{"<zone>": {"<day>": [[target, start, end], ...]}}`` where day
 is 0..6 (Mon..Sun) and start/end are minutes of day. A zone key that is present
