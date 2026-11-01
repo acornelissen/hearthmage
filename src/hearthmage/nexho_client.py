@@ -94,6 +94,10 @@ class NexhoLocalClient:
         self._desired: dict[int, int] = {}  # zone -> latest requested target (writes coalesce)
         self._writers: set[int] = set()  # zones with a live single-flight write worker
         self._zones: list[int] | None = None  # cached zone list (it is fixed)
+        # Heaters (modules) per zone from OPS3/, read when the zone list changes.
+        # Every D# write carries the count, as the vendor app does; unknown = 1.
+        self._heaters: dict[int, int] = {}
+        self._heaters_for: list[int] | None = None  # the OPS2 ids they were read for
         self._poller_started = False
         self._stop = threading.Event()  # set by stop(): the poller exits
         # Observability: monotonic timestamps for health reporting.
@@ -247,9 +251,31 @@ class NexhoLocalClient:
                 break
             if tok.isdigit():
                 ids.append(int(tok))
-        self._zones = ids
         self._last_ops2_ok = time.monotonic()  # hub answered: health clock resets
+        if ids != self._heaters_for:
+            self._read_heater_counts(ids)
+        # A zone with no heaters is a deleted slot; the vendor app hides it too.
+        ids = [z for z in ids if self._heaters.get(z, 1) > 0]
+        self._zones = ids
         return ids
+
+    def _read_heater_counts(self, ids: list[int]) -> None:
+        """Read OPS3/ (heaters per zone, in OPS2 order). On failure the counts
+        stay unknown and writes fall back to one heater; nothing is hidden."""
+        try:
+            resp = self._ask("OPS3/", _READ_RETRIES, _READ_TIMEOUT)
+        except HearthError:
+            return
+        if not resp.startswith("OPOK,OPS3,"):
+            return
+        counts = [_as_int(tok) for tok in resp.split(",")[2:]]
+        self._heaters = {z: c for z, c in zip(ids, counts) if c is not None}
+        self._heaters_for = ids
+
+    def _modules(self, zone: int) -> int:
+        """Heaters in a zone, for the second field of D# writes (default 1)."""
+        count = self._heaters.get(zone, 1)
+        return count if count > 0 else 1
 
     def _room(
         self,
@@ -516,7 +542,7 @@ class NexhoLocalClient:
         Resending the same target is idempotent - the radiator ends at that value."""
         wire = _encode_setpoint(target)
         try:
-            resp = self._ask_until_answered(f"D#{zone}#1#0#0*T{wire}/", "OK", priority=True)
+            resp = self._ask_until_answered(f"D#{zone}#{self._modules(zone)}#0#0*T{wire}/", "OK", priority=True)
             acked = resp == "OK"  # the vendor treats "OK,<...>" as a command error
             if acked:
                 _log.info("zone %s setpoint %s acknowledged", zone, target)
@@ -549,9 +575,12 @@ class NexhoLocalClient:
             return None
         return _as_int(resp.split(",")[1]) if "," in resp else None
 
-    def _write_element(self, zone: int, group: int, index: int, value: int, op: str = "D") -> None:
+    def _write_element(
+        self, zone: int, group: int, index: int, value: int, op: str = "D", module: int | None = None
+    ) -> None:
+        module = module if module is not None else self._modules(zone)
         resp = self._ask(
-            f"{op}#{zone}#1#0#0*SEP#{group}#{index}#{value}/",
+            f"{op}#{zone}#{module}#0#0*SEP#{group}#{index}#{value}/",
             _WRITE_RETRIES,
             _WRITE_TIMEOUT,
             priority=True,
@@ -604,8 +633,11 @@ class NexhoLocalClient:
         if frost_temp is not None:
             self._write_element(zone, *self._EL_FROST, int(frost_temp))
         if sensor_offset is not None:
-            # The vendor sends this one write with R#, not D#.
-            self._write_element(zone, *self._EL_OFFSET, round(sensor_offset * 10) & 0xFF, op="R")
+            # The vendor sends this one with R#, to each heater by its index.
+            for module in range(1, self._modules(zone) + 1):
+                self._write_element(
+                    zone, *self._EL_OFFSET, round(sensor_offset * 10) & 0xFF, op="R", module=module
+                )
 
     # ---- holiday hold (*RH) ----------------------------------------------
     # From the decompiled vendor app (AdvConfigHoliday, a0/j.java):
@@ -632,7 +664,7 @@ class NexhoLocalClient:
         else:
             raise HearthError(f"Arrival temperature {arrival_temp} out of range")
         resp = self._ask_until_answered(
-            f"D#{zone}#1#0#0*RH#{int(days)}#{int(hour)}#{int(minute)}#{arrival}/", "OK", priority=True
+            f"D#{zone}#{self._modules(zone)}#0#0*RH#{int(days)}#{int(hour)}#{int(minute)}#{arrival}/", "OK", priority=True
         )
         if resp != "OK":
             raise HearthError(f"Holiday set failed for zone {zone}: {resp!r}")
@@ -641,7 +673,7 @@ class NexhoLocalClient:
         """Cancel a zone's holiday hold (the vendor's clear: *RH#0#0#0#251)."""
         zone = _zone_int(room_id)
         resp = self._ask_until_answered(
-            f"D#{zone}#1#0#0*RH#0#0#0#{self._RH_RESUME_PROGRAM}/", "OK", priority=True
+            f"D#{zone}#{self._modules(zone)}#0#0*RH#0#0#0#{self._RH_RESUME_PROGRAM}/", "OK", priority=True
         )
         if resp != "OK":
             raise HearthError(f"Holiday clear failed for zone {zone}: {resp!r}")
@@ -722,7 +754,7 @@ class NexhoLocalClient:
         """Write a block pattern to every weekday in ``days`` (via ``*P``)."""
         zone = _zone_int(room_id)
         try:
-            cmd = build_program_command(zone, blocks, days)
+            cmd = build_program_command(zone, blocks, days, modules=self._modules(zone))
         except ValueError as exc:
             raise HearthError(f"Invalid schedule for zone {zone}: {exc}") from exc
         resp = self._ask_until_answered(
@@ -740,7 +772,7 @@ class NexhoLocalClient:
         """
         zone = _zone_int(room_id)
         op = "ON" if active else "OFF"
-        resp = self._ask_until_answered(f"D#{zone}#1#0#0*{op}/", "OK", priority=True)
+        resp = self._ask_until_answered(f"D#{zone}#{self._modules(zone)}#0#0*{op}/", "OK", priority=True)
         if resp != "OK":
             raise HearthError(f"Program {op} failed for zone {zone}: {resp!r}")
 

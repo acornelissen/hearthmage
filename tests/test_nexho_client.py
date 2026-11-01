@@ -785,3 +785,76 @@ def test_impossible_readings_are_not_trusted():
     assert _parse_status("OK,85,0,020") == (None, None)
     assert _parse_status("OK,20,0,040") == (None, None)
     assert _parse_status("OK,20,4,148") == (20.4, 20.5)  # half degree still fine
+
+
+# ---- heaters per zone (OPS3) ------------------------------------------------
+# The vendor reads OPS3/ (OPOK,OPS3,<count>,... in OPS2 order), sends each zone's
+# heater count in every D# write and hides zones with 0 heaters. Live: 1,1,1,1.
+
+
+def _multi_heater_client():
+    sent: list[str] = []
+    replies = {"OPS2/": "OPOK,OPS2,1,2,3", "OPS3/": "OPOK,OPS3,1,0,2"}
+    client = NexhoLocalClient("10.0.0.99")
+
+    def ask(cmd, *a, **k):
+        sent.append(cmd)
+        return replies.get(cmd, "OK")
+
+    client._ask = ask  # type: ignore[method-assign]
+    client._zone_ids()
+    sent.clear()
+    return client, sent
+
+
+def test_zones_with_no_heaters_are_hidden():
+    client, _ = _multi_heater_client()
+    assert client._zone_ids() == [1, 3]
+    assert [r.id for r in client.list_rooms()] == ["1", "3"]
+
+
+def test_writes_carry_the_zone_heater_count():
+    from hearthmage.schedule import Block
+
+    client, sent = _multi_heater_client()
+    client._send_once(3, 20.0)
+    client.set_day_pattern("3", [Block(20, 0, 60)], [0])
+    client.set_program_active("3", True)
+    client.set_holiday("3", days=2, hour=8, minute=0, arrival_temp=None)
+    client.clear_holiday("3")
+    client.set_config("3", window_sensor=True, frost_temp=7)
+    writes = [c for c in sent if c.startswith("D#")]
+    assert writes and all(c.startswith("D#3#2#0#0*") for c in writes), writes
+
+
+def test_sensor_offset_is_written_to_each_heater():
+    client, sent = _multi_heater_client()
+    client.set_config("3", sensor_offset=0.5)
+    assert [c for c in sent if "SEP#0#9" in c] == ["R#3#1#0#0*SEP#0#9#5/", "R#3#2#0#0*SEP#0#9#5/"]
+
+
+def test_unknown_heater_counts_fall_back_to_one():
+    sent: list[str] = []
+    client = NexhoLocalClient("10.0.0.99")
+
+    def ask(cmd, *a, **k):
+        sent.append(cmd)
+        if cmd == "OPS2/":
+            return "OPOK,OPS2,1,2"
+        if cmd == "OPS3/":
+            raise HearthError("no answer")
+        return "OK"
+
+    client._ask = ask  # type: ignore[method-assign]
+    assert client._zone_ids() == [1, 2]  # nothing hidden when counts are unknown
+    client._send_once(2, 20.0)
+    assert "D#2#1#0#0*T20/" in sent
+
+
+def test_heater_counts_are_read_once_not_every_poll():
+    sent: list[str] = []
+    client = NexhoLocalClient("10.0.0.99")
+    client._ask = lambda cmd, *a, **k: (sent.append(cmd), {"OPS2/": "OPOK,OPS2,1,2", "OPS3/": "OPOK,OPS3,1,1"}.get(cmd, "OK"))[1]  # type: ignore[method-assign]
+    for _ in range(3):
+        client._zone_ids()
+    assert sent.count("OPS3/") == 1

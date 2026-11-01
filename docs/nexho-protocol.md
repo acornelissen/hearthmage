@@ -33,6 +33,7 @@ to it over the LAN.
 |---|---|---|
 | `OPS1/` | Handshake / installation identity | `OPOK,OPS1,<f2>,…,<idA>,<idB>,<idU_lo>,<idU_mid>,<idU_hi>,…` (≥12 fields) |
 | `OPS2/` | List climate (heating) zones | `OPOK,OPS2,<zone>,<zone>,…` (a `0` field ends the list) |
+| `OPS3/` | Heaters per climate zone, in `OPS2` order | `OPOK,OPS3,<count>,…` (live: `1,1,1,1`) |
 | `OPS6/` | List load (on/off) zones | `OPOK,OPS6,…` (empty on this install) |
 | `R#<z>#1#0#0*?T/` | Read zone status | `OK,<tempWhole>,<tempTenths>,<setpoint>` or `ER,<n>` |
 | `D#<z>#1#0#0*T<deg>/` | Set zone target temperature | reply starting `OK` on success |
@@ -256,9 +257,10 @@ the `*RH` fields, and write handling. Other findings:
   45 s for a `*P#` write. This app: 5 s writes, 15 s program writes, resend on
   `ER` after 3 s.
 - **Module field.** Every `D#` write carries the zone's heater count, read with
-  `OPS3/` (`OPOK,OPS3,<count per zone in OPS2 order>`). Live: `OPOK,OPS3,1,1,1,1`,
-  so this app's fixed `1` is right for this install. A zone with 0 heaters is
-  a deleted slot; the vendor hides it.
+  `OPS3/` (`OPOK,OPS3,<count per zone in OPS2 order>`; live `1,1,1,1`). This app
+  does the same since 2026-11-01 (falling back to 1 if `OPS3` can't be read),
+  writes the sensor offset to each heater, and hides zones with 0 heaters
+  (deleted slots), as the vendor does. Reads use heater 1.
 - **Off.** The vendor sends `*T0` for off (`*T32` in Fahrenheit), and allows
   targets from 1 C. This app sends `*T1` (see "OFF and half degrees"). Either
   way the anti-ice temperature (`1#20`, 7 C) still applies.
