@@ -245,6 +245,41 @@ is the anti-ice temperature (vendor screen "Frost protection"); the real offset
 is `0#9`. Writes succeed only on a bare `OK` (the vendor treats `OK,...` as an
 error). See `src/hearthmage/nexho_client.py` (`read_config` / `set_config`).
 
+## Compared with the vendor app (HeatApp 4.1.1, 2026-11-01)
+
+Decompiled and compared command by command. Fixed in this app: `*UDEL` (a
+reset, not a probe), `1#20` (anti-ice, not offset) and the real offset `0#9`,
+the `*RH` fields, and write handling. Other findings:
+
+- **Writes succeed only on a bare `OK`**; the vendor treats `OK,<...>` as a
+  command error. It resends on `ER`/`OPER` (5 tries, 5 s each) and waits up to
+  45 s for a `*P#` write. This app: 5 s writes, 15 s program writes, resend on
+  `ER` after 3 s.
+- **Module field.** Every `D#` write carries the zone's heater count, read with
+  `OPS3/` (`OPOK,OPS3,<count per zone in OPS2 order>`). Live: `OPOK,OPS3,1,1,1,1`,
+  so this app's fixed `1` is right for this install. A zone with 0 heaters is
+  a deleted slot; the vendor hides it.
+- **Off.** The vendor sends `*T0` for off (`*T32` in Fahrenheit), and allows
+  targets from 1 C. This app sends `*T1` (see "OFF and half degrees"). Either
+  way the anti-ice temperature (`1#20`, 7 C) still applies.
+- **`*?F` field [8].** The vendor's resync treats `[8] > 11` as program off
+  and anything else as on. All four radiators read 11 while every program is
+  empty, and zone 1's program was switched off on 2026-10-28; `?RH` replies
+  carry the same `6,11` pair after the clock, which looks like weekday and
+  month. Unresolved; a supervised `*OFF`/`*ON` check would settle it.
+- **Hub identity.** The vendor accepts a hub only if `OPS1`'s idA/idB/IDU match
+  the paired installation. This app connects its UDP socket to the hub's
+  address, so replies from other hosts are dropped; it does not pin the IDU.
+- **Cloud relay.** The vendor's remote path is TCP to `49.13.37.164:4001`,
+  JSON `{id: <IDU>, ms: <command>, ps: "Clave1"}`, AES-CBC with a hard-coded
+  key and zero IV. The only credential is the 24-bit IDU, which `OPS1/` hands
+  out to anyone on the LAN. During its sync the vendor app also rewrites the
+  hub's cloud server address (`OPW3877`, `OPW4416`, `OPMW4411,8`). Keep the hub's
+  outbound traffic blocked at the router; `OPMW3898,0` (Settings, Manufacturer
+  cloud) turns off "send connectivity data" but may not close the relay.
+- **Discovery.** The vendor listens 45 s for the hub to announce itself on port
+  6653, then tries `OPS1/` at `<subnet>.246`. This app sweeps the /24.
+
 ## Not available on the LAN protocol
 
 - **Turning a heater off is available** via `*T0` (a 0 setpoint renders the zone

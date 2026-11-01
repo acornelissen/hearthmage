@@ -27,7 +27,11 @@ _DEFAULT_PORT = 6653
 _READ_RETRIES = 2
 _READ_TIMEOUT = 6.0
 _WRITE_RETRIES = 4
-_WRITE_TIMEOUT = 3.0
+_WRITE_TIMEOUT = 5.0  # the vendor app waits 5 s; a radio attempt takes about that long
+# The vendor app waits up to 45 s for a weekly-program write; we wait less so a
+# dead radiator cannot hold the wire for minutes, but well past one radio try.
+_PROGRAM_WRITE_TIMEOUT = 15.0
+_PROGRAM_WRITE_RETRIES = 2
 # A radiator can miss an RF window and the hub then answers ER,1 at once; the
 # same command a few seconds later usually succeeds (live 2026-11-01). The
 # vendor app resends on ER too. Used for program reads/writes and on/off.
@@ -41,6 +45,8 @@ _BACKOFF_MAX = 120.0
 # not answered a zone-list within this many poll intervals.
 _STALE_INTERVALS = 4
 
+_MAX_PLAUSIBLE_ROOM = 60.0  # vendor app: a room reading above this is re-read
+_MAX_PLAUSIBLE_TARGET = 35.0  # ...and a setpoint above this
 _MIN_TEMP = 5.0
 _MAX_TEMP = 30.0
 # "Off" is sent as a 1 degree setpoint: *T0 did not reliably turn radiators off.
@@ -180,8 +186,11 @@ class NexhoLocalClient:
                     # and killing the caller (a write worker or the poller).
                     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                     sock.settimeout(timeout)
-                    sock.sendto(cmd.encode("ascii"), self._addr)
-                    data, _ = sock.recvfrom(1024)
+                    # Connected: the OS then drops datagrams from any address
+                    # but the hub's, so another LAN host cannot answer for it.
+                    sock.connect(self._addr)
+                    sock.send(cmd.encode("ascii"))
+                    data = sock.recv(1024)
                     reply = data.rstrip(_NULL).decode("ascii", errors="replace")
                     _log.debug("hub %s -> %s (%.0fms)", cmd, reply, (time.monotonic() - started) * 1000)
                     return reply
@@ -200,11 +209,16 @@ class NexhoLocalClient:
         finally:
             self._wire_release(priority)
 
-    def _ask_until_answered(self, cmd: str, ok_prefix: str, priority: bool) -> str:
+    def _ask_until_answered(
+        self, cmd: str, ok_prefix: str, priority: bool,
+        retries: int | None = None, timeout: float | None = None,
+    ) -> str:
         """Send ``cmd``, resending after a short gap while the hub answers ER
         (radiator missed the RF window). The wire is released between attempts
         so other traffic is not blocked. Returns the last reply."""
-        retries, timeout = (_WRITE_RETRIES, _WRITE_TIMEOUT) if priority else (_READ_RETRIES, _READ_TIMEOUT)
+        default = (_WRITE_RETRIES, _WRITE_TIMEOUT) if priority else (_READ_RETRIES, _READ_TIMEOUT)
+        retries = retries if retries is not None else default[0]
+        timeout = timeout if timeout is not None else default[1]
         resp = ""
         for attempt in range(_ER_ATTEMPTS):
             resp = self._ask(cmd, retries, timeout, priority=priority)
@@ -502,10 +516,8 @@ class NexhoLocalClient:
         Resending the same target is idempotent - the radiator ends at that value."""
         wire = _encode_setpoint(target)
         try:
-            resp = self._ask(
-                f"D#{zone}#1#0#0*T{wire}/", _WRITE_RETRIES, _WRITE_TIMEOUT, priority=True
-            )
-            acked = resp.startswith("OK")
+            resp = self._ask_until_answered(f"D#{zone}#1#0#0*T{wire}/", "OK", priority=True)
+            acked = resp == "OK"  # the vendor treats "OK,<...>" as a command error
             if acked:
                 _log.info("zone %s setpoint %s acknowledged", zone, target)
             else:
@@ -713,8 +725,11 @@ class NexhoLocalClient:
             cmd = build_program_command(zone, blocks, days)
         except ValueError as exc:
             raise HearthError(f"Invalid schedule for zone {zone}: {exc}") from exc
-        resp = self._ask_until_answered(cmd, "OK", priority=True)
-        if not resp.startswith("OK"):
+        resp = self._ask_until_answered(
+            cmd, "OK", priority=True,
+            retries=_PROGRAM_WRITE_RETRIES, timeout=_PROGRAM_WRITE_TIMEOUT,
+        )
+        if resp != "OK":
             raise HearthError(f"Schedule write failed for zone {zone}: {resp!r}")
 
     def set_program_active(self, room_id: str, active: bool) -> None:
@@ -726,7 +741,7 @@ class NexhoLocalClient:
         zone = _zone_int(room_id)
         op = "ON" if active else "OFF"
         resp = self._ask_until_answered(f"D#{zone}#1#0#0*{op}/", "OK", priority=True)
-        if not resp.startswith("OK"):
+        if resp != "OK":
             raise HearthError(f"Program {op} failed for zone {zone}: {resp!r}")
 
     # ---- hub cloud reporting (memory address 3898) ------------------------
@@ -800,6 +815,12 @@ def _parse_status(resp: str) -> tuple[float | None, float | None]:
     setpoint = _as_int(parts[3]) if len(parts) > 3 else None
     if setpoint is not None:
         target = _decode_setpoint(setpoint)
+    # The vendor app re-reads such replies; treat them as no reading at all.
+    if (current is not None and current > _MAX_PLAUSIBLE_ROOM) or (
+        target is not None and target > _MAX_PLAUSIBLE_TARGET
+    ):
+        _log.debug("implausible status reply ignored: %r", resp)
+        return None, None
     return current, target
 
 

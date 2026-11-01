@@ -9,6 +9,12 @@ from hearthmage.nexho_client import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_resend_gap(monkeypatch):
+    """Resends after ER wait a few seconds on a real hub; not in tests."""
+    monkeypatch.setattr("hearthmage.nexho_client._ER_GAP", 0.0)
+
+
 def make_client(responses: dict[str, str], names=None) -> NexhoLocalClient:
     """A client whose UDP layer is replaced by a canned-response lookup."""
     client = NexhoLocalClient("10.0.0.99", zone_names=names or {})
@@ -714,3 +720,68 @@ def test_read_status_raw_returns_the_f_reply(monkeypatch):
     assert make_client({"R#1#1#0#0*?F/": live}).read_status_raw("1") == live
     with pytest.raises(HearthError):
         make_client({"R#1#1#0#0*?F/": "ER,1"}).read_status_raw("1")
+
+
+def test_ask_only_listens_to_the_hub(monkeypatch):
+    """The socket is connected to the hub, so the OS drops datagrams from any
+    other address (a spoofed reply on the LAN cannot answer for the hub)."""
+    calls: list[tuple] = []
+
+    class FakeSocket:
+        def __init__(self, *a):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, addr):
+            calls.append(("connect", addr))
+
+        def send(self, data):
+            calls.append(("send", data))
+
+        def recv(self, n):
+            return b"OK\x00"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hearthmage.nexho_client.socket.socket", FakeSocket)
+    client = NexhoLocalClient("10.0.0.99", port=6653)
+    assert client._ask("D#1#1#0#0*T20/", 1, 0.1) == "OK"
+    assert calls == [("connect", ("10.0.0.99", 6653)), ("send", b"D#1#1#0#0*T20/")]
+
+
+def test_setpoint_write_needs_a_bare_ok_and_resends_on_er(monkeypatch):
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc.time, "sleep", lambda s: None)
+    client = NexhoLocalClient("10.0.0.99")
+    client._ask = lambda cmd, *a, **k: "OK,1"  # type: ignore[method-assign]
+    assert client._send_once(1, 20.0) is False  # vendor: OK,<...> is a command error
+    replies = ["ER,1", "OK"]
+    client._ask = lambda cmd, *a, **k: replies.pop(0)  # type: ignore[method-assign]
+    assert client._send_once(1, 20.0) is True  # resent after the transient ER
+
+
+def test_program_write_waits_longer_and_needs_a_bare_ok():
+    from hearthmage.nexho_client import _PROGRAM_WRITE_TIMEOUT
+    from hearthmage.schedule import Block
+
+    seen: list[float] = []
+    client = NexhoLocalClient("10.0.0.99")
+    client._ask = lambda cmd, retries, timeout, priority=False: seen.append(timeout) or "OK"  # type: ignore[method-assign]
+    client.set_day_pattern("1", [Block(20, 0, 60)], [0])
+    assert seen == [_PROGRAM_WRITE_TIMEOUT] and _PROGRAM_WRITE_TIMEOUT >= 10
+    client._ask = lambda *a, **k: "OK,1"  # type: ignore[method-assign]
+    with pytest.raises(HearthError):
+        client.set_day_pattern("1", [Block(20, 0, 60)], [0])
+    with pytest.raises(HearthError):
+        client.set_program_active("1", True)
+
+
+def test_impossible_readings_are_not_trusted():
+    # The vendor re-reads when the room reads above 60 C or the target above 35 C.
+    assert _parse_status("OK,85,0,020") == (None, None)
+    assert _parse_status("OK,20,0,040") == (None, None)
+    assert _parse_status("OK,20,4,148") == (20.4, 20.5)  # half degree still fine
