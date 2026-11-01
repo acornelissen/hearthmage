@@ -149,6 +149,17 @@
       {% endif %}
     </section>
 
+    {% if hub_ready %}
+    <section class="panel">
+      <h2 class="panel-title">Manufacturer cloud</h2>
+      <p class="panel-note">The hub can send data to the manufacturer&rsquo;s server, which their
+        app can use to reach it from outside your home. HearthMage works without it.</p>
+      <div id="cloud" hx-get="/settings/cloud" hx-trigger="load" hx-swap="outerHTML">
+        <p class="panel-note">Checking the hub&hellip;</p>
+      </div>
+    </section>
+    {% endif %}
+
     <section class="panel">
       <h2 class="panel-title">Backup &amp; restore</h2>
       <p class="panel-note">Your schedules are kept here, and each zone&rsquo;s schedule

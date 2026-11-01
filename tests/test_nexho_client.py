@@ -603,6 +603,25 @@ def test_read_day_pattern_unreadable_is_hearth_error(monkeypatch):
         client.read_day_pattern("2", 9)  # not a weekday
 
 
+def test_cloud_reporting_read_and_write():
+    sent: list[str] = []
+    client = make_client({"OPMR3898/": "OPOK,1", "OPMW3898,": "OPOK"})
+    real = client._ask
+    client._ask = lambda cmd, *a, **k: (sent.append(cmd), real(cmd, *a, **k))[1]  # type: ignore[method-assign]
+    assert client.read_cloud_reporting() is True
+    client.set_cloud_reporting(False)
+    client.set_cloud_reporting(True)
+    assert sent[1:] == ["OPMW3898,0/", "OPMW3898,1/"]
+
+
+def test_cloud_reporting_errors_are_hearth_errors():
+    client = make_client({"OPMR3898/": "ER", "OPMW3898,": "ER"})
+    with pytest.raises(HearthError):
+        client.read_cloud_reporting()
+    with pytest.raises(HearthError):
+        client.set_cloud_reporting(False)
+
+
 def test_program_commands_retry_a_transient_er(monkeypatch):
     """Live 2026-11-01: a *P write got ER,1 and the same write 4s later got OK."""
     import hearthmage.nexho_client as nc

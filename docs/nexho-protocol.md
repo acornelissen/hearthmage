@@ -202,7 +202,8 @@ Mon=0, year minus 2000.
 
 `OPMR<addr>/` reads and `OPMW<addr>,<value>/` writes hub memory. Address
 `3898` is the app's **"Send data to external server"** toggle (`1` = on).
-Live read 2026-11-01: `OPMR3898/` -> `OPOK,1`, i.e. on. The app also has a
+Live 2026-11-01: `OPMR3898/` -> `OPOK,1` (on); `OPMW3898,0/` -> bare `OPOK`;
+read back `OPOK,0` (off). The app's Settings page shows and toggles it. The app also has a
 remote connection path that sends this same protocol through a gateway at
 `49.13.37.164`. Other `OPMW` addresses the app writes are per-zone tables
 (base 120/240/360 for climate zones, 608/609 for load zones); not mapped here.

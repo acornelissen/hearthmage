@@ -1,0 +1,16 @@
+<div id="cloud" aria-live="polite">
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  {% if cloud_on is not none %}
+  <p class="panel-note">
+    {% if cloud_on %}The hub <strong>is sending data to the manufacturer&rsquo;s server</strong>.
+    {% else %}The hub <strong>is not sending data to the manufacturer&rsquo;s server</strong>.{% endif %}
+  </p>
+  <form method="post" action="/settings/cloud"
+        hx-post="/settings/cloud" hx-target="#cloud" hx-swap="outerHTML">
+    <input type="hidden" name="enabled" value="{{ 0 if cloud_on else 1 }}">
+    <button type="submit" class="btn{% if not cloud_on %} btn-ghost{% endif %}">
+      {{ 'Turn off' if cloud_on else 'Turn on' }}
+    </button>
+  </form>
+  {% endif %}
+</div>

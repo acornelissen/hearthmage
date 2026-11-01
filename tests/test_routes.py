@@ -938,6 +938,29 @@ def test_apply_loaded_week_rejects_tampered_input(client, tmp_path, monkeypatch,
     assert appmod.schedules.get_zone("1") == {}
 
 
+def test_settings_cloud_toggle(client, tmp_path, monkeypatch):
+    fake = app.dependency_overrides[get_client]()
+    fake.cloud_reporting = True
+    part = client.get("/settings/cloud")
+    assert "is sending data to the manufacturer" in part.text
+    resp = client.post("/settings/cloud", data={"enabled": "0"}, headers={"HX-Request": "true"})
+    assert fake.cloud_reporting is False
+    assert "is not sending data" in resp.text
+    resp = client.post("/settings/cloud", data={"enabled": "1"}, follow_redirects=False)
+    assert fake.cloud_reporting is True
+    assert resp.status_code == 303  # no-JS fallback returns to the settings page
+
+
+def test_settings_cloud_reports_an_unreachable_hub(client, monkeypatch):
+    fake = app.dependency_overrides[get_client]()
+
+    def unreachable():
+        raise HearthError("No response from hub")
+
+    monkeypatch.setattr(fake, "read_cloud_reporting", unreachable)
+    assert "Couldn&#39;t read this setting from the hub" in client.get("/settings/cloud").text
+
+
 def _with_holiday(tmp_path, monkeypatch):
     import hearthmage.app as appmod
     from hearthmage.holiday_store import HolidayStore
@@ -1206,3 +1229,13 @@ def test_restart_mqtt_stops_old_client_and_is_serialised(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "_mqtt_client", None)
     monkeypatch.setattr(appmod, "mqtt_bridge", None)
 
+
+def test_settings_page_lazy_loads_the_cloud_section(client, tmp_path, monkeypatch):
+    import hearthmage.app as appmod
+    from hearthmage.settings import Settings
+
+    monkeypatch.setattr(appmod, "settings", Settings(str(tmp_path / "c.json"), env={}))
+    monkeypatch.setattr(appmod, "get_client", lambda: _room_fake())  # the page lists rooms
+    assert 'hx-get="/settings/cloud"' not in client.get("/settings").text  # no hub yet
+    appmod.settings.set_hub("10.0.0.5", 6653)
+    assert 'hx-get="/settings/cloud"' in client.get("/settings").text

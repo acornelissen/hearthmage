@@ -436,6 +436,7 @@ def settings_page(request: Request) -> HTMLResponse:
             "hub_port": settings.hub_port,
             "rooms": rooms,
             "auth_enabled": settings.auth_enabled,
+            "hub_ready": settings.is_configured(),
             **_mqtt_view(),
         },
     )
@@ -516,6 +517,45 @@ async def save_names(request: Request) -> RedirectResponse:
     if set_names is not None:
         set_names(settings.zone_names)
     return RedirectResponse("/settings", status_code=303)
+
+
+# ---- manufacturer cloud reporting ----------------------------------------
+
+
+def _cloud_view(request: Request, client: HearthClient, error: str | None = None) -> HTMLResponse:
+    read = getattr(client, "read_cloud_reporting", None)
+    state: bool | None = None
+    if read is None:
+        error = error or "This hub connection can't read this setting."
+    else:
+        try:
+            state = read()
+        except HearthError:
+            error = error or "Couldn't read this setting from the hub. Try again in a minute."
+    return templates.TemplateResponse(request, "_cloud.html", {"cloud_on": state, "error": error})
+
+
+@app.get("/settings/cloud", response_class=HTMLResponse)
+def cloud_reporting(request: Request, client: HearthClient = Depends(get_client)) -> HTMLResponse:
+    return _cloud_view(request, client)
+
+
+@app.post("/settings/cloud")
+def set_cloud_reporting(
+    request: Request, enabled: int = Form(...), client: HearthClient = Depends(get_client)
+) -> Response:
+    setter = getattr(client, "set_cloud_reporting", None)
+    error = None
+    if setter is None:
+        error = "This hub connection can't change this setting."
+    else:
+        try:
+            setter(bool(enabled))
+        except HearthError:
+            error = "The hub didn't confirm the change. Try again."
+    if request.headers.get("HX-Request") != "true":
+        return RedirectResponse("/settings", status_code=303)  # no-JS form post
+    return _cloud_view(request, client, error)
 
 
 # ---- backup / restore ---------------------------------------------------

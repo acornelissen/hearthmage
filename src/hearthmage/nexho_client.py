@@ -694,6 +694,29 @@ class NexhoLocalClient:
         if not resp.startswith("OK"):
             raise HearthError(f"Program {op} failed for zone {zone}: {resp!r}")
 
+    # ---- hub cloud reporting (memory address 3898) ------------------------
+    # OPMR<addr>/ -> OPOK,<value>; OPMW<addr>,<value>/ -> OPOK. Confirmed live.
+
+    def read_cloud_reporting(self) -> bool:
+        """Whether the hub sends data to the vendor's external server."""
+        resp = self._ask(f"OPMR{_CLOUD_REPORTING_ADDR}/", _READ_RETRIES, _READ_TIMEOUT)
+        parts = resp.split(",")
+        if parts[0] != "OPOK" or len(parts) < 2 or parts[1] not in ("0", "1"):
+            raise HearthError(f"Unexpected cloud reporting reply: {resp!r}")
+        return parts[1] == "1"
+
+    def set_cloud_reporting(self, enabled: bool) -> None:
+        """Turn the hub's reporting to the vendor's external server on or off."""
+        value = 1 if enabled else 0
+        resp = self._ask(
+            f"OPMW{_CLOUD_REPORTING_ADDR},{value}/", _WRITE_RETRIES, _WRITE_TIMEOUT, priority=True
+        )
+        if resp != "OPOK":
+            raise HearthError(f"Cloud reporting change failed: {resp!r}")
+
+
+_CLOUD_REPORTING_ADDR = 3898  # hub memory: "send data to external server" (vendor app)
+
 
 def _encode_setpoint(temp: float | None) -> int:
     """Display temperature -> the value the hub expects after ``*T``.
