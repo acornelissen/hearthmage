@@ -853,6 +853,91 @@ def test_expired_holiday_is_not_shown(client, tmp_path, monkeypatch):
     assert appmod.holidays.get("1") is None
 
 
+def test_push_is_verified_by_reading_the_hub_back(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+
+    class Forgetful(FakeHearthClient):
+        """Acks every write but the hub still holds nothing for Monday."""
+
+        def read_day_pattern(self, room_id, day):
+            return [] if day == 0 else super().read_day_pattern(room_id, day)
+
+    appmod.schedules.set_pattern("1", [Block(20, 420, 540)], [0])
+    assert appmod._resync_zone(_room_fake(), "1") is True  # read-back matches
+    forgetful = Forgetful([Room("1", "Living Room", 19.0, 20.0, False, 5.0, 30.0)])
+    assert appmod._resync_zone(forgetful, "1") is False  # acked, but not on the hub
+
+
+def test_push_verification_fails_when_a_day_cannot_be_read(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+
+    class Asleep(FakeHearthClient):
+        def read_day_pattern(self, room_id, day):
+            raise HearthError("asleep")
+
+    appmod.schedules.set_pattern("1", [Block(20, 420, 540)], [0])
+    assert appmod._resync_zone(Asleep([Room("1", "L", 19.0, 20.0, False, 5.0, 30.0)]), "1") is False
+
+
+def test_load_from_radiator_previews_without_saving(client, tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    fake = app.dependency_overrides[get_client]()
+    fake.programs[("1", 2)] = [Block(19, 360, 480), Block(21, 1080, 1440)]
+    resp = client.post("/zones/1/schedule/load")
+    assert resp.status_code == 200
+    assert "On the radiator" in resp.text
+    assert "18:00&ndash;24:00" in resp.text
+    assert 'name="day2" value="19,360,480;21,1080,1440"' in resp.text
+    assert appmod.schedules.get_zone("1") == {}  # nothing replaced yet
+
+
+def test_load_from_radiator_reports_an_unreadable_day(client, tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    fake = app.dependency_overrides[get_client]()
+
+    def asleep_on_wednesday(room_id, day):
+        if day == 2:
+            raise HearthError("Zone 1 day 2: no answer")
+        return []
+
+    monkeypatch.setattr(fake, "read_day_pattern", asleep_on_wednesday)
+    resp = client.post("/zones/1/schedule/load")
+    assert "Couldn&#39;t read Wednesday" in resp.text
+    assert "Replace saved schedule" not in resp.text
+
+
+def test_load_from_radiator_says_when_it_already_matches(client, tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    fake = app.dependency_overrides[get_client]()
+    appmod.schedules.set_pattern("1", [Block(20, 420, 540)], [0])
+    fake.programs[("1", 0)] = [Block(20, 420, 540)]
+    resp = client.post("/zones/1/schedule/load")
+    assert "already matches" in resp.text
+    assert "Replace saved schedule" not in resp.text
+
+
+def test_apply_loaded_week_replaces_and_syncs(client, tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_pattern("1", [Block(20, 0, 600)], [0, 1])
+    resp = client.post(
+        "/zones/1/schedule/load/apply",
+        data={"day2": "19,360,480;21,1080,1440", **{f"day{d}": "" for d in (0, 1, 3, 4, 5, 6)}},
+        follow_redirects=False,
+    )
+    _wait_for_sync()
+    assert resp.status_code == 303
+    assert appmod.schedules.get_zone("1") == {2: [Block(19, 360, 480), Block(21, 1080, 1440)]}
+    assert appmod.sync.get("1") == "synced"
+
+
+@pytest.mark.parametrize("bad", ["19,360", "99,360,480", "19,480,360", "x", "19,0,600;20,300,700"])
+def test_apply_loaded_week_rejects_tampered_input(client, tmp_path, monkeypatch, bad):
+    appmod = _with_store(tmp_path, monkeypatch)
+    resp = client.post("/zones/1/schedule/load/apply", data={"day0": bad})
+    assert resp.status_code == 400
+    assert appmod.schedules.get_zone("1") == {}
+
+
 def _with_holiday(tmp_path, monkeypatch):
     import hearthmage.app as appmod
     from hearthmage.holiday_store import HolidayStore
@@ -1120,3 +1205,4 @@ def test_restart_mqtt_stops_old_client_and_is_serialised(tmp_path, monkeypatch):
     appmod._mqtt_client.loop_stop()
     monkeypatch.setattr(appmod, "_mqtt_client", None)
     monkeypatch.setattr(appmod, "mqtt_bridge", None)
+

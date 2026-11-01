@@ -108,6 +108,12 @@ R#<zone>#1#0#0*?P<day>/  ->  OK,P<day>,11,<b1>,<b2>,<b3>,<b4>,<b5>,<b6>
   unknown (constant on all four radiators).
 - So block detail **is** readable over the LAN. Earlier notes said it was not
   because they used `*OD`, which is a different read (below).
+- Round trip confirmed live 2026-11-01 on zone 3, Wednesday: wrote
+  `6#3#0#3#30#6#23#30#0#0` (06 C 03:00-03:30 and 23:30-24:00), read back the same
+  blocks, then cleared it. This app verifies every push this way.
+- A `*P#` write can get `ER,1` straight back (radiator missed the RF window)
+  and the identical write a few seconds later `OK`; the vendor app resends on
+  `ER`, and so does this app for program reads, writes and `*ON`/`*OFF`.
 
 `R#<zone>#1#0#0*OD<day>/` is the older per-day read the app uses on its
 normal sync path, expecting `OK,` plus 35 fields; a bare `OK` is treated by the

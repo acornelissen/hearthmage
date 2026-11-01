@@ -11,7 +11,7 @@ import time
 from hearthmage.atomicio import write_json_atomic
 from hearthmage.domain import HearthError, Room, Scene
 from hearthmage.energy import parse_energy
-from hearthmage.schedule import Block, build_program_command, parse_day_schedule
+from hearthmage.schedule import Block, build_program_command, parse_program_day
 
 _log = logging.getLogger("hearthmage.nexho")
 
@@ -28,6 +28,11 @@ _READ_RETRIES = 2
 _READ_TIMEOUT = 6.0
 _WRITE_RETRIES = 4
 _WRITE_TIMEOUT = 3.0
+# A radiator can miss an RF window and the hub then answers ER,1 at once; the
+# same command a few seconds later usually succeeds (live 2026-11-01). The
+# vendor app resends on ER too. Used for program reads/writes and on/off.
+_ER_ATTEMPTS = 4
+_ER_GAP = 3.0
 _POLL_INTERVAL = 15.0
 # Unreachable zones back off exponentially so they stop monopolising the hub;
 # capped so a radiator that wakes is still noticed within a couple of minutes.
@@ -194,6 +199,21 @@ class NexhoLocalClient:
             raise HearthError(f"No response from hub for {cmd!r}{detail}")
         finally:
             self._wire_release(priority)
+
+    def _ask_until_answered(self, cmd: str, ok_prefix: str, priority: bool) -> str:
+        """Send ``cmd``, resending after a short gap while the hub answers ER
+        (radiator missed the RF window). The wire is released between attempts
+        so other traffic is not blocked. Returns the last reply."""
+        retries, timeout = (_WRITE_RETRIES, _WRITE_TIMEOUT) if priority else (_READ_RETRIES, _READ_TIMEOUT)
+        resp = ""
+        for attempt in range(_ER_ATTEMPTS):
+            resp = self._ask(cmd, retries, timeout, priority=priority)
+            if resp.startswith(ok_prefix) or not resp.startswith("ER"):
+                return resp
+            if attempt + 1 < _ER_ATTEMPTS:
+                _log.debug("hub %s -> %s; retrying in %.0fs", cmd, resp, _ER_GAP)
+                time.sleep(_ER_GAP)
+        return resp
 
     def _zone_ids(self) -> list[int]:
         try:
@@ -638,11 +658,18 @@ class NexhoLocalClient:
 
     # ---- weekly schedule (native hub programs) --------------------------
 
-    def get_day_schedule(self, room_id: str, day: int) -> list[Block]:
-        """Read one weekday's schedule blocks for a zone (via ``*OD``)."""
+    def read_day_pattern(self, room_id: str, day: int) -> list[Block]:
+        """Read one weekday's blocks back from the hub (``*?P<day>``, confirmed
+        live). Raises HearthError if the radiator does not answer or holds
+        something this app cannot represent."""
         zone = _zone_int(room_id)
-        resp = self._ask(f"R#{zone}#1#0#0*OD{day}/", _READ_RETRIES, _READ_TIMEOUT)
-        return parse_day_schedule(resp)
+        if not 0 <= int(day) <= 6:
+            raise HearthError(f"Invalid weekday: {day!r}")
+        resp = self._ask_until_answered(f"R#{zone}#1#0#0*?P{int(day)}/", "OK,", priority=False)
+        try:
+            return parse_program_day(resp, int(day))
+        except ValueError as exc:
+            raise HearthError(f"Zone {zone} day {day}: {exc}") from exc
 
     def set_day_pattern(self, room_id: str, blocks: list[Block], days: list[int]) -> None:
         """Write a block pattern to every weekday in ``days`` (via ``*P``)."""
@@ -651,12 +678,7 @@ class NexhoLocalClient:
             cmd = build_program_command(zone, blocks, days)
         except ValueError as exc:
             raise HearthError(f"Invalid schedule for zone {zone}: {exc}") from exc
-        resp = self._ask(
-            cmd,
-            _WRITE_RETRIES,
-            _WRITE_TIMEOUT,
-            priority=True,
-        )
+        resp = self._ask_until_answered(cmd, "OK", priority=True)
         if not resp.startswith("OK"):
             raise HearthError(f"Schedule write failed for zone {zone}: {resp!r}")
 
@@ -668,7 +690,7 @@ class NexhoLocalClient:
         """
         zone = _zone_int(room_id)
         op = "ON" if active else "OFF"
-        resp = self._ask(f"D#{zone}#1#0#0*{op}/", _WRITE_RETRIES, _WRITE_TIMEOUT, priority=True)
+        resp = self._ask_until_answered(f"D#{zone}#1#0#0*{op}/", "OK", priority=True)
         if not resp.startswith("OK"):
             raise HearthError(f"Program {op} failed for zone {zone}: {resp!r}")
 

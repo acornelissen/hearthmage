@@ -802,6 +802,8 @@ def _resync_zone(client: HearthClient, zone: str) -> bool:
             except HearthError as exc:
                 _sched_log.warning("zone %s schedule push for days %s failed: %s", zone, days, exc)
                 ok = False
+        if ok:
+            ok = _verify_week(client, zone, stored)
     toggle = getattr(client, "set_program_active", None)
     active = schedules.get_active(zone)
     if toggle is not None and active is not None:
@@ -811,6 +813,24 @@ def _resync_zone(client: HearthClient, zone: str) -> bool:
             _sched_log.warning("zone %s program on/off push failed: %s", zone, exc)
             ok = False
     return ok
+
+
+def _verify_week(client: HearthClient, zone: str, stored: dict[int, list[Block]]) -> bool:
+    """Read every day back from the hub (``*?P``) and compare with what was
+    pushed, so "synced" means the hub holds it, not just that it acked."""
+    read = getattr(client, "read_day_pattern", None)
+    if read is None:
+        return True  # a client that cannot read back: the ack is all we have
+    for day in range(7):
+        try:
+            held = read(zone, day)
+        except HearthError as exc:
+            _sched_log.warning("zone %s day %s read-back failed: %s", zone, day, exc)
+            return False
+        if held != stored.get(day, []):
+            _sched_log.warning("zone %s day %s read-back mismatch: hub has %s", zone, day, held)
+            return False
+    return True
 
 
 def _sync_until_settled(client: HearthClient, zone: str) -> None:
@@ -962,7 +982,11 @@ def _parse_schedule_form(form) -> tuple[list[dict], list[int], list[Block], list
 
 def _schedule_view(zone: str):
     """Per-day rows (with HH:MM strings) for rendering the stored schedule."""
-    stored = schedules.get_zone(zone)
+    return _week_rows(schedules.get_zone(zone))
+
+
+def _week_rows(stored: dict[int, list[Block]]) -> list[dict]:
+    """Per-day rows (with HH:MM strings) for rendering a week of blocks."""
     rows = []
     for day, label in enumerate(WEEKDAY_NAMES):
         blocks = stored.get(day, [])
@@ -1009,7 +1033,12 @@ _NEW_EDITOR = {
 
 
 def _render_schedule(
-    request: Request, zone_id: str, client: HearthClient, editor: dict, status_code: int = 200
+    request: Request,
+    zone_id: str,
+    client: HearthClient,
+    editor: dict,
+    status_code: int = 200,
+    loaded: dict | None = None,
 ) -> HTMLResponse:
     room = _find_room(client, zone_id)
     name = room.name if room else f"Zone {zone_id}"
@@ -1027,6 +1056,8 @@ def _render_schedule(
             "sync": sync.get(zone_id),
             "holiday": _current_holiday(zone_id),
             "editor": editor,
+            "loaded": loaded,
+            "can_load": hasattr(client, "read_day_pattern"),
             "max_blocks": MAX_BLOCKS,
             "min_target": MIN_TARGET,
             "max_target": MAX_TARGET,
@@ -1089,6 +1120,76 @@ def toggle_program(
 ) -> RedirectResponse:
     _check_zone(zone_id)
     schedules.set_active(zone_id, bool(active))  # our app is the source of truth for this
+    _request_sync(client, zone_id)
+    return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
+
+
+def _read_week(client: HearthClient, zone: str) -> tuple[dict[int, list[Block]] | None, str | None]:
+    """Read all seven days from the hub; (week, None) or (None, error message)."""
+    read = getattr(client, "read_day_pattern", None)
+    if read is None:
+        return None, "This hub connection can't read schedules back."
+    week: dict[int, list[Block]] = {}
+    for day in range(7):
+        try:
+            week[day] = read(zone, day)
+        except HearthError as exc:
+            return None, (f"Couldn't read {WEEKDAY_NAMES[day]} from the radiator ({exc}). "
+                          "If it is asleep, try again in a minute.")
+    return week, None
+
+
+def _encode_day(blocks: list[Block]) -> str:
+    return ";".join(f"{b.target},{b.start},{b.end}" for b in blocks)
+
+
+def _decode_day(value: str) -> list[Block]:
+    """Inverse of _encode_day; raises ValueError on anything malformed (the
+    values come back from the browser, so they are validated again on save)."""
+    if not value.strip():
+        return []
+    blocks = []
+    for part in value.split(";"):
+        nums = part.split(",")
+        if len(nums) != 3 or not all(n.isascii() and n.isdigit() for n in nums):
+            raise ValueError(f"malformed block: {part!r}")
+        blocks.append(Block(*(int(n) for n in nums)))
+    return blocks
+
+
+@app.post("/zones/{zone_id}/schedule/load", response_class=HTMLResponse)
+def load_from_radiator(
+    request: Request, zone_id: str, client: HearthClient = Depends(get_client)
+) -> HTMLResponse:
+    """Preview the week the radiator holds. Nothing is saved until the user
+    confirms with /schedule/load/apply."""
+    _check_zone(zone_id)
+    week, error = _read_week(client, zone_id)
+    loaded: dict = {"error": error}
+    if week is not None:
+        saved = {d: schedules.get_day(zone_id, d) for d in range(7)}
+        loaded.update(
+            rows=_week_rows(week),
+            encoded={d: _encode_day(week[d]) for d in range(7)},
+            matches=week == saved,
+            empty=not any(week.values()),
+        )
+    return _render_schedule(request, zone_id, client, _NEW_EDITOR, loaded=loaded)
+
+
+@app.post("/zones/{zone_id}/schedule/load/apply")
+async def apply_loaded_week(
+    request: Request, zone_id: str, client: HearthClient = Depends(get_client)
+) -> Response:
+    _check_zone(zone_id)
+    form = await request.form()
+    try:
+        week = {day: _decode_day(str(form.get(f"day{day}", ""))) for day in range(7)}
+        schedules.replace_week(zone_id, week)
+    except ValueError:
+        return PlainTextResponse(
+            "That schedule could not be read. Load it from the radiator again.", status_code=400
+        )
     _request_sync(client, zone_id)
     return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
 

@@ -52,10 +52,59 @@
     </section>
     {% endif %}
 
+    {% if can_load %}
+    <section class="panel radiator-load" id="radiator" aria-labelledby="radiator-title">
+      <h2 class="panel-title" id="radiator-title">On the radiator</h2>
+      {% if not loaded %}
+      <p class="panel-note">See the week the radiator holds now, for example one set in the
+        manufacturer&rsquo;s app. Nothing changes here until you choose to replace.</p>
+      <form method="post" action="/zones/{{ zone_id }}/schedule/load">
+        <button type="submit" class="btn btn-ghost">Load from radiator</button>
+      </form>
+      {% elif loaded.error %}
+      <p class="error" role="alert">{{ loaded.error }}</p>
+      <form method="post" action="/zones/{{ zone_id }}/schedule/load">
+        <button type="submit" class="btn btn-ghost">Try again</button>
+      </form>
+      {% elif loaded.matches %}
+      <p class="panel-note" role="status">The radiator <strong>already matches</strong> the
+        schedule saved here.</p>
+      {% else %}
+      <p class="panel-note" role="status">
+        {% if loaded.empty %}The radiator holds <strong>no schedule</strong>.
+        {% else %}The radiator holds this week, which differs from the one saved here:{% endif %}
+      </p>
+      {% if not loaded.empty %}
+      <ul class="loaded-week">
+        {% for row in loaded.rows if row.blocks %}
+        <li><strong>{{ row.label }}</strong>
+          {% for b in row.blocks %}<span class="sched-time">{{ b.start }}&ndash;{{ b.end }}</span>
+          <span class="sched-temp">{{ b.target }}&deg;</span>{% if not loop.last %}, {% endif %}{% endfor %}
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+      <form method="post" action="/zones/{{ zone_id }}/schedule/load/apply" class="loaded-actions">
+        {% for day, value in loaded.encoded.items() %}
+        <input type="hidden" name="day{{ day }}" value="{{ value }}">
+        {% endfor %}
+        {% if loaded.empty %}
+        {# Replacing with an empty week would wipe the saved one: keep is the default. #}
+        <a class="btn" href="/zones/{{ zone_id }}/schedule">Keep mine</a>
+        <button type="submit" class="btn btn-ghost">Clear saved schedule</button>
+        {% else %}
+        <button type="submit" class="btn">Replace saved schedule</button>
+        <a class="btn btn-ghost" href="/zones/{{ zone_id }}/schedule">Keep mine</a>
+        {% endif %}
+      </form>
+      {% endif %}
+    </section>
+    {% endif %}
+
     {% if not has_schedule %}
     <p class="sched-note">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 11v5M12 8h.01" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-      <span>This app doesn&rsquo;t import schedules set in the manufacturer&rsquo;s app yet, so days may show as &ldquo;not programmed&rdquo; even if the hub has one. Once you set a schedule here, this app owns it and is the source of truth &mdash; it keeps it and pushes it to the hub, cloud-free.</span>
+      <span>Schedules set in the manufacturer&rsquo;s app don&rsquo;t show here until you load them from the radiator. Once you set or load a schedule here, this app owns it and is the source of truth &mdash; it keeps it and pushes it to the hub, cloud-free.</span>
     </p>
     {% endif %}
 
@@ -213,6 +262,14 @@
       addBtn.removeAttribute('hidden');
       addBtn.focus();
     });
+
+    // After loading from the radiator, take the user to the result.
+    var radiator = document.querySelector('#radiator [role="status"], #radiator [role="alert"]');
+    if (radiator) {
+      radiator.setAttribute('tabindex', '-1');
+      radiator.scrollIntoView({ block: 'center' });
+      radiator.focus({ preventScroll: true });
+    }
 
     // After a failed save, take the user straight to what needs fixing.
     var errors = document.getElementById('editor-errors');

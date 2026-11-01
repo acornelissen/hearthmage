@@ -188,6 +188,20 @@ class ScheduleStore:
                 zone[str(day)] = [list(b) for b in serialised]
             self._save()
 
+    def replace_week(self, zone_id: str, week: dict[int, list[Block]]) -> None:
+        """Replace the zone's whole week in one save (e.g. loaded from the hub).
+        Days missing from ``week`` or with no blocks become cleared."""
+        key = _zone_key(zone_id)
+        days: dict[str, list[list[int]]] = {}
+        for day, blocks in week.items():
+            (day,) = validate_days([int(day)])
+            ordered = validate_blocks(list(blocks))
+            if ordered:
+                days[str(day)] = [[b.target, b.start, b.end] for b in ordered]
+        with self._lock:
+            self._data[key] = days
+            self._save()
+
     def clear_day(self, zone_id: str, day: int) -> None:
         key = _zone_key(zone_id)
         (day,) = validate_days([int(day)])

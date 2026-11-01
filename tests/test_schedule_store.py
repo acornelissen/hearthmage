@@ -156,3 +156,22 @@ def test_validate_data_is_strict(tmp_path):
     ):
         with pytest.raises(ValueError):
             validate_data(bad)
+
+
+def test_replace_week_sets_every_day_in_one_go(tmp_path):
+    path = str(tmp_path / "schedules.json")
+    store = ScheduleStore(path)
+    store.set_pattern("1", [Block(20, 0, 600)], [0, 1, 2])
+    store.replace_week("1", {1: [Block(21, 420, 540)], 4: [Block(18, 60, 120)]})
+    assert store.get_zone("1") == {1: [Block(21, 420, 540)], 4: [Block(18, 60, 120)]}
+    assert ScheduleStore(path).get_zone("1") == store.get_zone("1")
+
+
+def test_replace_week_validates_before_writing(tmp_path):
+    store = ScheduleStore(str(tmp_path / "schedules.json"))
+    store.set_pattern("1", [Block(20, 0, 600)], [0])
+    with pytest.raises(ValueError):
+        store.replace_week("1", {0: [Block(20, 0, 600)], 9: []})
+    with pytest.raises(ValueError):
+        store.replace_week("1", {0: [Block(99, 0, 600)]})
+    assert store.get_zone("1") == {0: [Block(20, 0, 600)]}  # untouched

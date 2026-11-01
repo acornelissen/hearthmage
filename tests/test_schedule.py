@@ -4,7 +4,7 @@ import pytest
 from hearthmage.schedule import (
     Block,
     build_program_command,
-    parse_day_schedule,
+    parse_program_day,
     weekday_bitmask,
 )
 
@@ -33,22 +33,46 @@ def test_build_program_command_two_blocks_weekdays():
     assert cmd.count("#24#60#24#60") == 4  # four disabled blocks
 
 
-def test_parse_day_schedule_drops_disabled_and_empty():
-    resp = "OK,20,6,30,8,30,5,24,60,24,60,253,0,0,0,0,5,24,60,24,60,5,24,60,24,60,5,24,60,24,60,0,0,0,132"
-    blocks = parse_day_schedule(resp)
-    assert blocks == [Block(20, 390, 510)]
+_OFF = "5,24,60,24,60"
 
 
-def test_parse_day_schedule_two_blocks():
-    resp = "OPOK,18,0,0,7,0,21,17,0,23,30,5,24,60,24,60,5,24,60,24,60,5,24,60,24,60,5,24,60,24,60,0,0,0,132"
-    assert parse_day_schedule(resp) == [Block(18, 0, 420), Block(21, 1020, 1410)]
+def _reply(day: int, *blocks: str) -> str:
+    padded = list(blocks) + [_OFF] * (6 - len(blocks))
+    return f"OK,P{day},11," + ",".join(padded)
 
 
-def test_parse_day_schedule_rejects_non_schedule():
-    import pytest
+def test_parse_program_day_all_disabled_is_empty():
+    # Verbatim live reply from a radiator with no program (2026-11-01).
+    live = "OK,P0,11,5,24,60,24,60,5,24,60,24,60,5,24,60,24,60,5,24,60,24,60,5,24,60,24,60,5,24,60,24,60"
+    assert parse_program_day(live, 0) == []
 
+
+def test_parse_program_day_reads_blocks_and_midnight():
+    resp = _reply(2, "21,17,0,0,0", "20,7,0,9,0")  # out of order, second ends at 00:00
+    assert parse_program_day(resp, 2) == [Block(20, 420, 540), Block(21, 1020, 1440)]
+
+
+def test_parse_program_day_skips_empty_slots():
+    resp = _reply(3, "253,0,0,0,0", "19,6,30,8,0")  # 253 = empty slot
+    assert parse_program_day(resp, 3) == [Block(19, 390, 480)]
+
+
+@pytest.mark.parametrize(
+    "resp",
+    [
+        "ER,1",
+        "OK",
+        _reply(4, "20,7,0,9,0"),  # reply for another day
+        "OK,P1,11,20,7,0",  # truncated
+        _reply(1, "0,7,0,9,0"),  # an Off block: not representable here
+        _reply(1, "40,7,0,9,0"),  # outside 5..30
+        _reply(1, "20,7,0,9,0", "18,8,0,10,0"),  # overlapping
+        _reply(1, "x,7,0,9,0"),
+    ],
+)
+def test_parse_program_day_rejects(resp):
     with pytest.raises(ValueError):
-        parse_day_schedule("ER,1")
+        parse_program_day(resp, 1)
 
 
 def test_block_ending_at_midnight_is_sent_as_hour_zero():

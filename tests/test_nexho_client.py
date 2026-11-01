@@ -582,3 +582,48 @@ def test_stop_ends_the_poller():
     client.stop()
     client._thread.join(timeout=3)
     assert not client._thread.is_alive()
+
+
+def test_read_day_pattern_uses_the_program_read():
+    from hearthmage.schedule import Block
+
+    blocks = "20,7,0,9,0," + ",".join(["5,24,60,24,60"] * 5)
+    client = make_client({"R#2#1#0#0*?P3/": f"OK,P3,11,{blocks}"})
+    assert client.read_day_pattern("2", 3) == [Block(20, 420, 540)]
+
+
+def test_read_day_pattern_unreadable_is_hearth_error(monkeypatch):
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc.time, "sleep", lambda s: None)  # skip the ER retry gaps
+    client = make_client({"R#2#1#0#0*?P3/": "ER,1"})
+    with pytest.raises(HearthError):
+        client.read_day_pattern("2", 3)
+    with pytest.raises(HearthError):
+        client.read_day_pattern("2", 9)  # not a weekday
+
+
+def test_program_commands_retry_a_transient_er(monkeypatch):
+    """Live 2026-11-01: a *P write got ER,1 and the same write 4s later got OK."""
+    import hearthmage.nexho_client as nc
+    from hearthmage.schedule import Block
+
+    monkeypatch.setattr(nc.time, "sleep", lambda s: None)
+    replies = {"D#": ["ER,1", "OK"], "R#1#1#0#0*?P0/": ["ER,1", "OK,P0,11," + ",".join(["5,24,60,24,60"] * 6)]}
+    client = NexhoLocalClient("10.0.0.99")
+    client._ask = lambda cmd, *a, **k: replies["D#" if cmd.startswith("D#") else cmd].pop(0)  # type: ignore[method-assign]
+    client.set_day_pattern("1", [Block(20, 0, 60)], [0])  # does not raise
+    assert client.read_day_pattern("1", 0) == []
+
+
+def test_program_write_gives_up_after_repeated_er(monkeypatch):
+    import hearthmage.nexho_client as nc
+    from hearthmage.schedule import Block
+
+    monkeypatch.setattr(nc.time, "sleep", lambda s: None)
+    calls: list[str] = []
+    client = NexhoLocalClient("10.0.0.99")
+    client._ask = lambda cmd, *a, **k: (calls.append(cmd), "ER,1")[1]  # type: ignore[method-assign]
+    with pytest.raises(HearthError):
+        client.set_program_active("1", True)
+    assert 1 < len(calls) <= 5  # retried, but bounded

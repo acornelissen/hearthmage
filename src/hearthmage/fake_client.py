@@ -14,6 +14,7 @@ class FakeHearthClient:
         self.holiday: dict[str, dict] = {}  # room_id -> holiday hold state
         self.applied: list = []  # (room_id, blocks, days) recorded by set_day_pattern
         self.program_active: dict[str, bool] = {}  # room_id -> last set_program_active
+        self.programs: dict[tuple[str, int], list] = {}  # (room_id, day) -> blocks held "on the hub"
         for room in (_default_rooms() if rooms is None else rooms):
             self._rooms[room.id] = room
 
@@ -40,6 +41,12 @@ class FakeHearthClient:
     def set_day_pattern(self, room_id: str, blocks, days) -> None:
         self._get(room_id)  # validate the zone exists
         self.applied.append((room_id, list(blocks), list(days)))
+        for day in days:
+            self.programs[(room_id, day)] = sorted(blocks, key=lambda b: b.start)
+
+    def read_day_pattern(self, room_id: str, day: int) -> list:
+        self._get(room_id)
+        return list(self.programs.get((room_id, day), []))
 
     def set_program_active(self, room_id: str, active: bool) -> None:
         self._get(room_id)  # validate the zone exists

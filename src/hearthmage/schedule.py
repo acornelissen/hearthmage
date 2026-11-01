@@ -9,7 +9,7 @@ where each block is ``<cmd>#<startHour>#<startMin>#<endHour>#<endMin>`` and the
 bitmask is ``sum(2**dayOfWeek)`` for the days the pattern applies to. Unused
 blocks are the disabled sentinel ``5#24#60#24#60``. It reads back per day with:
 
-    R#<zone>#1#0#0*OD<day>/  ->  OK,<6 blocks x 5 fields>,...,<status>  (35 fields)
+    R#<zone>#1#0#0*?P<day>/  ->  OK,P<day>,11,<6 blocks x 5 fields>
 
 Encoding confirmed by decompiling the app (f1/h.java writer, b1/j.java reader,
 f1/o.java block model, ProgDaySelection day list); see docs/nexho-protocol.md:
@@ -38,7 +38,7 @@ MAX_TARGET = 30
 DAY_MINUTES = 24 * 60
 DISABLED_CMD = 5  # climate "off"/disabled block sentinel (f1/h.java:287)
 DISABLED_BLOCK = f"{DISABLED_CMD}#24#60#24#60"
-_EMPTY_CMD_THRESHOLD = 240  # cmd > 240 (i.e. 253) marks an empty slot on read (b1/j.java:915)
+_EMPTY_CMD_THRESHOLD = 240  # cmd > 240 (e.g. 253) marks an empty slot on read
 
 # Weekday -> bit index, confirmed from the day-list order in ProgDaySelection.
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -111,21 +111,23 @@ def build_program_command(
     return "#".join(parts) + "/"
 
 
-def parse_day_schedule(resp: str) -> list[Block]:
-    """Parse an ``*OD`` reply into the day's active blocks (disabled ones dropped)."""
-    if not resp.startswith(("OK,", "OPOK,")):
-        raise ValueError(f"not a schedule response: {resp!r}")
+def parse_program_day(resp: str, day: int) -> list[Block]:
+    """Parse a ``*?P<day>`` reply (``OK,P<day>,<x>,`` then six blocks of
+    ``cmd,startH,startM,endH,endM``) into that day's blocks, sorted.
+
+    Disabled and empty slots (cmd > 240 or start hour > 23, as the vendor app
+    reads them) are dropped; an end of 0:00 means midnight. Raises ValueError
+    for anything else this app cannot represent, e.g. an Off (cmd 0) block."""
     fields = resp.split(",")
+    if fields[:2] != ["OK", f"P{day}"] or len(fields) < 3 + MAX_BLOCKS * 5:
+        raise ValueError(f"not a program reply for day {day}: {resp!r}")
     blocks: list[Block] = []
     for i in range(MAX_BLOCKS):
-        seg = fields[i * 5 + 1 : i * 5 + 6]
-        if len(seg) < 5:
-            break
-        try:
-            cmd, sh, sm, eh, em = (int(x) for x in seg)
-        except ValueError:
-            continue
-        if cmd > _EMPTY_CMD_THRESHOLD or (sh >= 24 and sm >= 60):
-            continue  # empty or disabled block
-        blocks.append(Block(cmd, sh * 60 + sm, eh * 60 + em))
-    return blocks
+        cmd, sh, sm, eh, em = (int(x) for x in fields[3 + i * 5 : 8 + i * 5])
+        if cmd > _EMPTY_CMD_THRESHOLD or sh > 23:
+            continue  # disabled (5#24#60#24#60) or empty (253) slot
+        if cmd == 0:
+            raise ValueError("the radiator holds an Off time frame, which this app can't edit yet")
+        end = eh * 60 + em
+        blocks.append(Block(cmd, sh * 60 + sm, end or DAY_MINUTES))
+    return validate_blocks(blocks)

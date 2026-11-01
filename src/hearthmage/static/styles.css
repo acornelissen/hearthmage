@@ -853,3 +853,11 @@ a.link-btn:hover { text-decoration: underline; }
 .editor-hint { margin: -.4rem 0 0; color: var(--muted); font-size: .85rem; }
 .editor-sub a { color: var(--heat-fg); font-weight: 700; }
 .sched-editor, #editor-errors { scroll-margin-top: 6rem; }  /* clear the sticky top bar */
+
+/* ---- schedule: load from radiator -------------------------------------- */
+
+.loaded-week { list-style: none; margin: 0 0 .9rem; padding: 0; display: grid; gap: .35rem; }
+.loaded-week li { padding: .4rem .6rem; border-radius: 10px; background: var(--paper-2); }
+.loaded-week strong { margin-right: .4rem; }
+.loaded-actions { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+#radiator [tabindex="-1"]:focus { outline: 3px solid var(--focus); outline-offset: 2px; }
