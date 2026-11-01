@@ -389,31 +389,38 @@ def test_config_page_shows_current_settings(client: TestClient):
     assert resp.status_code == 200
     assert "Living Room" in resp.text
     assert "Lock the keypad" in resp.text
-    assert "Temperature offset" in resp.text
+    assert "Anti-ice temperature" in resp.text
+    assert "Sensor offset" in resp.text
+    assert "offset calibration" not in resp.text  # 1#20 is not an offset
 
 
 def test_save_config_writes_and_redirects(client: TestClient):
     resp = client.post(
         "/zones/1/config",
-        data={"keypad_lock": "1", "offset": "9"},  # window_sensor omitted -> off
+        data={"keypad_lock": "1", "frost_temp": "8", "sensor_offset": "-0.5"},
         follow_redirects=False,
     )
     assert resp.status_code == 303
     assert resp.headers["location"] == "/zones/1/config?saved=1"
-    # confirm the fake client recorded the change
-    from hearthmage.app import get_client as _gc
-
-    fake = app.dependency_overrides[_gc]()
+    fake = app.dependency_overrides[get_client]()
     cfg = fake.read_config("1")
     assert cfg["keypad_lock"] is True
     assert cfg["window_sensor"] is False
-    assert cfg["offset"] == 9
+    assert cfg["frost_temp"] == 8
+    assert cfg["sensor_offset"] == -0.5
 
 
-def test_save_config_rejects_bad_offset(client: TestClient):
-    resp = client.post("/zones/1/config", data={"offset": "99"}, follow_redirects=False)
-    assert resp.status_code == 502
-    assert "out of range" in resp.text
+@pytest.mark.parametrize("data", [
+    {"frost_temp": "99", "sensor_offset": "0"},
+    {"frost_temp": "7", "sensor_offset": "12"},
+    {"frost_temp": "x", "sensor_offset": "0"},
+    {"frost_temp": "7", "sensor_offset": "nan"},
+])
+def test_save_config_rejects_bad_values(client: TestClient, data):
+    resp = client.post("/zones/1/config", data=data, follow_redirects=False)
+    assert resp.status_code == 400
+    fake = app.dependency_overrides[get_client]()
+    assert fake.read_config("1")["frost_temp"] == 7  # nothing written
 
 
 # ---- energy --------------------------------------------------------------

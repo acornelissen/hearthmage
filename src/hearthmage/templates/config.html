@@ -66,12 +66,25 @@
         </div>
 
         <div class="field">
-          <label class="field-label" for="offset">Temperature offset calibration</label>
-          <input class="field-input" id="offset" name="offset" type="number"
-                 min="0" max="{{ offset_max }}" step="1" inputmode="numeric"
-                 value="{{ config.offset if config.offset is not none else 7 }}">
-          <p class="hint">Corrects the radiator&rsquo;s own thermometer (0&ndash;{{ offset_max }};
-            a typical default is 7). Adjust only if the room reading is consistently off.</p>
+          <label class="field-label" for="frost_temp">Anti-ice temperature (&deg;C)</label>
+          <input class="field-input" id="frost_temp" name="frost_temp" type="number"
+                 min="{{ frost_min }}" max="{{ frost_max }}" step="1" inputmode="numeric"
+                 aria-describedby="frost_hint"
+                 value="{{ config.frost_temp if config.frost_temp is not none else 7 }}">
+          <p class="hint" id="frost_hint">Frost protection: if the room drops below this, the
+            radiator heats to it even when it is off or set lower ({{ frost_min }}&ndash;{{ frost_max }};
+            the default is 7).</p>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="sensor_offset">Sensor offset (&deg;C)</label>
+          <input class="field-input" id="sensor_offset" name="sensor_offset" type="number"
+                 min="-{{ offset_limit }}" max="{{ offset_limit }}" step="0.1" inputmode="decimal"
+                 aria-describedby="offset_hint"
+                 value="{{ config.sensor_offset if config.sensor_offset is not none else 0 }}">
+          <p class="hint" id="offset_hint">Corrects the radiator&rsquo;s own thermometer, in
+            tenths of a degree (&minus;{{ offset_limit }} to +{{ offset_limit }}; 0 means no
+            correction). Change it only if the room reading is consistently off.</p>
         </div>
 
         <button type="submit" class="btn">Save to radiator</button>

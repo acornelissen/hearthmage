@@ -67,23 +67,25 @@ class FakeHearthClient:
 
     def read_config(self, room_id: str) -> dict | None:
         self._get(room_id)
-        return self._config.setdefault(
-            room_id, {"keypad_lock": False, "window_sensor": False, "offset": 7}
-        )
+        return self._config.setdefault(room_id, dict(_DEFAULT_CONFIG))
 
-    def set_config(self, room_id, keypad_lock=None, window_sensor=None, offset=None) -> None:
+    def set_config(
+        self, room_id, keypad_lock=None, window_sensor=None, frost_temp=None, sensor_offset=None
+    ) -> None:
         self._get(room_id)
-        if offset is not None and not (0 <= offset <= 17):
-            raise HearthError(f"Offset {offset} out of range 0..17")
-        cfg = self._config.setdefault(
-            room_id, {"keypad_lock": False, "window_sensor": False, "offset": 7}
-        )
+        if frost_temp is not None and not (0 <= frost_temp <= 17):
+            raise HearthError(f"Anti-ice temperature {frost_temp} out of range 0..17")
+        if sensor_offset is not None and not abs(sensor_offset) <= 9.9:
+            raise HearthError(f"Sensor offset {sensor_offset} out of range +/-9.9")
+        cfg = self._config.setdefault(room_id, dict(_DEFAULT_CONFIG))
         if keypad_lock is not None:
             cfg["keypad_lock"] = bool(keypad_lock)
         if window_sensor is not None:
             cfg["window_sensor"] = bool(window_sensor)
-        if offset is not None:
-            cfg["offset"] = int(offset)
+        if frost_temp is not None:
+            cfg["frost_temp"] = int(frost_temp)
+        if sensor_offset is not None:
+            cfg["sensor_offset"] = round(float(sensor_offset), 1)
 
     def set_holiday(self, room_id: str, day: int, month: int, temp: float) -> None:
         self._get(room_id)
@@ -121,6 +123,9 @@ class FakeHearthClient:
                 for r in self._rooms.values()
             },
         }
+
+
+_DEFAULT_CONFIG = {"keypad_lock": False, "window_sensor": False, "frost_temp": 7, "sensor_offset": 0.0}
 
 
 def _default_rooms() -> list[Room]:

@@ -452,16 +452,17 @@ def test_read_holiday_active_and_inactive():
     assert off.read_holiday("2") == {"active": False, "day": None, "month": None, "temp": None}
 
 
-def test_read_config_decodes_all_three():
+def test_read_config_decodes_every_setting():
     client = make_client(
         {
-            "R#1#1#0#0*?E#0#8/": "OK,1",  # keypad locked
+            "R#1#1#0#0*?E#0#8/": "OK,129",  # keypad locked (bit0), bit7 set
             "R#1#1#0#0*?E#0#6/": "OK,0",  # window sensor off
-            "R#1#1#0#0*?E#1#20/": "OK,7",  # offset 7
+            "R#1#1#0#0*?E#1#20/": "OK,7",  # anti-ice 7 C (live default)
+            "R#1#1#0#0*?E#0#9/": "OK,251",  # sensor offset: signed tenths, -0.5 C
         }
     )
     cfg = client.read_config("1")
-    assert cfg == {"keypad_lock": True, "window_sensor": False, "offset": 7}
+    assert cfg == {"keypad_lock": True, "window_sensor": False, "frost_temp": 7, "sensor_offset": -0.5}
 
 
 def test_read_config_none_when_asleep():
@@ -469,20 +470,42 @@ def test_read_config_none_when_asleep():
     assert client.read_config("3") is None
 
 
-def test_set_config_writes_only_given_fields():
+def _recording_client(keypad_raw: str = "OK,0"):
     sent: list[str] = []
     client = NexhoLocalClient("10.0.0.99")
-    client._ask = lambda cmd, r, t, priority=False: sent.append(cmd) or "OK"  # type: ignore[method-assign]
-    client.set_config("2", keypad_lock=True, offset=9)
-    assert "D#2#1#0#0*SEP#0#8#1/" in sent  # keypad lock on
-    assert "D#2#1#0#0*SEP#1#20#9/" in sent  # offset 9
-    assert not any("0#6" in c for c in sent)  # window sensor not touched
+
+    def ask(cmd, *a, **k):
+        sent.append(cmd)
+        return keypad_raw if "*?E#0#8" in cmd else "OK"
+
+    client._ask = ask  # type: ignore[method-assign]
+    return client, sent
 
 
-def test_set_config_rejects_out_of_range_offset():
-    client = NexhoLocalClient("10.0.0.99")
+def test_set_config_writes_frost_and_offset_like_the_vendor():
+    client, sent = _recording_client()
+    client.set_config("2", frost_temp=9, sensor_offset=-1.5)
+    assert "D#2#1#0#0*SEP#1#20#9/" in sent  # anti-ice 9 C
+    assert "R#2#1#0#0*SEP#0#9#241/" in sent  # -1.5 C -> -15 & 255; vendor uses R# here
+    assert not any("0#6" in c or "0#8" in c for c in sent)  # untouched settings
+
+
+def test_keypad_write_keeps_bit_7():
+    client, sent = _recording_client(keypad_raw="OK,129")
+    client.set_config("2", keypad_lock=False)
+    assert "D#2#1#0#0*SEP#0#8#128/" in sent
+    client, sent = _recording_client(keypad_raw="OK,0")
+    client.set_config("2", keypad_lock=True)
+    assert "D#2#1#0#0*SEP#0#8#1/" in sent
+
+
+@pytest.mark.parametrize("kwargs", [{"frost_temp": 18}, {"frost_temp": -1},
+                                    {"sensor_offset": 10.0}, {"sensor_offset": -9.95}])
+def test_set_config_rejects_out_of_range(kwargs):
+    client, sent = _recording_client()
     with pytest.raises(HearthError):
-        client.set_config("2", offset=99)
+        client.set_config("2", **kwargs)
+    assert not any("SEP" in c for c in sent)
 
 
 def test_set_config_raises_when_write_not_acked():
@@ -490,6 +513,12 @@ def test_set_config_raises_when_write_not_acked():
     with pytest.raises(HearthError):
         client.set_config("2", window_sensor=True)
 
+
+def test_set_config_requires_a_bare_ok():
+    # The vendor treats "OK,<...>" as a command error for writes.
+    client = make_client({"D#2#1#0#0*SEP#0#6#1/": "OK,1"})
+    with pytest.raises(HearthError):
+        client.set_config("2", window_sensor=True)
 
 def test_read_energy_reads_counters_and_never_resets_them():
     """*UDEL is the vendor app's consumption RESET (behind a "confirm reset"

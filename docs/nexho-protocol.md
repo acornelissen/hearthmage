@@ -225,13 +225,19 @@ needed. Known elements:
 
 | Setting | group#index | Value |
 |---|---|---|
-| Keypad lock | `0#8` | bit0: 1 = locked, 0 = unlocked |
+| Keypad lock | `0#8` | bit0: 1 = locked, 0 = unlocked. The vendor keeps bit7 on write (meaning unknown). |
 | Open-window detection | `0#6` | 1 = on, 0 = off |
-| Temperature-offset calibration | `1#20` | 0..17 (both test radiators read 7, likely the default) |
+| Anti-ice (frost protection) temperature | `1#20` | 0..17 °C; all four radiators read 7 (default). The radiator heats to this even when off or set lower. |
+| Sensor offset | `0#9` | signed byte in tenths of a degree, -9.9..+9.9 °C; all four read 0. Written with **`R#`**, not `D#`: `R#<z>#<module>#0#0*SEP#0#9#<round(off*10) & 255>/`. |
+| Temperature units | `1#224` | 36 or 136 = °F; all four read 255 (unset, °C). |
+| Output power level | `1#124` | 0..5 (vendor; not used here) |
+| Boost time | `1#22` | 1..19, in 5-minute steps (vendor; not used here) |
 
-The offset's exact degrees-per-step mapping is not established; it is exposed as
-the raw 0..17 value. See `src/hearthmage/nexho_client.py` (`read_config` /
-`set_config`).
+Corrected 2026-11-01 from the decompiled vendor app (HeatApp 4.1.1): `1#20` was
+earlier documented, and exposed in this app, as "temperature offset 0..17". It
+is the anti-ice temperature (vendor screen "Frost protection"); the real offset
+is `0#9`. Writes succeed only on a bare `OK` (the vendor treats `OK,...` as an
+error). See `src/hearthmage/nexho_client.py` (`read_config` / `set_config`).
 
 ## Not available on the LAN protocol
 

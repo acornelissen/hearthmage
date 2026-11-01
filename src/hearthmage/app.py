@@ -743,67 +743,92 @@ def history_page(request: Request, client: HearthClient = Depends(get_client)) -
 # ---- per-radiator config ------------------------------------------------
 
 
-@app.get("/zones/{zone_id}/config", response_class=HTMLResponse)
-def zone_config_page(
-    request: Request, zone_id: str, client: HearthClient = Depends(get_client), saved: int = 0
+def _config_page(
+    request: Request, zone_id: str, client: HearthClient, config: dict | None,
+    saved: bool = False, error: str | None = None, status_code: int = 200,
 ) -> HTMLResponse:
     room = _find_room(client, zone_id)
-    name = room.name if room else f"Zone {zone_id}"
-    read = getattr(client, "read_config", None)
-    try:
-        config = read(zone_id) if read else None
-    except HearthError:
-        config = None
     return templates.TemplateResponse(
         request,
         "config.html",
         {
             "zone_id": zone_id,
-            "zone_name": name,
+            "zone_name": room.name if room else f"Zone {zone_id}",
             "config": config,
-            "offset_max": 17,
-            "saved": bool(saved),
+            "frost_min": 0,
+            "frost_max": 17,
+            "offset_limit": 9.9,
+            "saved": saved,
+            "error": error,
         },
+        status_code=status_code,
     )
+
+
+@app.get("/zones/{zone_id}/config", response_class=HTMLResponse)
+def zone_config_page(
+    request: Request, zone_id: str, client: HearthClient = Depends(get_client), saved: int = 0
+) -> HTMLResponse:
+    _check_zone(zone_id)
+    read = getattr(client, "read_config", None)
+    try:
+        config = read(zone_id) if read else None
+    except HearthError:
+        config = None
+    return _config_page(request, zone_id, client, config, saved=bool(saved))
+
+
+def _parse_config_form(frost_temp: str, sensor_offset: str) -> tuple[int, float]:
+    """Validate the config form; raises ValueError with a message for the user."""
+    try:
+        frost = int(frost_temp)
+    except ValueError:
+        raise ValueError("Anti-ice temperature must be a whole number of degrees.") from None
+    if not 0 <= frost <= 17:
+        raise ValueError("Anti-ice temperature must be from 0 to 17 °C.")
+    try:
+        offset = float(sensor_offset)
+    except ValueError:
+        raise ValueError("Sensor offset must be a number, e.g. -0.5.") from None
+    if not (math.isfinite(offset) and abs(offset) <= 9.9):
+        raise ValueError("Sensor offset must be from -9.9 to +9.9 °C.")
+    return frost, round(offset, 1)
 
 
 @app.post("/zones/{zone_id}/config")
 def save_zone_config(
     request: Request,
     zone_id: str,
-    offset: int = Form(...),
+    frost_temp: str = Form(...),
+    sensor_offset: str = Form(...),
     keypad_lock: str = Form(None),
     window_sensor: str = Form(None),
     client: HearthClient = Depends(get_client),
 ) -> Response:
+    _check_zone(zone_id)
+    submitted = {
+        "keypad_lock": keypad_lock is not None,
+        "window_sensor": window_sensor is not None,
+        "frost_temp": frost_temp,
+        "sensor_offset": sensor_offset,
+    }
+    try:
+        frost, offset = _parse_config_form(frost_temp, sensor_offset)
+    except ValueError as exc:
+        return _config_page(request, zone_id, client, submitted, error=str(exc), status_code=400)
     apply = getattr(client, "set_config", None)
     if apply is None:
         return RedirectResponse(f"/zones/{zone_id}/config", status_code=303)
     try:
         apply(
             zone_id,
-            keypad_lock=keypad_lock is not None,
-            window_sensor=window_sensor is not None,
-            offset=offset,
+            keypad_lock=submitted["keypad_lock"],
+            window_sensor=submitted["window_sensor"],
+            frost_temp=frost,
+            sensor_offset=offset,
         )
     except HearthError as exc:
-        room = _find_room(client, zone_id)
-        return templates.TemplateResponse(
-            request,
-            "config.html",
-            {
-                "zone_id": zone_id,
-                "zone_name": room.name if room else f"Zone {zone_id}",
-                "config": {
-                    "keypad_lock": keypad_lock is not None,
-                    "window_sensor": window_sensor is not None,
-                    "offset": offset,
-                },
-                "offset_max": 17,
-                "error": str(exc),
-            },
-            status_code=502,
-        )
+        return _config_page(request, zone_id, client, submitted, error=str(exc), status_code=502)
     return RedirectResponse(f"/zones/{zone_id}/config?saved=1", status_code=303)
 
 

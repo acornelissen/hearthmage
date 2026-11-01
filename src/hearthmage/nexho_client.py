@@ -516,14 +516,17 @@ class NexhoLocalClient:
             return False
 
     # ---- per-radiator element config (*?E read / *SEP write) -------------
-    # Element parameters are addressed by (group, index). Confirmed live:
-    # reads return ``OK,<value>``; writes ``D#<z>#1#0#0*SEP#<g>#<i>#<v>/`` ack OK
-    # and persist (no separate commit packet needed).
-    _EL_KEYPAD = (0, 8)  # bit0 = keypad locked
+    # Element parameters are addressed by (group, index): read with
+    # ``R#<z>#1#0#0*?E#<g>#<i>/`` -> ``OK,<value>``, written with ``*SEP`` and
+    # acked with a bare ``OK`` (no commit packet). Meanings and write forms
+    # follow the decompiled vendor app (HeatApp 4.1.1); see the protocol doc.
+    _EL_KEYPAD = (0, 8)  # bit0 = keypad locked; bit7 is kept on write (vendor does)
     _EL_WINDOW = (0, 6)  # 1 = open-window detection on
-    _EL_OFFSET = (1, 20)  # temperature-offset calibration, 0..17
-    _OFFSET_MIN = 0
-    _OFFSET_MAX = 17
+    _EL_FROST = (1, 20)  # anti-ice (frost protection) temperature, 0..17 C
+    _EL_OFFSET = (0, 9)  # sensor offset, signed tenths of a degree, -9.9..+9.9 C
+    FROST_MIN = 0
+    FROST_MAX = 17
+    OFFSET_LIMIT = 9.9
 
     def _read_element(self, zone: int, group: int, index: int) -> int | None:
         try:
@@ -534,28 +537,31 @@ class NexhoLocalClient:
             return None
         return _as_int(resp.split(",")[1]) if "," in resp else None
 
-    def _write_element(self, zone: int, group: int, index: int, value: int) -> None:
+    def _write_element(self, zone: int, group: int, index: int, value: int, op: str = "D") -> None:
         resp = self._ask(
-            f"D#{zone}#1#0#0*SEP#{group}#{index}#{value}/",
+            f"{op}#{zone}#1#0#0*SEP#{group}#{index}#{value}/",
             _WRITE_RETRIES,
             _WRITE_TIMEOUT,
             priority=True,
         )
-        if not resp.startswith("OK"):
+        if resp != "OK":
             raise HearthError(f"Config write failed for zone {zone} ({group}#{index}): {resp!r}")
 
     def read_config(self, room_id: str) -> dict | None:
-        """Read keypad-lock, window-sensor and offset for a zone; None if asleep."""
+        """Read keypad lock, window sensor, anti-ice temperature and sensor
+        offset for a zone; None if the radiator is asleep."""
         zone = _zone_int(room_id)
         keypad = self._read_element(zone, *self._EL_KEYPAD)
         if keypad is None:  # first read failed: radiator asleep, don't bother more
             return None
         window = self._read_element(zone, *self._EL_WINDOW)
+        frost = self._read_element(zone, *self._EL_FROST)
         offset = self._read_element(zone, *self._EL_OFFSET)
         return {
             "keypad_lock": bool(keypad & 1),
             "window_sensor": bool(window),
-            "offset": offset,
+            "frost_temp": frost,
+            "sensor_offset": _decode_offset(offset) if offset is not None else None,
         }
 
     def set_config(
@@ -563,20 +569,31 @@ class NexhoLocalClient:
         room_id: str,
         keypad_lock: bool | None = None,
         window_sensor: bool | None = None,
-        offset: int | None = None,
+        frost_temp: int | None = None,
+        sensor_offset: float | None = None,
     ) -> None:
-        """Write only the provided per-radiator settings. Validates the offset."""
+        """Write only the provided per-radiator settings, validated first."""
         zone = _zone_int(room_id)
-        if offset is not None and not (self._OFFSET_MIN <= offset <= self._OFFSET_MAX):
+        if frost_temp is not None and not (self.FROST_MIN <= frost_temp <= self.FROST_MAX):
             raise HearthError(
-                f"Offset {offset} out of range {self._OFFSET_MIN}..{self._OFFSET_MAX}"
+                f"Anti-ice temperature {frost_temp} out of range {self.FROST_MIN}..{self.FROST_MAX}"
             )
+        if sensor_offset is not None and not (
+            math.isfinite(sensor_offset) and abs(sensor_offset) <= self.OFFSET_LIMIT + 1e-9
+        ):
+            raise HearthError(f"Sensor offset {sensor_offset} out of range +/-{self.OFFSET_LIMIT}")
         if keypad_lock is not None:
-            self._write_element(zone, *self._EL_KEYPAD, int(bool(keypad_lock)))
+            current = self._read_element(zone, *self._EL_KEYPAD)
+            if current is None:
+                raise HearthError(f"Zone {zone}: could not read the keypad setting to update it")
+            self._write_element(zone, *self._EL_KEYPAD, (current & 0x80) | int(bool(keypad_lock)))
         if window_sensor is not None:
             self._write_element(zone, *self._EL_WINDOW, int(bool(window_sensor)))
-        if offset is not None:
-            self._write_element(zone, *self._EL_OFFSET, int(offset))
+        if frost_temp is not None:
+            self._write_element(zone, *self._EL_FROST, int(frost_temp))
+        if sensor_offset is not None:
+            # The vendor sends this one write with R#, not D#.
+            self._write_element(zone, *self._EL_OFFSET, round(sensor_offset * 10) & 0xFF, op="R")
 
     # ---- holiday hold (*RH) ----------------------------------------------
     # Confirmed live: D#<z>#1#0#0*RH#<day>#<month>#0#<tempEncoded>/ holds the zone
@@ -737,6 +754,12 @@ def _encode_setpoint(temp: float | None) -> int:
     if half == int(half):
         return int(half)
     return int(half + 127.5)
+
+
+def _decode_offset(value: int) -> float:
+    """Sensor offset element (0#9): a signed byte in tenths of a degree."""
+    signed = value - 256 if value > 127 else value
+    return signed / 10
 
 
 def _decode_setpoint(value: int) -> float:
