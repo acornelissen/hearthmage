@@ -737,6 +737,7 @@ def _with_store(tmp_path, monkeypatch):
 
     monkeypatch.setattr(appmod, "schedules", ScheduleStore(str(tmp_path / "sched.json")))
     monkeypatch.setattr(appmod, "sync", SyncStore(str(tmp_path / "sync.json")))
+    monkeypatch.setattr(appmod, "_sync_backoff", {}, raising=False)  # no waits carried between tests
     return appmod
 
 
@@ -1387,6 +1388,79 @@ def test_retry_keeps_failed_when_still_unreachable(tmp_path, monkeypatch):
 
     appmod._retry_failed_syncs(Boom())
     assert appmod.sync.get("1") == "failed"  # stays failed for the next retry
+
+
+class _AsleepZone:
+    """A hub whose radiator never answers a schedule write; counts the attempts."""
+
+    def __init__(self) -> None:
+        self.day_writes = 0
+        self.toggles = 0
+
+    def set_day_pattern(self, *a):
+        self.day_writes += 1
+        raise HearthError("still asleep")
+
+    def set_program_active(self, *a):
+        self.toggles += 1
+        raise HearthError("still asleep")
+
+
+def test_resync_stops_at_the_first_write_the_hub_does_not_take(tmp_path, monkeypatch):
+    # Two day-groups plus the program switch: once one write fails the radiator
+    # is asleep, so the rest would only be more doomed RF attempts.
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_pattern("1", [Block(20, 0, 600)], [0])
+    appmod.schedules.set_pattern("1", [Block(18, 0, 600)], [1])
+    appmod.schedules.set_active("1", True)
+    hub = _AsleepZone()
+    assert appmod._resync_zone(hub, "1") is False
+    assert (hub.day_writes, hub.toggles) == (1, 0)
+
+
+def test_retry_backs_off_from_a_zone_that_keeps_failing(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(appmod, "_monotonic", lambda: clock["now"])
+    appmod.schedules.set_pattern("1", [Block(20, 0, 600)], [0])
+    appmod.sync.set("1", "failed")
+    hub = _AsleepZone()
+
+    appmod._retry_failed_syncs(hub)  # first retry: tried, fails
+    assert hub.day_writes == 1
+    clock["now"] += 59
+    appmod._retry_failed_syncs(hub)  # too soon
+    assert hub.day_writes == 1
+    clock["now"] += 2  # 61 s after the first failure
+    appmod._retry_failed_syncs(hub)
+    assert hub.day_writes == 2
+    clock["now"] += 61  # the wait has doubled to 120 s, so this is still too soon
+    appmod._retry_failed_syncs(hub)
+    assert hub.day_writes == 2
+    clock["now"] += 60
+    appmod._retry_failed_syncs(hub)
+    assert hub.day_writes == 3
+    clock["now"] += 100 * 3600  # however long it has failed, the wait is capped
+    appmod._retry_failed_syncs(hub)
+    clock["now"] += appmod._RETRY_MAX_WAIT + 1
+    appmod._retry_failed_syncs(hub)
+    assert hub.day_writes == 5
+
+
+def test_a_newly_queued_or_recovered_zone_is_pushed_without_waiting(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(appmod, "_monotonic", lambda: clock["now"])
+    appmod.schedules.set_pattern("1", [Block(20, 0, 600)], [0])
+    appmod.sync.set("1", "failed")
+    appmod._retry_failed_syncs(_AsleepZone())  # now backing off
+    # A backup import (or a new change) queues the zone as pending: push at once.
+    appmod.sync.set("1", "pending")
+    fake = _room_fake()
+    appmod._retry_failed_syncs(fake)
+    assert appmod.sync.get("1") == "synced"
+    # ...and the success wipes the backoff, so a later failure starts from 60 s.
+    assert "1" not in appmod._sync_backoff
 
 
 # ---- MQTT settings --------------------------------------------------------

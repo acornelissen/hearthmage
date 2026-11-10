@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import threading
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -1015,6 +1016,23 @@ _sync_lock = threading.Lock()
 _sync_gen: dict[str, int] = {}  # zone -> bumped on every change
 _sync_running: set[str] = set()  # zones with a live sync worker
 _retry_wake = threading.Event()  # set to run the retry loop now instead of in 60s
+# A zone that keeps failing (radiator asleep or unplugged) is retried less and
+# less often: every failed push is several priority RF attempts that hold back
+# polling and queue other zones' setpoints behind writes that cannot land.
+_RETRY_FIRST_WAIT = 60.0
+_RETRY_MAX_WAIT = 1800.0
+_sync_backoff: dict[str, tuple[int, float]] = {}  # zone -> (failures in a row, retry not before)
+_monotonic = time.monotonic  # indirection so tests can move the clock
+
+
+def _note_sync_result(zone: str, ok: bool) -> None:
+    """Record a settled push for the retry backoff. Caller holds ``_sync_lock``."""
+    if ok:
+        _sync_backoff.pop(zone, None)
+        return
+    failures = _sync_backoff.get(zone, (0, 0.0))[0] + 1
+    wait = min(_RETRY_FIRST_WAIT * 2 ** (failures - 1), _RETRY_MAX_WAIT)
+    _sync_backoff[zone] = (failures, _monotonic() + wait)
 
 
 def _resync_zone(client: HearthClient, zone: str) -> bool:
@@ -1035,9 +1053,11 @@ def _resync_zone(client: HearthClient, zone: str) -> bool:
                 apply(zone, [Block(*t) for t in key], days)
             except HearthError as exc:
                 _sched_log.warning("zone %s schedule push for days %s failed: %s", zone, days, exc)
-                ok = False
-        if ok:
-            ok = _verify_week(client, zone, stored)
+                # The radiator is not taking writes: the remaining days and the
+                # program switch would fail the same way. The whole week is
+                # re-sent on the next attempt anyway.
+                return False
+        ok = _verify_week(client, zone, stored)
     toggle = getattr(client, "set_program_active", None)
     active = schedules.get_active(zone)
     if toggle is not None and active is not None:
@@ -1078,6 +1098,7 @@ def _sync_until_settled(client: HearthClient, zone: str) -> None:
             with _sync_lock:
                 if _sync_gen.get(zone, 0) == gen:  # nothing changed while pushing
                     _sync_running.discard(zone)
+                    _note_sync_result(zone, ok)
                     sync.set(zone, "synced" if ok else "failed")
                     return
     except Exception:  # noqa: BLE001 - never leave the zone stuck on "pending"
@@ -1106,10 +1127,14 @@ def _request_sync(client: HearthClient, zone: str) -> None:
 
 def _retry_failed_syncs(client: HearthClient) -> None:
     """Push every zone not yet confirmed on the hub (failed, or queued as
-    pending), skipping any a worker is already pushing."""
+    pending), skipping any a worker is already pushing and any failed zone
+    still inside its backoff wait. A pending zone was queued on purpose (a
+    change or a backup import), so it is pushed without waiting."""
     for zone in sync.unsettled_zones():
         with _sync_lock:
             if zone in _sync_running:
+                continue
+            if sync.get(zone) == "failed" and _monotonic() < _sync_backoff.get(zone, (0, 0.0))[1]:
                 continue
             _sync_running.add(zone)
         _sync_until_settled(client, zone)
