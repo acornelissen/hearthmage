@@ -83,19 +83,29 @@
   </script>
 
   <script>
-    // Keep each target box showing the hub's target. The readout above it is
-    // re-fetched every few seconds and carries the hub's value in data-target;
-    // copy that into the box unless the user is in the middle of changing it.
+    // Keep each target box and Off button showing the hub's state. The readout
+    // above them is re-fetched every few seconds and carries the hub's target
+    // in data-target (empty = off); copy that into the box unless the user is
+    // in the middle of changing it.
     (function () {
       function boxFor(el) {
         var zone = el.closest('.zone');
         return zone && zone.querySelector('.setpoint-input');
       }
+      function syncOffButton(zone, hub) {
+        var off = zone.querySelector('.setpoint-off button');
+        if (!off) return;
+        off.disabled = hub === '';
+        if (hub === '') off.setAttribute('aria-disabled', 'true');
+        else off.removeAttribute('aria-disabled');
+      }
       function syncTargets() {
         document.querySelectorAll('.readout[data-target]').forEach(function (readout) {
-          var input = boxFor(readout);
+          var zone = readout.closest('.zone');
+          var input = zone && zone.querySelector('.setpoint-input');
           if (!input) return;
           var hub = readout.getAttribute('data-target');
+          syncOffButton(zone, hub);
           var moved = input.dataset.hub !== undefined && input.dataset.hub !== hub;
           input.dataset.hub = hub;
           input.placeholder = hub === '' ? 'Off' : '';

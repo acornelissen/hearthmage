@@ -84,6 +84,19 @@ def test_target_box_reads_off_when_the_zone_is_off(client: TestClient):
     assert 'value=""' in box
 
 
+def test_off_button_follows_the_hub_like_the_target_box(client: TestClient):
+    # The Off button is rendered disabled when the zone is off. It sits outside
+    # the polled readout, so the page script must keep it in step, or a zone
+    # that was off at page load could never be turned off again without a reload.
+    client.post("/rooms/1/temperature", data={"temperature": "0"})
+    page = client.get("/").text
+    button = page.split('class="off"')[1].split(">")[0]
+    assert "disabled" in button  # server-rendered state when off
+    script = page.split("Keep each target box and Off button")[1].split("</script>")[0]
+    assert "'.setpoint-off button'" in script
+    assert "off.disabled = hub === ''" in script
+
+
 def test_setpoint_request_is_logged_with_value_and_client(client: TestClient, caplog):
     with caplog.at_level("INFO", logger="hearthmage.setpoint"):
         client.post("/rooms/1/temperature", data={"temperature": "22"})
