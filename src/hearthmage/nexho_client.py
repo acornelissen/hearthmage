@@ -45,6 +45,11 @@ _BACKOFF_MAX = 120.0
 # not answered a zone-list within this many poll intervals.
 _STALE_INTERVALS = 4
 
+# Heater counts (OPS3) are re-read this often even when the zone list has not
+# changed: a zone deleted in the vendor app keeps its OPS2 slot and only shows
+# up as zero heaters. The hub answers OPS3 itself, with no radio involved.
+_HEATERS_REFRESH = 600.0
+
 _MAX_PLAUSIBLE_ROOM = 60.0  # vendor app: a room reading above this is re-read
 _MAX_PLAUSIBLE_TARGET = 35.0  # ...and a setpoint above this
 _MIN_TEMP = 5.0
@@ -98,6 +103,7 @@ class NexhoLocalClient:
         # Every D# write carries the count, as the vendor app does; unknown = 1.
         self._heaters: dict[int, int] = {}
         self._heaters_for: list[int] | None = None  # the OPS2 ids they were read for
+        self._heaters_read_at = 0.0  # monotonic time of the last good OPS3 read
         self._poller_started = False
         self._stop = threading.Event()  # set by stop(): the poller exits
         # Observability: monotonic timestamps for health reporting.
@@ -251,13 +257,27 @@ class NexhoLocalClient:
                 break
             if tok.isdigit():
                 ids.append(int(tok))
-        self._last_ops2_ok = time.monotonic()  # hub answered: health clock resets
-        if ids != self._heaters_for:
+        now = time.monotonic()
+        self._last_ops2_ok = now  # hub answered: health clock resets
+        if ids != self._heaters_for or now - self._heaters_read_at >= _HEATERS_REFRESH:
             self._read_heater_counts(ids)
         # A zone with no heaters is a deleted slot; the vendor app hides it too.
         ids = [z for z in ids if self._heaters.get(z, 1) > 0]
-        self._zones = ids
+        self._forget_zones_except(ids)
         return ids
+
+    def _forget_zones_except(self, ids: list[int]) -> None:
+        """The hub has just told us its zones: drop everything held for any
+        other zone. Without this a zone that was deleted, or that came from the
+        readings cache of another hub, stays on screen as "ok" with its last
+        reading for ever. Only called on a real answer, never on a hub failure."""
+        keep = set(ids)
+        with self._lock:
+            self._zones = ids
+            for table in (self._state, self._last, self._pending, self._desired,
+                          self._next_poll, self._backoff, self._last_fresh):
+                for zone in [z for z in table if z not in keep]:
+                    del table[zone]
 
     def _read_heater_counts(self, ids: list[int]) -> None:
         """Read OPS3/ (heaters per zone, in OPS2 order). On failure the counts
@@ -269,8 +289,23 @@ class NexhoLocalClient:
         if not resp.startswith("OPOK,OPS3,"):
             return
         counts = [_as_int(tok) for tok in resp.split(",")[2:]]
-        self._heaters = {z: c for z, c in zip(ids, counts) if c is not None}
-        self._heaters_for = ids
+        with self._lock:
+            self._heaters = {z: c for z, c in zip(ids, counts) if c is not None}
+            self._heaters_for = ids
+            self._heaters_read_at = time.monotonic()
+
+    def _require_zone(self, room_id: str) -> int:
+        """Zone number for a request, refused if the hub has no such zone. The
+        id comes from a URL or an MQTT topic, so without this any number would
+        be put on the wire and leave a phantom card behind. Before the hub has
+        answered once, the zones restored from the readings cache stand in; with
+        neither there is nothing to check against yet."""
+        zone = _zone_int(room_id)
+        with self._lock:
+            known = self._zones if self._zones is not None else (list(self._state) or None)
+        if known is not None and zone not in known:
+            raise HearthError(f"Unknown zone: {room_id}")
+        return zone
 
     def _modules(self, zone: int) -> int:
         """Heaters in a zone, for the second field of D# writes (default 1)."""
@@ -479,7 +514,7 @@ class NexhoLocalClient:
         at most one datagram is in flight per zone, and only the final value is
         confirmed. ``_last`` (the confirmed cache) is updated only on ack.
         """
-        zone = _zone_int(room_id)
+        zone = self._require_zone(room_id)
         if not math.isfinite(temperature):
             raise HearthError(f"Invalid temperature: {temperature!r}")
         # A non-positive request means OFF (sent as _OFF_TEMP). Otherwise clamp to
@@ -593,7 +628,7 @@ class NexhoLocalClient:
         offset for a zone; None if the radiator is asleep. A setting whose own
         read failed is None (unknown), never a default: the settings form must
         not be able to write a guess back to the radiator."""
-        zone = _zone_int(room_id)
+        zone = self._require_zone(room_id)
         keypad = self._read_element(zone, *self._EL_KEYPAD)
         if keypad is None:  # first read failed: radiator asleep, don't bother more
             return None
@@ -616,7 +651,7 @@ class NexhoLocalClient:
         sensor_offset: float | None = None,
     ) -> None:
         """Write only the provided per-radiator settings, validated first."""
-        zone = _zone_int(room_id)
+        zone = self._require_zone(room_id)
         if frost_temp is not None and not (self.FROST_MIN <= frost_temp <= self.FROST_MAX):
             raise HearthError(
                 f"Anti-ice temperature {frost_temp} out of range {self.FROST_MIN}..{self.FROST_MAX}"
@@ -656,7 +691,7 @@ class NexhoLocalClient:
     ) -> None:
         """Away until ``days`` from today at ``hour``:``minute``; then switch to
         ``arrival_temp``, or back to the weekly program if it is None."""
-        zone = _zone_int(room_id)
+        zone = self._require_zone(room_id)
         if not (0 <= days <= self._RH_MAX_DAYS and 0 <= hour <= 23 and 0 <= minute <= 59):
             raise HearthError(f"Invalid holiday end: {days} days, {hour}:{minute:02d}")
         if arrival_temp is None:
@@ -673,7 +708,7 @@ class NexhoLocalClient:
 
     def clear_holiday(self, room_id: str) -> None:
         """Cancel a zone's holiday hold (the vendor's clear: *RH#0#0#0#251)."""
-        zone = _zone_int(room_id)
+        zone = self._require_zone(room_id)
         resp = self._ask_until_answered(
             f"D#{zone}#{self._modules(zone)}#0#0*RH#0#0#0#{self._RH_RESUME_PROGRAM}/", "OK", priority=True
         )
@@ -682,7 +717,7 @@ class NexhoLocalClient:
 
     def read_holiday(self, room_id: str) -> dict | None:
         """Read a zone's holiday hold; None if the radiator did not answer."""
-        zone = _zone_int(room_id)
+        zone = self._require_zone(room_id)
         try:
             resp = self._ask(f"R#{zone}#1#0#0*?RH/", _READ_RETRIES, _READ_TIMEOUT)
         except HearthError:
@@ -709,7 +744,7 @@ class NexhoLocalClient:
 
         Never send ``*UDEL``: in the vendor app it is the consumption RESET,
         behind a "confirm reset" dialog (it was once used here as a probe)."""
-        zone = _zone_int(room_id)
+        zone = self._require_zone(room_id)
         try:
             ud = self._ask(f"R#{zone}#1#0#0*?UD/", _READ_RETRIES, _READ_TIMEOUT)
             um = self._ask(f"R#{zone}#1#0#0*?UM/", _READ_RETRIES, _READ_TIMEOUT)
@@ -733,7 +768,7 @@ class NexhoLocalClient:
         """Read one weekday's blocks back from the hub (``*?P<day>``, confirmed
         live). Raises HearthError if the radiator does not answer or holds
         something this app cannot represent."""
-        zone = _zone_int(room_id)
+        zone = self._require_zone(room_id)
         if not 0 <= int(day) <= 6:
             raise HearthError(f"Invalid weekday: {day!r}")
         resp = self._ask_until_answered(f"R#{zone}#1#0#0*?P{int(day)}/", "OK,", priority=False)
@@ -746,7 +781,7 @@ class NexhoLocalClient:
         """The radiator's full status reply (``*?F``), unparsed: room temperature,
         setpoint, its clock and weekday, firmware, and fields not yet mapped.
         Stored verbatim when diagnosing heating nobody asked for."""
-        zone = _zone_int(room_id)
+        zone = self._require_zone(room_id)
         resp = self._ask_until_answered(f"R#{zone}#1#0#0*?F/", "OK,", priority=False)
         if not resp.startswith("OK,"):
             raise HearthError(f"Zone {zone} status read failed: {resp!r}")
@@ -754,7 +789,7 @@ class NexhoLocalClient:
 
     def set_day_pattern(self, room_id: str, blocks: list[Block], days: list[int]) -> None:
         """Write a block pattern to every weekday in ``days`` (via ``*P``)."""
-        zone = _zone_int(room_id)
+        zone = self._require_zone(room_id)
         try:
             cmd = build_program_command(zone, blocks, days, modules=self._modules(zone))
         except ValueError as exc:
@@ -772,7 +807,7 @@ class NexhoLocalClient:
         Activated, the hub runs the stored schedule for the zone; deactivated,
         the zone holds its manual setpoint. Confirmed against the hub.
         """
-        zone = _zone_int(room_id)
+        zone = self._require_zone(room_id)
         op = "ON" if active else "OFF"
         resp = self._ask_until_answered(f"D#{zone}#{self._modules(zone)}#0#0*{op}/", "OK", priority=True)
         if resp != "OK":

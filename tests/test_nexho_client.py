@@ -874,3 +874,85 @@ def test_heater_counts_are_read_once_not_every_poll():
     for _ in range(3):
         client._zone_ids()
     assert sent.count("OPS3/") == 1
+
+
+# ---- zones follow the hub's own list (heatapp-local-iqr) -----------------
+
+
+def test_a_zone_the_hub_no_longer_lists_is_forgotten(tmp_path):
+    # Zone 3 is in the readings cache from an earlier run (or another hub). The
+    # hub now lists only 1 and 2, so zone 3 must not stay on screen as "ok".
+    import json
+
+    path = tmp_path / "readings.json"
+    path.write_text(json.dumps({"1": [19.0, 20.0], "2": [18.0, 17.0], "3": [15.8, 1.0]}))
+    client = NexhoLocalClient("10.0.0.99", cache_file=str(path))
+    assert [r.id for r in client.list_rooms()] == ["1", "2", "3"]  # from the cache
+    client._ask = lambda cmd, *a, **k: {  # type: ignore[method-assign]
+        "OPS2/": "OPOK,OPS2,1,2,0", "OPS3/": "OPOK,OPS3,1,1",
+    }.get(cmd, "OK,19,00,020")
+    client._poll_once()
+    assert [r.id for r in client.list_rooms()] == ["1", "2"]
+    assert sorted(json.loads(path.read_text())) == ["1", "2"]  # and not reloaded next start
+
+
+def test_zones_are_kept_when_the_hub_does_not_answer(tmp_path):
+    import json
+
+    path = tmp_path / "readings.json"
+    path.write_text(json.dumps({"1": [19.0, 20.0], "2": [18.0, 17.0]}))
+    client = NexhoLocalClient("10.0.0.99", cache_file=str(path))
+
+    def down(cmd, *a, **k):
+        raise HearthError("hub down")
+
+    client._ask = down  # type: ignore[method-assign]
+    with pytest.raises(HearthError):
+        client._poll_once()
+    assert [r.id for r in client.list_rooms()] == ["1", "2"]  # last-known view stays
+
+
+def test_a_zone_deleted_in_the_vendor_app_is_noticed_without_a_restart(monkeypatch):
+    # Deleting a zone leaves its OPS2 slot in place and only drops its heater
+    # count to 0, so the heater counts have to be re-read now and then.
+    import hearthmage.nexho_client as mod
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["now"])
+    heaters = {"reply": "OPOK,OPS3,1,1,1"}
+    sent: list[str] = []
+    client = NexhoLocalClient("10.0.0.99")
+
+    def ask(cmd, *a, **k):
+        sent.append(cmd)
+        return {"OPS2/": "OPOK,OPS2,1,2,3", "OPS3/": heaters["reply"]}.get(cmd, "OK")
+
+    client._ask = ask  # type: ignore[method-assign]
+    assert client._zone_ids() == [1, 2, 3]
+    heaters["reply"] = "OPOK,OPS3,1,1,0"  # zone 3 deleted in the vendor app
+    clock["now"] += 30
+    assert client._zone_ids() == [1, 2, 3]  # not re-read on every poll
+    assert sent.count("OPS3/") == 1
+    clock["now"] += mod._HEATERS_REFRESH
+    assert client._zone_ids() == [1, 2]
+
+
+def test_a_zone_the_hub_does_not_have_is_refused_before_anything_is_sent():
+    sent: list[str] = []
+    client = NexhoLocalClient("10.0.0.99")
+
+    def ask(cmd, *a, **k):
+        sent.append(cmd)
+        return {"OPS2/": "OPOK,OPS2,1,2", "OPS3/": "OPOK,OPS3,1,1"}.get(cmd, "OK")
+
+    client._ask = ask  # type: ignore[method-assign]
+    client._zone_ids()
+    sent.clear()
+    with pytest.raises(HearthError, match="Unknown zone"):
+        client.set_temperature("999", 30)
+    with pytest.raises(HearthError, match="Unknown zone"):
+        client.set_config("999", frost_temp=17)
+    with pytest.raises(HearthError, match="Unknown zone"):
+        client.set_holiday("999", days=1, hour=8, minute=0, arrival_temp=None)
+    assert sent == []  # nothing reached the wire
+    assert [r.id for r in client.list_rooms()] == ["1", "2"]  # and no phantom card
