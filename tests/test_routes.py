@@ -239,6 +239,40 @@ def test_cross_origin_post_is_rejected(tmp_path, monkeypatch):
     _ = appmod
 
 
+def test_cross_origin_post_is_rejected_without_a_password(client: TestClient):
+    # No password keeps the app open on the LAN, but a web page on another
+    # site must not be able to drive it through a visitor's browser.
+    resp = client.post(
+        "/rooms/1/temperature",
+        data={"temperature": "30"},
+        headers={"origin": "http://evil.example"},
+    )
+    assert resp.status_code == 403
+    assert "Target 21" in client.get("/rooms/1/status").text  # nothing was changed
+
+
+def test_same_origin_and_headerless_posts_still_work_without_a_password(client: TestClient):
+    same = client.post(
+        "/rooms/1/temperature",
+        data={"temperature": "22"},
+        headers={"origin": "http://testserver"},
+    )
+    assert same.status_code == 200
+    # curl and scripts send no Origin or Referer; they keep working.
+    assert client.post("/rooms/1/temperature", data={"temperature": "23"}).status_code == 200
+
+
+def test_cross_origin_login_post_is_rejected(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    resp = TestClient(app).post(
+        "/login",
+        data={"password": "swordfish"},
+        headers={"origin": "http://evil.example"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 403
+
+
 def test_healthz_stays_public_under_auth(tmp_path, monkeypatch):
     _with_auth(monkeypatch, tmp_path)
     # unconfigured hub -> 503, but crucially not a redirect to /login

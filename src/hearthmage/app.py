@@ -205,7 +205,8 @@ def _is_authenticated(request: Request) -> bool:
 
 def _same_origin(request: Request) -> bool:
     """CSRF guard: a mutating request's Origin/Referer must match this host.
-    Absent headers fall through to the SameSite=Strict session cookie."""
+    Browsers always send Origin on a cross-site POST, so a request with neither
+    header is a script or curl on the LAN, which the open default allows."""
     origin = request.headers.get("origin") or request.headers.get("referer")
     if not origin:
         return True
@@ -214,16 +215,19 @@ def _same_origin(request: Request) -> bool:
 
 @app.middleware("http")
 async def _security(request: Request, call_next):
-    """Optional gate: when a password is set, require a session for the UI and a
-    same-origin check on mutating requests. No password => fully open (as before)."""
+    """Every mutating request must come from this site (CSRF guard), password or
+    not: without it any web page a LAN user opens could drive the heating or
+    repoint the hub and MQTT broker. When a password is set, the UI also needs a
+    session. No password => open to anyone on the LAN (as before)."""
+    mutating = request.method in ("POST", "PUT", "PATCH", "DELETE")
+    if mutating and not _same_origin(request):
+        return PlainTextResponse("CSRF check failed", status_code=403)
     if not settings.auth_enabled:
         return await call_next(request)
     path = request.url.path
     if path in _PUBLIC_PATHS or path.startswith("/static"):
         return await call_next(request)
-    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
-        if not _same_origin(request):
-            return PlainTextResponse("CSRF check failed", status_code=403)
+    if mutating:
         if not _is_authenticated(request):
             return PlainTextResponse("Forbidden", status_code=403)
         return await call_next(request)
