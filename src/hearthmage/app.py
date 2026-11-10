@@ -229,8 +229,16 @@ def _same_origin(request: Request) -> bool:
 async def _security(request: Request, call_next):
     """Every mutating request must come from this site (CSRF guard), password or
     not: without it any web page a LAN user opens could drive the heating or
-    repoint the hub and MQTT broker. When a password is set, the UI also needs a
-    session. No password => open to anyone on the LAN (as before)."""
+    repoint the hub and MQTT broker with a plain cross-site form post. When a
+    password is set, the UI also needs a session. No password => open to anyone
+    on the LAN (as before).
+
+    Known limit: the check compares Origin with the request's own Host header,
+    so it does not stop DNS rebinding (a hostile page whose name is re-pointed
+    at this app's LAN address sends matching Origin and Host). Closing that
+    needs a list of the hostnames this app is reached by; see bead
+    heatapp-local-hr0. A reverse proxy that rewrites Host fails this check
+    for the same reason."""
     mutating = request.method in ("POST", "PUT", "PATCH", "DELETE")
     if mutating and not _same_origin(request):
         return PlainTextResponse("CSRF check failed", status_code=403)
