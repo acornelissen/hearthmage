@@ -1472,16 +1472,55 @@ class _AsleepZone:
         raise HearthError("still asleep")
 
 
-def test_resync_stops_at_the_first_write_the_hub_does_not_take(tmp_path, monkeypatch):
-    # Two day-groups plus the program switch: once one write fails the radiator
-    # is asleep, so the rest would only be more doomed RF attempts.
+def test_resync_stops_sending_days_at_the_first_write_the_hub_does_not_take(tmp_path, monkeypatch):
+    # Two day-groups: once one write fails the radiator is asleep, so the other
+    # would only be another doomed RF attempt.
     appmod = _with_store(tmp_path, monkeypatch)
     appmod.schedules.set_pattern("1", [Block(20, 0, 600)], [0])
     appmod.schedules.set_pattern("1", [Block(18, 0, 600)], [1])
     appmod.schedules.set_active("1", True)
     hub = _AsleepZone()
     assert appmod._resync_zone(hub, "1") is False
-    assert (hub.day_writes, hub.toggles) == (1, 0)
+    assert hub.day_writes == 1
+
+
+def test_program_switch_is_still_sent_when_the_week_will_not_go_through(tmp_path, monkeypatch):
+    # Switching the weekly program off is how a user stops unwanted heating. It
+    # is one short command and must not wait for a week write that keeps failing.
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_pattern("1", [Block(20, 0, 600)], [0])
+    appmod.schedules.set_active("1", False)
+
+    class WeekFails(FakeHearthClient):
+        def set_day_pattern(self, *a):
+            raise HearthError("program write timed out")
+
+    hub = WeekFails([Room("1", "L", 19.0, 20.0, False, 5.0, 30.0)])
+    assert appmod._resync_zone(hub, "1") is False  # still not synced...
+    assert hub.program_active["1"] is False  # ...but the switch-off reached the hub
+
+
+def test_a_change_or_a_new_hub_clears_the_retry_wait(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(appmod, "_monotonic", lambda: clock["now"])
+    appmod.schedules.set_pattern("1", [Block(20, 0, 600)], [0])
+    appmod.sync.set("1", "failed")
+    asleep = _AsleepZone()
+    for _ in range(4):  # fail until the wait is several minutes long
+        appmod._retry_failed_syncs(asleep)
+        clock["now"] += appmod._RETRY_MAX_WAIT
+    assert appmod._sync_backoff["1"][0] == 4
+    # The hub address is corrected: retries must not sit out the old wait.
+    appmod._drop_client()
+    assert appmod._sync_backoff == {}
+    fake = _room_fake()
+    appmod._retry_failed_syncs(fake)
+    assert appmod.sync.get("1") == "synced"
+    # And a user's own change starts the count afresh rather than adding to it.
+    appmod._sync_backoff["1"] = (5, clock["now"] + 9999)
+    appmod._request_sync(fake, "1")
+    assert "1" not in appmod._sync_backoff or appmod._sync_backoff["1"][0] <= 1
 
 
 def test_retry_backs_off_from_a_zone_that_keeps_failing(tmp_path, monkeypatch):

@@ -8,6 +8,6 @@
     <span class="sync-dot" aria-hidden="true"></span> Sent to the hub
   {% elif sync == 'failed' %}
     <span class="sync-dot" aria-hidden="true"></span>
-    Saved here, but the radiator didn&rsquo;t answer. The app retries every minute until it does.
+    Saved here, but the radiator didn&rsquo;t answer. The app keeps retrying, less often the longer it stays silent (at most every 30 minutes).
   {% endif %}
 </div>

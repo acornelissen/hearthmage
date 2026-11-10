@@ -319,6 +319,8 @@ def _drop_client() -> None:
     with _client_lock:
         old, _client, _client_hub = _client, None, None
     _stop_client(old)
+    with _sync_lock:
+        _sync_backoff.clear()  # waits earned against the old hub mean nothing now
 
 
 def _safe_rooms(client: HearthClient) -> tuple[list, str | None]:
@@ -1055,11 +1057,15 @@ def _resync_zone(client: HearthClient, zone: str) -> bool:
                 apply(zone, [Block(*t) for t in key], days)
             except HearthError as exc:
                 _sched_log.warning("zone %s schedule push for days %s failed: %s", zone, days, exc)
-                # The radiator is not taking writes: the remaining days and the
-                # program switch would fail the same way. The whole week is
-                # re-sent on the next attempt anyway.
-                return False
-        ok = _verify_week(client, zone, stored)
+                # The radiator is not taking this write, so the remaining days
+                # would most likely fail the same way; the whole week is re-sent
+                # on the next attempt anyway. The program switch below is still
+                # sent: it is one short command, and switching the program off
+                # is how a user stops unwanted heating.
+                ok = False
+                break
+        if ok:
+            ok = _verify_week(client, zone, stored)
     toggle = getattr(client, "set_program_active", None)
     active = schedules.get_active(zone)
     if toggle is not None and active is not None:
@@ -1118,6 +1124,7 @@ def _request_sync(client: HearthClient, zone: str) -> None:
     worker pick the change up)."""
     with _sync_lock:
         _sync_gen[zone] = _sync_gen.get(zone, 0) + 1
+        _sync_backoff.pop(zone, None)  # a fresh change starts the retry wait afresh
         sync.set(zone, "pending")
         if zone in _sync_running:
             return
