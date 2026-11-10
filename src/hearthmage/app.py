@@ -374,7 +374,9 @@ _MANIFEST = {
 }
 
 # Minimal service worker: static assets are served cache-first, pages always
-# from the network (the cached home page is only the offline fallback). The app
+# from the network (the cached home page is only the offline fallback, and only
+# for page loads: a failed htmx poll must fail, or htmx swaps a whole home page
+# into a readout and each copy starts polling too). The app
 # is LAN-only, so this is about install ergonomics and fast loads, not full
 # offline use. The cache name carries a hash of the static files, so changing
 # any of them changes sw.js and browsers drop the old cache.
@@ -398,7 +400,7 @@ self.addEventListener('fetch', (e) => {
   const url = new URL(req.url);
   if (STATIC.includes(url.pathname)) {
     e.respondWith(caches.match(req).then((r) => r || fetch(req)));
-  } else {
+  } else if (req.mode === 'navigate') {
     e.respondWith(fetch(req).catch(() => caches.match('/')));
   }
 });

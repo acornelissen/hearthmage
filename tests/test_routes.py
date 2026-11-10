@@ -342,6 +342,18 @@ def test_service_worker_fetches_pages_from_the_network_first(client: TestClient)
     assert "fetch(req).catch(() => caches.match('/'))" in text  # offline fallback kept
 
 
+def test_service_worker_offline_fallback_is_for_page_loads_only(client: TestClient):
+    """A failed htmx poll must fail, not come back as the cached home page: htmx
+    would swap the whole page into a readout, and every copy would poll again."""
+    text = client.get("/sw.js").text
+    handler = text.split("addEventListener('fetch'")[1]
+    assert "} else if (req.mode === 'navigate') {" in handler
+    fallback = handler.split("req.mode === 'navigate'")[1]
+    assert "caches.match('/')" in fallback  # the fallback sits inside the navigate branch...
+    assert "caches.match('/')" not in handler.split("req.mode === 'navigate'")[0]  # ...and nowhere else
+    assert "} else {" not in handler  # no catch-all branch for other requests
+
+
 def test_index_links_manifest_and_registers_sw(client: TestClient):
     resp = client.get("/")
     assert 'rel="manifest"' in resp.text
