@@ -273,6 +273,21 @@ def test_cross_origin_login_post_is_rejected(tmp_path, monkeypatch):
     assert resp.status_code == 403
 
 
+def test_non_ascii_password_can_sign_in(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path, password="geheim-p\u00e4ssword")
+    c = TestClient(app)
+    wrong = c.post("/login", data={"password": "geheim-password"}, follow_redirects=False)
+    assert wrong.status_code == 401
+    ok = c.post("/login", data={"password": "geheim-p\u00e4ssword"}, follow_redirects=False)
+    assert ok.status_code == 303
+
+
+def test_non_ascii_guess_is_a_plain_wrong_password(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    resp = TestClient(app).post("/login", data={"password": "sw\u00f6rdfish"}, follow_redirects=False)
+    assert resp.status_code == 401
+
+
 def test_healthz_stays_public_under_auth(tmp_path, monkeypatch):
     _with_auth(monkeypatch, tmp_path)
     # unconfigured hub -> 503, but crucially not a redirect to /login

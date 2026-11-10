@@ -199,8 +199,14 @@ def _session_token() -> str:
     return hmac.new(settings.secret_key().encode(), b"authenticated:v1", hashlib.sha256).hexdigest()
 
 
+def _same_secret(given: str, expected: str) -> bool:
+    """Constant-time string compare. ``hmac.compare_digest`` raises on non-ASCII
+    str, so compare the UTF-8 bytes instead."""
+    return hmac.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
+
+
 def _is_authenticated(request: Request) -> bool:
-    return hmac.compare_digest(request.cookies.get(_SESSION_COOKIE, ""), _session_token())
+    return _same_secret(request.cookies.get(_SESSION_COOKIE, ""), _session_token())
 
 
 def _same_origin(request: Request) -> bool:
@@ -469,7 +475,7 @@ def login_page(request: Request) -> HTMLResponse:
 @app.post("/login")
 def login(request: Request, password: str = Form(...)) -> Response:
     expected = settings.auth_password
-    if expected and hmac.compare_digest(password, expected):
+    if expected and _same_secret(password, expected):
         resp = RedirectResponse("/", status_code=303)
         resp.set_cookie(
             _SESSION_COOKIE, _session_token(), httponly=True, samesite="strict", path="/"
