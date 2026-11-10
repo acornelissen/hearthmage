@@ -1518,19 +1518,29 @@ async def start_holiday(
 
 
 @app.post("/zones/{zone_id}/holiday/cancel")
-def cancel_holiday(zone_id: str, client: HearthClient = Depends(get_client)) -> Response:
+def cancel_holiday(
+    request: Request, zone_id: str, client: HearthClient = Depends(get_client)
+) -> Response:
     _check_zone(zone_id)
     clearer = getattr(client, "clear_holiday", None)
     if clearer is not None:
         try:
             clearer(zone_id)
-            # Cancelling was seen live to leave the zone at its holiday level, so
-            # restore the target it had, unless a weekly program is driving it.
-            record = holidays.get(zone_id)
-            prev = record.get("prev_setpoint") if record else None
-            if prev is not None and schedules.get_active(zone_id) is not True:
+        except HearthError as exc:
+            # The hub still holds the zone. Keep the record (and the setpoint to
+            # restore) so the page keeps showing the hold and offers Cancel again.
+            return _render_schedule(
+                request, zone_id, client, _NEW_EDITOR, status_code=502,
+                holiday_error=f"The hub didn't cancel the holiday: {exc}. Try again shortly.",
+            )
+        # Cancelling was seen live to leave the zone at its holiday level, so
+        # restore the target it had, unless a weekly program is driving it.
+        record = holidays.get(zone_id)
+        prev = record.get("prev_setpoint") if record else None
+        if prev is not None and schedules.get_active(zone_id) is not True:
+            try:
                 client.set_temperature(zone_id, prev)
-        except HearthError:
-            pass
+            except HearthError:
+                pass  # the hold is cleared; the target can be set by hand
     holidays.clear(zone_id)
     return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)

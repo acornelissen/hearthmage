@@ -1296,6 +1296,28 @@ def test_cancel_holiday_clears_and_restores_setpoint(client: TestClient, tmp_pat
     assert room.target_temp == 21.0  # setpoint restored
 
 
+def test_cancel_holiday_keeps_the_hold_when_the_hub_does_not_answer(client, tmp_path, monkeypatch):
+    # The radiator is asleep: the hub still holds the zone, so the app must keep
+    # its record (and the setpoint to restore) and let the user try again.
+    appmod = _with_holiday(tmp_path, monkeypatch)
+    _with_store(tmp_path, monkeypatch)
+    appmod.holidays.set("1", until=f"{_in_days(3)}T08:00", arrival_temp=20.0, prev_setpoint=21.0)
+    fake = app.dependency_overrides[get_client]()
+    fake.set_temperature("1", 7)
+
+    def asleep(room_id):
+        raise HearthError("Holiday clear failed for zone 1: 'ER,1'")
+
+    monkeypatch.setattr(fake, "clear_holiday", asleep)
+    resp = client.post("/zones/1/holiday/cancel", follow_redirects=False)
+    assert resp.status_code == 502
+    assert "didn&#39;t cancel the holiday" in resp.text or "didn't cancel the holiday" in resp.text
+    assert "Cancel holiday" in resp.text  # still offered, so it can be retried
+    assert appmod.holidays.get("1")["prev_setpoint"] == 21.0
+    room = next(r for r in fake.list_rooms() if r.id == "1")
+    assert room.target_temp == 7.0  # no restore while the hold is still on
+
+
 def test_cancel_holiday_leaves_a_running_program_alone(client, tmp_path, monkeypatch):
     appmod = _with_holiday(tmp_path, monkeypatch)
     _with_store(tmp_path, monkeypatch)
