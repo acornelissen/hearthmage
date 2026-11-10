@@ -1390,6 +1390,12 @@ def toggle_program(
 ) -> RedirectResponse:
     _check_zone(zone_id)
     schedules.set_active(zone_id, bool(active))  # our app is the source of truth for this
+    if active:
+        # The program now decides the target. A manual setpoint still waiting
+        # for a sleeping radiator must not be sent after it and override it.
+        cancel = getattr(client, "cancel_waiting_setpoint", None)
+        if cancel is not None:
+            cancel(zone_id)
     _request_sync(client, zone_id)
     return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
 

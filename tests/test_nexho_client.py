@@ -1252,3 +1252,77 @@ def test_setpoint_retry_wait_doubles_and_is_capped():
     assert _setpoint_retry_wait(2) == _SETPOINT_RETRY_FIRST * 2
     assert _setpoint_retry_wait(3) == _SETPOINT_RETRY_FIRST * 4
     assert _setpoint_retry_wait(50) == _SETPOINT_RETRY_MAX
+
+
+# ---- review follow-ups to the setpoint retry (heatapp-local-sdm) ----------
+
+
+def test_a_poll_that_already_shows_the_wanted_target_confirms_it():
+    # The setpoint reached the radiator but the hub's OK was lost. The next
+    # read proves it, so stop saying "not confirmed" and stop re-sending.
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    sent = _scripted_sends(client, {21.0: [False]})
+    client.set_temperature("2", 21.0)
+    _wait_until(lambda: client.list_rooms()[0].unconfirmed, "the not-confirmed mark")
+    client._read_zone_raw = lambda zone: (19.4, 21.0, True)  # type: ignore[method-assign]
+    client._poll_zone(2)
+    _wait_for_writer(client, 2)
+    room = client.list_rooms()[0]
+    assert (room.target_temp, room.unconfirmed) == (21.0, False)
+    assert client._last[2] == (19.4, 21.0)
+    assert sent == [21.0]  # nothing was re-sent
+
+
+@pytest.mark.parametrize("newer_command", ["holiday", "program_on"])
+def test_a_newer_mode_command_cancels_a_setpoint_that_is_still_waiting(newer_command):
+    # 22 C is waiting for a sleeping radiator. The user then starts a holiday
+    # (or switches the weekly program on). The old 22 must not be sent after it.
+    client = make_client({"D#": "OK"})
+    _zone_ready(client)
+    sent = _scripted_sends(client, {22.0: [False]})
+    client.set_temperature("2", 22.0)
+    _wait_until(lambda: client.list_rooms()[0].unconfirmed, "the not-confirmed mark")
+    if newer_command == "holiday":
+        client.set_holiday("2", days=7, hour=18, minute=0, arrival_temp=None)
+    else:
+        client.cancel_waiting_setpoint("2")  # what the app does when the program is switched on
+    _wait_for_writer(client, 2)  # the retry worker has gone
+    room = client.list_rooms()[0]
+    assert room.unconfirmed is False
+    assert room.target_temp == 18.0  # back to the last confirmed target
+    assert 2 not in client._pending and 2 not in client._desired
+    assert sent == [22.0]  # the stale 22 was never sent again
+
+
+def test_history_and_mqtt_are_not_told_a_target_from_before_a_write():
+    # A read that overlapped a confirmed write carries the old target. The
+    # reading hook (history, waste detector, MQTT state) must get the new one.
+    seen: list[tuple] = []
+    client = make_client({"D#": "OK"})
+    client._on_reading = lambda zone, current, target: seen.append((zone, current, target))
+    _zone_ready(client, zone=1, current=19.0, target=19.0)
+
+    def read_then_user_writes(zone):
+        client.set_temperature("1", 21.0)
+        _wait_for_writer(client, 1)
+        return 19.2, 19.0, True
+
+    client._read_zone_raw = read_then_user_writes  # type: ignore[method-assign]
+    client._poll_zone(1)
+    assert seen == [(1, 19.2, 21.0)]
+
+
+def test_the_reading_hook_reports_what_the_radiator_holds_while_unconfirmed():
+    seen: list[tuple] = []
+    client = NexhoLocalClient("10.0.0.99")
+    client._on_reading = lambda zone, current, target: seen.append((zone, current, target))
+    _zone_ready(client)
+    _scripted_sends(client, {21.0: [False]})
+    client.set_temperature("2", 21.0)
+    _wait_until(lambda: client.list_rooms()[0].unconfirmed, "the not-confirmed mark")
+    client._read_zone_raw = lambda zone: (19.4, 18.0, True)  # type: ignore[method-assign]
+    client._poll_zone(2)
+    assert seen == [(2, 19.4, 18.0)]  # history records the truth, not the wish
+    client.stop()
+    _wait_for_writer(client, 2)

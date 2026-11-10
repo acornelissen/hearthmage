@@ -1484,6 +1484,22 @@ def test_resync_stops_sending_days_at_the_first_write_the_hub_does_not_take(tmp_
     assert hub.day_writes == 1
 
 
+def test_switching_the_program_on_drops_a_setpoint_still_waiting_for_the_radiator(
+    client: TestClient, tmp_path, monkeypatch
+):
+    # A manual 22 C is still being retried for a sleeping radiator. If the user
+    # now hands the zone to its weekly program, that old 22 must not be sent
+    # after the program is on. Switching the program off leaves it alone.
+    _with_store(tmp_path, monkeypatch)
+    fake = app.dependency_overrides[get_client]()
+    cancelled: list[str] = []
+    fake.cancel_waiting_setpoint = cancelled.append
+    client.post("/zones/1/program", data={"active": "0"}, follow_redirects=False)
+    assert cancelled == []
+    client.post("/zones/1/program", data={"active": "1"}, follow_redirects=False)
+    assert cancelled == ["1"]
+
+
 def test_program_switch_is_still_sent_when_the_week_will_not_go_through(tmp_path, monkeypatch):
     # Switching the weekly program off is how a user stops unwanted heating. It
     # is one short command and must not wait for a week write that keeps failing.

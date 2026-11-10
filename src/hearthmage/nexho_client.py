@@ -478,15 +478,10 @@ class NexhoLocalClient:
         if fresh:
             self._last_fresh[zone] = time.monotonic()
             _log.debug("zone %s fresh: current=%s target=%s", zone, current, target)
-            if was_silent:
-                self._kick_write_retry(zone)
-            if self._on_reading is not None:
-                try:
-                    self._on_reading(zone, current, target)
-                except Exception:  # noqa: BLE001 - history logging must not break polling
-                    _log.exception("on_reading hook failed for zone %s", zone)
         else:
             _log.debug("zone %s did not answer (RF asleep)", zone)
+        reported = target  # the target handed to the reading hook, see below
+        settled_by_read = False
         with self._lock:
             pending = self._pending.get(zone)
             undisturbed = (
@@ -494,7 +489,19 @@ class NexhoLocalClient:
                 and zone not in self._writers
                 and self._write_seq.get(zone, 0) == seq_before
             )
-            if fresh and undisturbed:
+            if fresh and pending is not None and target is not None and target == pending:
+                # The radiator already holds the target that was asked for: the
+                # write landed even if its ack was lost. That confirms it, and
+                # the worker (if any) has nothing left to send.
+                self._last[zone] = (current, target)
+                self._pending.pop(zone, None)
+                self._unconfirmed.discard(zone)
+                self._write_kick.discard(zone)
+                if self._desired.get(zone) == pending:
+                    self._desired.pop(zone, None)
+                self._state[zone] = self._room(zone, current, target, "ok")
+                settled_by_read = True
+            elif fresh and undisturbed:
                 # No write anywhere near this read: the radiator's answer is
                 # ground truth and reconciles any now-settled pending write.
                 self._last[zone] = (current, target)
@@ -507,6 +514,8 @@ class NexhoLocalClient:
                 if fresh:
                     prev = self._last.get(zone)
                     self._last[zone] = (current, prev[1] if prev else None)
+                    if zone not in self._unconfirmed:
+                        reported = pending  # first send still in flight: about to land
                 last = self._last.get(zone)
                 self._state[zone] = self._room(zone, last[0] if last else None, pending, "ok")
             elif fresh:
@@ -518,12 +527,27 @@ class NexhoLocalClient:
                 kept = prev[1] if prev is not None else target
                 self._last[zone] = (current, kept)
                 self._state[zone] = self._room(zone, current, kept, "ok")
+                reported = kept
             else:
                 last = self._last.get(zone)
                 if last is not None:
                     self._state[zone] = self._room(zone, last[0], last[1], "ok")
                 else:
                     self._state[zone] = self._room(zone, None, None, "unreachable")
+        if settled_by_read:
+            with self._write_wake:
+                self._write_wake.notify_all()  # a worker waiting to retry can stop
+        elif fresh and was_silent:
+            self._kick_write_retry(zone)
+        if fresh and self._on_reading is not None:
+            # The hook feeds history, the waste detector and MQTT state. It runs
+            # after the read is reconciled so it is told the target the radiator
+            # holds: the raw one normally (and while a setpoint is unconfirmed),
+            # but the newer one when a write overlapped this read.
+            try:
+                self._on_reading(zone, current, reported)
+            except Exception:  # noqa: BLE001 - history logging must not break polling
+                _log.exception("on_reading hook failed for zone %s", zone)
         return fresh
 
     # ---- HearthClient interface (non-blocking; serves the cache) --------
@@ -571,6 +595,28 @@ class NexhoLocalClient:
             "hub_stale": self.hub_stale(),
             "zones": zones,
         }
+
+    def cancel_waiting_setpoint(self, room_id: str) -> None:
+        """Drop a setpoint that is still waiting for the radiator, because a
+        newer command for the zone (a holiday, the weekly program switched on)
+        is about to be sent. Otherwise the old setpoint would be re-sent after
+        the new command and override it, e.g. heat the room for a whole absence.
+        A first send that is simply in flight is left alone: it lands first."""
+        zone = _zone_int(room_id)
+        with self._lock:
+            if zone not in self._unconfirmed:
+                return
+            target = self._desired.pop(zone, None)
+            self._pending.pop(zone, None)
+            self._unconfirmed.discard(zone)
+            self._write_kick.discard(zone)
+            last = self._last.get(zone)
+            prev = self._state.get(zone)
+            current = prev.current_temp if prev else (last[0] if last else None)
+            self._state[zone] = self._room(zone, current, last[1] if last else None, "ok")
+        _log.info("zone %s unconfirmed setpoint %s dropped: replaced by a newer command", zone, target)
+        with self._write_wake:
+            self._write_wake.notify_all()  # its worker sees nothing left to send and ends
 
     def _kick_write_retry(self, zone: int) -> None:
         """The radiator has just come back after not answering polls, so it is
@@ -817,6 +863,7 @@ class NexhoLocalClient:
             arrival = _encode_setpoint(arrival_temp)
         else:
             raise HearthError(f"Arrival temperature {arrival_temp} out of range")
+        self.cancel_waiting_setpoint(room_id)
         resp = self._ask_until_answered(
             f"D#{zone}#{self._modules(zone)}#0#0*RH#{int(days)}#{int(hour)}#{int(minute)}#{arrival}/", "OK", priority=True
         )
