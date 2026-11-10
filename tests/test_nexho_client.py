@@ -956,3 +956,47 @@ def test_a_zone_the_hub_does_not_have_is_refused_before_anything_is_sent():
         client.set_holiday("999", days=1, hour=8, minute=0, arrival_temp=None)
     assert sent == []  # nothing reached the wire
     assert [r.id for r in client.list_rooms()] == ["1", "2"]  # and no phantom card
+
+
+def test_a_radiator_that_stops_answering_is_marked_silent(monkeypatch):
+    # Powered off at its switch: the hub keeps the zone, the reads fail, and the
+    # last reading must not go on looking live.
+    import hearthmage.nexho_client as mod
+
+    clock = {"now": 5000.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["now"])
+    replies = {"R#1": "OK,15,08,010"}
+    client = make_client(replies)
+    client._poll_zone(1)
+    assert client.list_rooms()[0].silent_for is None  # it just answered
+    replies["R#1"] = "ER,1"
+    clock["now"] += 300
+    client._poll_zone(1)
+    room = client.list_rooms()[0]
+    assert (room.current_temp, room.silent_for) == (15.8, None)  # a short nap is normal
+    clock["now"] += 2400
+    client._poll_zone(1)
+    room = client.list_rooms()[0]
+    assert room.current_temp == 15.8  # last reading still shown...
+    assert room.silent_for == 2700  # ...with how long it has been silent
+    replies["R#1"] = "OK,14,00,010"
+    client._poll_zone(1)
+    assert client.list_rooms()[0].silent_for is None  # back again
+
+
+def test_a_cached_zone_that_never_answers_after_a_restart_is_marked_silent(tmp_path, monkeypatch):
+    import json
+
+    import hearthmage.nexho_client as mod
+
+    clock = {"now": 100.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["now"])
+    path = tmp_path / "readings.json"
+    path.write_text(json.dumps({"1": [15.8, 1.0]}))
+    client = NexhoLocalClient("10.0.0.99", cache_file=str(path))
+    client._ask = lambda cmd, *a, **k: "ER,1"  # type: ignore[method-assign]
+    client._started_at = clock["now"]  # what start() records
+    clock["now"] += 900
+    client._poll_zone(1)
+    room = client.list_rooms()[0]
+    assert (room.current_temp, room.status, room.silent_for) == (15.8, "ok", 900)

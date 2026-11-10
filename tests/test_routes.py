@@ -97,6 +97,31 @@ def test_off_button_follows_the_hub_like_the_target_box(client: TestClient):
     assert "off.disabled = hub === ''" in script
 
 
+@pytest.mark.parametrize("silent_for, text", [
+    (2700.0, "over 45 min"),
+    (3 * 3600.0, "over 3 h"),
+])
+def test_readout_says_when_the_radiator_has_stopped_answering(silent_for, text):
+    fake = FakeHearthClient([
+        Room("1", "Lounge", 15.8, 10.0, is_off=False, min_temp=5.0, max_temp=30.0,
+             silent_for=silent_for)
+    ])
+    app.dependency_overrides[get_client] = lambda: fake
+    try:
+        page = TestClient(app).get("/rooms/1/status").text
+    finally:
+        app.dependency_overrides.clear()
+    assert "hasn&rsquo;t answered for " + text in page
+    assert "Showing the last reading" in page
+    assert "No answer" in page  # the state chip must not claim Idle/Heating
+    assert "Idle" not in page and "At target" not in page
+
+
+def test_readout_has_no_silence_note_for_a_radiator_that_answers(client: TestClient):
+    page = client.get("/rooms/1/status").text
+    assert "answered" not in page and "No answer" not in page
+
+
 def test_setpoint_request_is_logged_with_value_and_client(client: TestClient, caplog):
     with caplog.at_level("INFO", logger="hearthmage.setpoint"):
         client.post("/rooms/1/temperature", data={"temperature": "22"})

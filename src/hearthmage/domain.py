@@ -27,6 +27,9 @@ class Room:
     max_temp: float
     status: str = "ok"  # "ok" | "loading" | "unreachable"
     error: str | None = None  # transient per-zone error (e.g. a write that failed)
+    # Seconds since the radiator last answered, once that is long enough to be
+    # worth telling the user (the reading shown is then the last one it gave).
+    silent_for: float | None = None
 
 
 class HearthError(Exception):

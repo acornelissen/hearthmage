@@ -45,6 +45,10 @@ _BACKOFF_MAX = 120.0
 # not answered a zone-list within this many poll intervals.
 _STALE_INTERVALS = 4
 
+# A radiator dozes off over RF for a few minutes at a time, which is normal and
+# not worth a message. Silent for longer than this, the UI says so next to the
+# last reading (it may be switched off at the wall).
+_SILENT_AFTER = 600.0
 # Heater counts (OPS3) are re-read this often even when the zone list has not
 # changed: a zone deleted in the vendor app keeps its OPS2 slot and only shows
 # up as zero heaters. The hub answers OPS3 itself, with no radio involved.
@@ -331,7 +335,18 @@ class NexhoLocalClient:
             max_temp=_MAX_TEMP,
             status=status,
             error=error,
+            silent_for=self._silent_for(zone),
         )
+
+    def _silent_for(self, zone: int) -> float | None:
+        """How long the radiator has gone without answering, or None if that is
+        not long enough to mention. A zone restored from the readings cache that
+        has not answered since start is counted from when polling started."""
+        since = self._last_fresh.get(zone, self._started_at)
+        if since is None:
+            return None
+        silent = time.monotonic() - since
+        return silent if silent >= _SILENT_AFTER else None
 
     def _read_zone_raw(self, zone: int) -> tuple[float | None, float | None, bool]:
         """Query the radiator; return (current, target, fresh) where ``fresh``

@@ -309,6 +309,17 @@ body {
   font-weight: 600;
 }
 
+/* A calm per-zone note (radiator silent, change not confirmed yet). */
+.zone-note {
+  margin: .5rem 0 0;
+  padding: .5rem .7rem;
+  border-radius: var(--radius-sm);
+  background: var(--off-bg);
+  color: var(--off-fg);
+  font-size: .88rem;
+  font-weight: 600;
+}
+
 /* ---- setpoint control ------------------------------------------------- */
 
 .setpoint {

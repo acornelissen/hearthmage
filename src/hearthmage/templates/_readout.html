@@ -29,7 +29,9 @@
     <div class="reading">
       <div class="reading-head">
         <span class="temp-big">{{ '%.1f'|format(room.current_temp) if room.current_temp is not none else '--' }}<span class="deg">&deg;</span></span>
-        {% if room.is_off %}
+        {% if room.silent_for %}
+          <span class="state-chip state-chip--off">No answer</span>
+        {% elif room.is_off %}
           <span class="state-chip state-chip--off">Off</span>
         {% elif diff is not none and diff < -0.5 %}
           <span class="state-chip state-chip--heating">
@@ -49,6 +51,11 @@
       </div>
 
       <p class="summary">Now {{ '%.1f'|format(room.current_temp) if room.current_temp is not none else '--' }}&deg;C<span class="sep" aria-hidden="true">&middot;</span><span class="tgt">{% if room.is_off %}Off{% else %}Target {{ '%.1f'|format(room.target_temp) if room.target_temp is not none else '--' }}&deg;C{% endif %}</span></p>
+      {% if room.silent_for %}
+      {% set mins = (room.silent_for // 60)|int %}
+      {% set silent = (mins // 60) ~ ' h' if mins >= 120 else mins ~ ' min' %}
+      <p class="zone-note">The radiator hasn&rsquo;t answered for over {{ silent }}. Showing the last reading.</p>
+      {% endif %}
     </div>
   {% endif %}
 </div>
