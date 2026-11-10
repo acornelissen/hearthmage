@@ -37,6 +37,7 @@
     </div>
 
     {% if saved %}<p class="ok" role="status">Saved to the radiator.</p>{% endif %}
+    {% if unchanged %}<p class="ok" role="status">Nothing changed, so nothing was sent to the radiator.</p>{% endif %}
     {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
 
     {% if config is none %}
@@ -46,45 +47,66 @@
     </section>
     {% else %}
     <section class="panel">
+      {# A setting whose read failed is shown disabled and is not sent: saving
+         must never write a guess over the radiator's real value. #}
+      {% macro unread(id) %}<p class="hint" id="{{ id }}">This setting couldn&rsquo;t be read
+            from the radiator, so saving leaves it as it is. Reload the page to try again.</p>{% endmacro %}
       <form method="post" action="/zones/{{ zone_id }}/config">
+        <input type="hidden" name="orig_keypad_lock"
+               value="{{ '' if orig.keypad_lock is none else ('1' if orig.keypad_lock else '0') }}">
+        <input type="hidden" name="orig_window_sensor"
+               value="{{ '' if orig.window_sensor is none else ('1' if orig.window_sensor else '0') }}">
+        <input type="hidden" name="orig_frost_temp"
+               value="{{ '' if orig.frost_temp is none else orig.frost_temp }}">
+        <input type="hidden" name="orig_sensor_offset"
+               value="{{ '' if orig.sensor_offset is none else orig.sensor_offset }}">
+
         <div class="field field-check">
           <label>
             <input type="checkbox" name="keypad_lock" value="1"
-                   {% if config.keypad_lock %}checked{% endif %}>
+                   {% if config.keypad_lock %}checked{% endif %}
+                   {% if orig.keypad_lock is none %}disabled aria-describedby="keypad_unread"{% endif %}>
             Lock the keypad on the radiator
           </label>
           <p class="hint">Stops the buttons on the radiator itself from changing anything.</p>
+          {% if orig.keypad_lock is none %}{{ unread("keypad_unread") }}{% endif %}
         </div>
 
         <div class="field field-check">
           <label>
             <input type="checkbox" name="window_sensor" value="1"
-                   {% if config.window_sensor %}checked{% endif %}>
+                   {% if config.window_sensor %}checked{% endif %}
+                   {% if orig.window_sensor is none %}disabled aria-describedby="window_unread"{% endif %}>
             Open-window detection
           </label>
           <p class="hint">The radiator pauses heating when it senses a sudden temperature drop.</p>
+          {% if orig.window_sensor is none %}{{ unread("window_unread") }}{% endif %}
         </div>
 
         <div class="field">
           <label class="field-label" for="frost_temp">Anti-ice temperature (&deg;C)</label>
           <input class="field-input" id="frost_temp" name="frost_temp" type="number"
                  min="{{ frost_min }}" max="{{ frost_max }}" step="1" inputmode="numeric"
-                 aria-describedby="frost_hint"
-                 value="{{ config.frost_temp if config.frost_temp is not none else 7 }}">
+                 aria-describedby="frost_hint{% if orig.frost_temp is none %} frost_unread{% endif %}"
+                 value="{{ config.frost_temp if config.frost_temp is not none else '' }}"
+                 {% if orig.frost_temp is none %}disabled{% endif %}>
           <p class="hint" id="frost_hint">Frost protection: if the room drops below this, the
             radiator heats to it even when it is off or set lower ({{ frost_min }}&ndash;{{ frost_max }};
             the default is 7).</p>
+          {% if orig.frost_temp is none %}{{ unread("frost_unread") }}{% endif %}
         </div>
 
         <div class="field">
           <label class="field-label" for="sensor_offset">Sensor offset (&deg;C)</label>
           <input class="field-input" id="sensor_offset" name="sensor_offset" type="number"
                  min="-{{ offset_limit }}" max="{{ offset_limit }}" step="0.1" inputmode="decimal"
-                 aria-describedby="offset_hint"
-                 value="{{ config.sensor_offset if config.sensor_offset is not none else 0 }}">
+                 aria-describedby="offset_hint{% if orig.sensor_offset is none %} offset_unread{% endif %}"
+                 value="{{ config.sensor_offset if config.sensor_offset is not none else '' }}"
+                 {% if orig.sensor_offset is none %}disabled{% endif %}>
           <p class="hint" id="offset_hint">Corrects the radiator&rsquo;s own thermometer, in
             tenths of a degree (&minus;{{ offset_limit }} to +{{ offset_limit }}; 0 means no
             correction). Change it only if the room reading is consistently off.</p>
+          {% if orig.sensor_offset is none %}{{ unread("offset_unread") }}{% endif %}
         </div>
 
         <button type="submit" class="btn">Save to radiator</button>

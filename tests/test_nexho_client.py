@@ -496,6 +496,22 @@ def test_read_config_decodes_every_setting():
     assert cfg == {"keypad_lock": True, "window_sensor": False, "frost_temp": 7, "sensor_offset": -0.5}
 
 
+def test_read_config_reports_an_unread_setting_as_unknown():
+    # The keypad read works but the radiator then misses its RF window. A failed
+    # read must not look like "off" or a default, or saving would write it back.
+    client = make_client(
+        {
+            "R#1#1#0#0*?E#0#8/": "OK,1",
+            "R#1#1#0#0*?E#0#6/": "ER,1",
+            "R#1#1#0#0*?E#1#20/": "ER,1",
+            "R#1#1#0#0*?E#0#9/": "ER,1",
+        }
+    )
+    assert client.read_config("1") == {
+        "keypad_lock": True, "window_sensor": None, "frost_temp": None, "sensor_offset": None,
+    }
+
+
 def test_read_config_none_when_asleep():
     client = make_client({"R#3#1#0#0*?E#0#8/": "ER,1"})
     assert client.read_config("3") is None

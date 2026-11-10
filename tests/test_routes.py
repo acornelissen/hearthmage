@@ -488,20 +488,81 @@ def test_config_page_shows_current_settings(client: TestClient):
     assert "offset calibration" not in resp.text  # 1#20 is not an offset
 
 
-def test_save_config_writes_and_redirects(client: TestClient):
-    resp = client.post(
-        "/zones/1/config",
-        data={"keypad_lock": "1", "frost_temp": "8", "sensor_offset": "-0.5"},
+class _ConfigSpy(FakeHearthClient):
+    """Fake that records what the settings form asked to write."""
+
+    def __init__(self, config: dict) -> None:
+        super().__init__(
+            [Room("1", "Living Room", 19.5, 21.0, is_off=False, min_temp=5.0, max_temp=30.0)]
+        )
+        self._config["1"] = dict(config)
+        self.writes: list[dict] = []
+
+    def set_config(self, room_id, **kwargs) -> None:
+        self.writes.append(kwargs)
+        super().set_config(room_id, **kwargs)
+
+
+def _config_client(config: dict):
+    spy = _ConfigSpy(config)
+    app.dependency_overrides[get_client] = lambda: spy
+    return spy, TestClient(app)
+
+
+_READ = {"keypad_lock": False, "window_sensor": True, "frost_temp": 5, "sensor_offset": 0.7}
+# What the page posts back when nothing is touched: each value plus what was read.
+_UNTOUCHED = {
+    "window_sensor": "1", "frost_temp": "5", "sensor_offset": "0.7",
+    "orig_keypad_lock": "0", "orig_window_sensor": "1",
+    "orig_frost_temp": "5", "orig_sensor_offset": "0.7",
+}
+
+
+def test_save_config_writes_only_what_changed(client: TestClient):
+    # Behaviour change (heatapp-local-xns): the form used to send all four
+    # settings on every save; it now sends only the ones the user changed.
+    spy, c = _config_client(_READ)
+    resp = c.post(
+        "/zones/1/config", data={**_UNTOUCHED, "keypad_lock": "1", "frost_temp": "8"},
         follow_redirects=False,
     )
     assert resp.status_code == 303
     assert resp.headers["location"] == "/zones/1/config?saved=1"
-    fake = app.dependency_overrides[get_client]()
-    cfg = fake.read_config("1")
-    assert cfg["keypad_lock"] is True
-    assert cfg["window_sensor"] is False
-    assert cfg["frost_temp"] == 8
-    assert cfg["sensor_offset"] == -0.5
+    assert spy.writes == [{"keypad_lock": True, "frost_temp": 8}]
+    assert spy.read_config("1") == {**_READ, "keypad_lock": True, "frost_temp": 8}
+
+
+def test_save_config_with_no_change_sends_nothing(client: TestClient):
+    spy, c = _config_client(_READ)
+    resp = c.post("/zones/1/config", data=_UNTOUCHED, follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/zones/1/config?unchanged=1"
+    assert spy.writes == []
+    assert "Nothing changed" in c.get("/zones/1/config?unchanged=1").text
+
+
+def test_config_page_marks_an_unread_setting_and_never_writes_it(client: TestClient):
+    # Window, anti-ice and offset could not be read. They must show as unknown,
+    # not as off/7/0, and a save of the keypad lock must leave them alone.
+    spy, c = _config_client(
+        {"keypad_lock": False, "window_sensor": None, "frost_temp": None, "sensor_offset": None}
+    )
+    page = c.get("/zones/1/config").text
+    assert page.count("couldn&rsquo;t be read") == 3
+    for name in ("window_sensor", "frost_temp", "sensor_offset"):
+        field = page.split(f'name="{name}"')[1].split(">")[0]
+        assert "disabled" in field
+    assert 'name="frost_temp"' in page and 'value="7"' not in page
+    # A crafted or stale post that still carries values for the unread settings:
+    resp = c.post(
+        "/zones/1/config",
+        data={"keypad_lock": "1", "frost_temp": "7", "sensor_offset": "0",
+              "orig_keypad_lock": "0", "orig_window_sensor": "",
+              "orig_frost_temp": "", "orig_sensor_offset": ""},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert spy.writes == [{"keypad_lock": True}]
 
 
 @pytest.mark.parametrize("data", [

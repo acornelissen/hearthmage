@@ -590,7 +590,9 @@ class NexhoLocalClient:
 
     def read_config(self, room_id: str) -> dict | None:
         """Read keypad lock, window sensor, anti-ice temperature and sensor
-        offset for a zone; None if the radiator is asleep."""
+        offset for a zone; None if the radiator is asleep. A setting whose own
+        read failed is None (unknown), never a default: the settings form must
+        not be able to write a guess back to the radiator."""
         zone = _zone_int(room_id)
         keypad = self._read_element(zone, *self._EL_KEYPAD)
         if keypad is None:  # first read failed: radiator asleep, don't bother more
@@ -600,7 +602,7 @@ class NexhoLocalClient:
         offset = self._read_element(zone, *self._EL_OFFSET)
         return {
             "keypad_lock": bool(keypad & 1),
-            "window_sensor": bool(window),
+            "window_sensor": bool(window) if window is not None else None,
             "frost_temp": frost,
             "sensor_offset": _decode_offset(offset) if offset is not None else None,
         }

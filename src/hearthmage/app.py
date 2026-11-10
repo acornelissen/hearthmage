@@ -769,7 +769,11 @@ def history_page(request: Request, client: HearthClient = Depends(get_client)) -
 def _config_page(
     request: Request, zone_id: str, client: HearthClient, config: dict | None,
     saved: bool = False, error: str | None = None, status_code: int = 200,
+    orig: dict | None = None, unchanged: bool = False,
 ) -> HTMLResponse:
+    """``config`` is what the form shows; ``orig`` is what was read from the
+    radiator (None per setting = that read failed). The form posts ``orig`` back
+    so a save sends only what the user changed."""
     room = _find_room(client, zone_id)
     return templates.TemplateResponse(
         request,
@@ -778,6 +782,8 @@ def _config_page(
             "zone_id": zone_id,
             "zone_name": room.name if room else f"Zone {zone_id}",
             "config": config,
+            "orig": orig if orig is not None else config,
+            "unchanged": unchanged,
             "frost_min": 0,
             "frost_max": 17,
             "offset_limit": 9.9,
@@ -790,7 +796,8 @@ def _config_page(
 
 @app.get("/zones/{zone_id}/config", response_class=HTMLResponse)
 def zone_config_page(
-    request: Request, zone_id: str, client: HearthClient = Depends(get_client), saved: int = 0
+    request: Request, zone_id: str, client: HearthClient = Depends(get_client),
+    saved: int = 0, unchanged: int = 0,
 ) -> HTMLResponse:
     _check_zone(zone_id)
     read = getattr(client, "read_config", None)
@@ -798,60 +805,109 @@ def zone_config_page(
         config = read(zone_id) if read else None
     except HearthError:
         config = None
-    return _config_page(request, zone_id, client, config, saved=bool(saved))
+    return _config_page(
+        request, zone_id, client, config, saved=bool(saved), unchanged=bool(unchanged)
+    )
 
 
-def _parse_config_form(frost_temp: str, sensor_offset: str) -> tuple[int, float]:
-    """Validate the config form; raises ValueError with a message for the user."""
-    try:
-        frost = int(frost_temp)
-    except ValueError:
-        raise ValueError("Anti-ice temperature must be a whole number of degrees.") from None
-    if not 0 <= frost <= 17:
-        raise ValueError("Anti-ice temperature must be from 0 to 17 °C.")
-    try:
-        offset = float(sensor_offset)
-    except ValueError:
-        raise ValueError("Sensor offset must be a number, e.g. -0.5.") from None
-    if not (math.isfinite(offset) and abs(offset) <= 9.9):
-        raise ValueError("Sensor offset must be from -9.9 to +9.9 °C.")
-    return frost, round(offset, 1)
+def _parse_config_form(
+    frost_temp: str | None, sensor_offset: str | None
+) -> tuple[int | None, float | None]:
+    """Validate the submitted config values; raises ValueError with a message
+    for the user. A value that was not submitted (its input was disabled because
+    the setting could not be read) stays None."""
+    frost: int | None = None
+    offset: float | None = None
+    if frost_temp is not None:
+        try:
+            frost = int(frost_temp)
+        except ValueError:
+            raise ValueError("Anti-ice temperature must be a whole number of degrees.") from None
+        if not 0 <= frost <= 17:
+            raise ValueError("Anti-ice temperature must be from 0 to 17 °C.")
+    if sensor_offset is not None:
+        try:
+            offset = float(sensor_offset)
+        except ValueError:
+            raise ValueError("Sensor offset must be a number, e.g. -0.5.") from None
+        if not (math.isfinite(offset) and abs(offset) <= 9.9):
+            raise ValueError("Sensor offset must be from -9.9 to +9.9 °C.")
+        offset = round(offset, 1)
+    return frost, offset
+
+
+def _parse_config_orig(keypad: str, window: str, frost: str, offset: str) -> dict:
+    """The values the page read from the radiator, posted back as hidden fields.
+    Anything missing or unparseable is None: unknown, so never written."""
+
+    def flag(value: str) -> bool | None:
+        return {"1": True, "0": False}.get(value)
+
+    def number(value: str, cast):
+        try:
+            parsed = cast(value)
+        except ValueError:
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    return {
+        "keypad_lock": flag(keypad),
+        "window_sensor": flag(window),
+        "frost_temp": number(frost, int),
+        "sensor_offset": number(offset, float),
+    }
 
 
 @app.post("/zones/{zone_id}/config")
 def save_zone_config(
     request: Request,
     zone_id: str,
-    frost_temp: str = Form(...),
-    sensor_offset: str = Form(...),
+    frost_temp: str = Form(None),
+    sensor_offset: str = Form(None),
     keypad_lock: str = Form(None),
     window_sensor: str = Form(None),
+    orig_keypad_lock: str = Form(""),
+    orig_window_sensor: str = Form(""),
+    orig_frost_temp: str = Form(""),
+    orig_sensor_offset: str = Form(""),
     client: HearthClient = Depends(get_client),
 ) -> Response:
+    """Send the radiator only the settings the user changed. A setting the page
+    could not read (no ``orig`` value) is never written: its current value is
+    unknown, so anything sent would be a guess overwriting the real one."""
     _check_zone(zone_id)
+    orig = _parse_config_orig(
+        orig_keypad_lock, orig_window_sensor, orig_frost_temp, orig_sensor_offset
+    )
     submitted = {
         "keypad_lock": keypad_lock is not None,
         "window_sensor": window_sensor is not None,
         "frost_temp": frost_temp,
         "sensor_offset": sensor_offset,
     }
+    # What to show again if the save fails: unread settings stay unread.
+    shown = {key: (value if orig[key] is not None else None) for key, value in submitted.items()}
     try:
         frost, offset = _parse_config_form(frost_temp, sensor_offset)
     except ValueError as exc:
-        return _config_page(request, zone_id, client, submitted, error=str(exc), status_code=400)
-    apply = getattr(client, "set_config", None)
-    if apply is None:
-        return RedirectResponse(f"/zones/{zone_id}/config", status_code=303)
-    try:
-        apply(
-            zone_id,
-            keypad_lock=submitted["keypad_lock"],
-            window_sensor=submitted["window_sensor"],
-            frost_temp=frost,
-            sensor_offset=offset,
+        return _config_page(
+            request, zone_id, client, shown, error=str(exc), status_code=400, orig=orig
         )
+    wanted = {**submitted, "frost_temp": frost, "sensor_offset": offset}
+    changes = {
+        key: value
+        for key, value in wanted.items()
+        if value is not None and orig[key] is not None and value != orig[key]
+    }
+    apply = getattr(client, "set_config", None)
+    if apply is None or not changes:
+        return RedirectResponse(f"/zones/{zone_id}/config?unchanged=1", status_code=303)
+    try:
+        apply(zone_id, **changes)
     except HearthError as exc:
-        return _config_page(request, zone_id, client, submitted, error=str(exc), status_code=502)
+        return _config_page(
+            request, zone_id, client, shown, error=str(exc), status_code=502, orig=orig
+        )
     return RedirectResponse(f"/zones/{zone_id}/config?saved=1", status_code=303)
 
 
