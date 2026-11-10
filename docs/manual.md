@@ -72,9 +72,18 @@ Reading a card:
   - **HEATING** — actively warming toward the target.
   - **COMFORT** — at or above the target, resting.
   - **OFF** — the radiator is switched off.
+  - **NOT CONFIRMED** — you set a target but the radiator has not acknowledged
+    it yet (it may be asleep). HearthMage keeps the target and keeps sending it
+    until the radiator takes it; a note under the reading says so.
+  - **NO ANSWER** — the radiator has not answered for more than ten minutes, for
+    example because it is switched off at the wall. The card keeps showing its
+    last reading and says how long it has been silent.
 
 Readings refresh on their own every few seconds, so you can leave the screen
-open and watch it update.
+open and watch it update. The **Target** box follows the hub too: a change made
+on the radiator's keypad, in the manufacturer's app or on another device shows
+up there, and it reads **Off** while the room is off. A number you are still
+typing is left alone until you send it.
 
 The top bar has shortcuts to the [History](#temperature-history) (the chart
 icon), [Energy](#energy) (the lightning icon), and [Settings](#settings) (the
@@ -118,8 +127,8 @@ create or change one, use **New pattern**:
 4. Tap **Save & apply**.
 
 The pattern is saved and pushed to the hub. If a radiator is asleep when you
-save, HearthMage keeps trying in the background and pushes it as soon as the
-radiator is reachable.
+save, HearthMage keeps trying in the background: after a minute at first, then
+less often (up to every 30 minutes) while the radiator stays unreachable.
 
 **Why days can show "Not programmed":** the manufacturer's own app writes
 schedules in a way that can't be read back reliably over the local network. So a
@@ -155,11 +164,16 @@ radiator hardware itself, so you rarely need them.
   changing anything, useful in a rental or a child's room.
 - **Open-window detection** — the radiator pauses heating when it senses a
   sudden temperature drop, such as a window being opened.
-- **Temperature offset calibration** — corrects the radiator's own thermometer.
-  The range is 0–17 and a typical default is 7. Only adjust this if the room
-  reading is consistently wrong compared to a thermometer you trust.
+- **Anti-ice temperature** — frost protection: if the room drops below this,
+  the radiator heats to it even when it is off or set lower. The range is 0–17
+  and the default is 7.
+- **Sensor offset** — corrects the radiator's own thermometer, from −9.9 to
+  +9.9 °C. Only adjust this if the room reading is consistently wrong compared
+  to a thermometer you trust.
 
-Tap **Save to radiator** to apply.
+Tap **Save to radiator** to apply. Only the settings you changed are sent. If a
+setting could not be read from the radiator it is shown greyed out with a note
+and is left untouched; reload the page to try reading it again.
 
 ## Energy
 
