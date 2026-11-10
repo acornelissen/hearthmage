@@ -102,6 +102,7 @@ class NexhoLocalClient:
         self._pending: dict[int, float] = {}  # zone -> target while a write is in flight
         self._desired: dict[int, int] = {}  # zone -> latest requested target (writes coalesce)
         self._writers: set[int] = set()  # zones with a live single-flight write worker
+        self._write_seq: dict[int, int] = {}  # zone -> bumped on every requested write
         self._zones: list[int] | None = None  # cached zone list (it is fixed)
         # Heaters (modules) per zone from OPS3/, read when the zone list changes.
         # Every D# write carries the count, as the vendor app does; unknown = 1.
@@ -434,6 +435,13 @@ class NexhoLocalClient:
 
     def _poll_zone(self, zone: int) -> bool:
         """Read one zone into the cache; return True if the radiator answered."""
+        # Note the write activity before the read goes out. If a write is in
+        # flight now, or one is requested before this read is applied, the read
+        # may have sampled the radiator before that write landed, so its target
+        # is not ground truth (the room temperature still is).
+        with self._lock:
+            seq_before = self._write_seq.get(zone, 0)
+            writing_before = zone in self._writers
         current, target, fresh = self._read_zone_raw(zone)
         if fresh:
             self._last_fresh[zone] = time.monotonic()
@@ -447,11 +455,14 @@ class NexhoLocalClient:
             _log.debug("zone %s did not answer (RF asleep)", zone)
         with self._lock:
             pending = self._pending.get(zone)
-            if fresh and zone not in self._writers:
-                # No write in flight: the radiator's answer is ground truth and
-                # reconciles any now-settled pending write. (A write worker,
-                # while active, may have this read sampling the OLD setpoint, so
-                # we must not treat a fresh read as truth until it finishes.)
+            undisturbed = (
+                not writing_before
+                and zone not in self._writers
+                and self._write_seq.get(zone, 0) == seq_before
+            )
+            if fresh and undisturbed:
+                # No write anywhere near this read: the radiator's answer is
+                # ground truth and reconciles any now-settled pending write.
                 self._last[zone] = (current, target)
                 self._pending.pop(zone, None)
                 self._state[zone] = self._room(zone, current, target, "ok")
@@ -465,10 +476,14 @@ class NexhoLocalClient:
                 last = self._last.get(zone)
                 self._state[zone] = self._room(zone, last[0] if last else None, pending, "ok")
             elif fresh:
-                # Fresh read, a write is in flight but there is no pending target
-                # to protect: take the reading.
-                self._last[zone] = (current, target)
-                self._state[zone] = self._room(zone, current, target, "ok")
+                # A write overlapped this read and has already been confirmed
+                # (nothing pending): keep the confirmed target, which is newer
+                # than what this read may have sampled, and take the room
+                # temperature. The next undisturbed read settles any difference.
+                prev = self._last.get(zone)
+                kept = prev[1] if prev is not None else target
+                self._last[zone] = (current, kept)
+                self._state[zone] = self._room(zone, current, kept, "ok")
             else:
                 last = self._last.get(zone)
                 if last is not None:
@@ -546,6 +561,7 @@ class NexhoLocalClient:
             current = prev.current_temp if prev else None
             self._pending[zone] = target  # poll must not revert this
             self._desired[zone] = target  # latest wins
+            self._write_seq[zone] = self._write_seq.get(zone, 0) + 1  # see _poll_zone
             self._state[zone] = self._room(zone, current, target, "ok")
             if zone in self._writers:
                 return  # the running worker will pick up the new desired target

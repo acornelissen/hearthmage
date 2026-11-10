@@ -1000,3 +1000,72 @@ def test_a_cached_zone_that_never_answers_after_a_restart_is_marked_silent(tmp_p
     client._poll_zone(1)
     room = client.list_rooms()[0]
     assert (room.current_temp, room.status, room.silent_for) == (15.8, "ok", 900)
+
+
+# ---- a stale read must not undo a confirmed setpoint (heatapp-local-6fs) --
+
+
+def _wait_for_writer(client, zone):
+    import time as _time
+
+    deadline = _time.time() + 2
+    while _time.time() < deadline:
+        with client._lock:
+            if zone not in client._writers:
+                return
+        _time.sleep(0.005)
+    raise AssertionError("write worker did not finish")
+
+
+def test_a_read_taken_before_a_write_cannot_undo_the_confirmed_target():
+    # The radiator answers the poll with the old target (20). Before the poller
+    # applies that answer the user sets 22 and the hub acknowledges it. The old
+    # 20 must not be written over the confirmed 22.
+    client = make_client({"D#": "OK"})
+    with client._lock:
+        client._last[1] = (19.0, 20.0)
+        client._state[1] = client._room(1, 19.0, 20.0, "ok")
+
+    def read_then_user_writes(zone):
+        client.set_temperature("1", 22.0)
+        _wait_for_writer(client, 1)
+        return 19.2, 20.0, True
+
+    client._read_zone_raw = read_then_user_writes  # type: ignore[method-assign]
+    client._poll_zone(1)
+    room = client.list_rooms()[0]
+    assert room.target_temp == 22.0
+    assert room.current_temp == 19.2  # the room temperature is still taken from the read
+    assert client._last[1] == (19.2, 22.0)
+
+
+def test_a_read_that_overlaps_a_finishing_write_cannot_undo_it():
+    # Here the write was already in flight when the read started and was
+    # acknowledged before the read was applied.
+    client = make_client({})
+    with client._lock:
+        client._last[1] = (19.0, 20.0)
+        client._pending[1] = 22.0
+        client._writers.add(1)
+
+    def read_while_write_lands(zone):
+        with client._lock:  # what the write worker does on an ack
+            client._last[1] = (19.0, 22.0)
+            client._pending.pop(1, None)
+            client._writers.discard(1)
+        return 19.2, 20.0, True
+
+    client._read_zone_raw = read_while_write_lands  # type: ignore[method-assign]
+    client._poll_zone(1)
+    assert client.list_rooms()[0].target_temp == 22.0
+    assert client._last[1] == (19.2, 22.0)
+
+
+def test_an_undisturbed_read_is_still_the_truth():
+    # No write anywhere near the read: a change made on the radiator keypad
+    # must still show up.
+    client = make_client({"R#1": "OK,19,02,016"})
+    with client._lock:
+        client._last[1] = (19.0, 20.0)
+    client._poll_zone(1)
+    assert client.list_rooms()[0].target_temp == 16.0
