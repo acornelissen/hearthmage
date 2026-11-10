@@ -55,6 +55,7 @@ holidays = HolidayStore(settings.holiday_path)
 waste = WasteDetector()
 history.close_open_waste_events()  # a restart forgets what was being tracked
 _waste_log = logging.getLogger("hearthmage.waste")
+_setpoint_log = logging.getLogger("hearthmage.setpoint")  # who asked for which target
 
 _TEMP_RETAIN_DAYS = 30  # keep a month of temperature readings
 
@@ -127,6 +128,7 @@ class _MqttCommandHandler:
     the hub keeps exactly one owner."""
 
     def set_temperature(self, zone_id: str, temperature: float) -> None:
+        _setpoint_log.info("zone %r target %s requested by mqtt", zone_id, temperature)
         try:
             get_client().set_temperature(zone_id, temperature)
         except (HearthError, NotConfigured):
@@ -434,6 +436,12 @@ def set_temperature(
     temperature: float = Form(...),
     client: HearthClient = Depends(get_client),
 ) -> HTMLResponse:
+    # Record what was asked and from where, so a target nobody remembers
+    # setting can be traced. %r keeps a crafted zone id on one log line.
+    _setpoint_log.info(
+        "zone %r target %s requested by %s",
+        room_id, temperature, request.client.host if request.client else "unknown",
+    )
     error: str | None = None
     try:
         client.set_temperature(room_id, temperature)

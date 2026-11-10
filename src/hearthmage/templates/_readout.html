@@ -1,5 +1,9 @@
 <div id="readout-{{ room_id }}" class="readout"
      hx-get="/rooms/{{ room_id }}/status" hx-trigger="every 4s" hx-swap="outerHTML"
+     {# The hub's target, copied into the target box by the page script; empty = off. -#}
+     {% if room is not none and room.status == "ok" and (room.is_off or room.target_temp is not none) -%}
+     data-target="{{ '' if room.is_off else '%.1f'|format(room.target_temp) }}"
+     {% endif -%}
      {% if room is none or room.status == "loading" %}aria-busy="true"{% endif %}>
   {% set zone_error = error or (room.error if room else None) %}
   {% if zone_error %}<p class="zone-error" role="alert">{{ zone_error }}</p>{% endif %}

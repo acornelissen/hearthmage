@@ -59,6 +59,38 @@ def test_set_temperature_half_degree_shows_one_decimal(client: TestClient):
     assert "Target 20.5" in resp.text
 
 
+def test_readout_carries_the_hub_target_for_the_target_box(client: TestClient):
+    # The page script copies this into the target box so the box follows the hub.
+    resp = client.get("/rooms/1/status")
+    assert 'data-target="21.0"' in resp.text
+
+
+def test_readout_target_is_empty_when_the_zone_is_off(client: TestClient):
+    resp = client.post("/rooms/1/temperature", data={"temperature": "0"})
+    assert 'data-target=""' in resp.text
+
+
+def test_readout_has_no_target_when_the_zone_is_unknown(client: TestClient):
+    # No hub value to show, so the target box must be left alone.
+    resp = client.get("/rooms/99/status")
+    assert "data-target" not in resp.text
+
+
+def test_target_box_reads_off_when_the_zone_is_off(client: TestClient):
+    client.post("/rooms/1/temperature", data={"temperature": "0"})
+    resp = client.get("/")
+    box = resp.text.split('class="setpoint-input"')[1].split(">")[0]
+    assert 'placeholder="Off"' in box
+    assert 'value=""' in box
+
+
+def test_setpoint_request_is_logged_with_value_and_client(client: TestClient, caplog):
+    with caplog.at_level("INFO", logger="hearthmage.setpoint"):
+        client.post("/rooms/1/temperature", data={"temperature": "22"})
+    messages = [r.getMessage() for r in caplog.records if r.name == "hearthmage.setpoint"]
+    assert messages == ["zone '1' target 22.0 requested by testclient"]
+
+
 def test_set_temperature_error_shows_message(client: TestClient):
     resp = client.post("/rooms/99/temperature", data={"temperature": "22"})
     assert resp.status_code == 200

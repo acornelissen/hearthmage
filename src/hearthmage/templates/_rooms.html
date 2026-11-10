@@ -32,6 +32,7 @@
           <input class="setpoint-input" type="number" name="temperature" step="0.5"
                  inputmode="decimal" aria-label="Target temperature for {{ room.name }}"
                  min="{{ '%.1f'|format(room.min_temp) }}" max="{{ '%.1f'|format(room.max_temp) }}"
+                 placeholder="{{ 'Off' if room.is_off else '' }}"
                  value="{{ '%.1f'|format(room.target_temp) if (room.target_temp is not none and not room.is_off) else '' }}">
         </label>
         <button type="button" class="step" data-step="0.5"

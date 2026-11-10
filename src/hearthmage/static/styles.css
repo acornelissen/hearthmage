@@ -372,6 +372,7 @@ body {
   -moz-appearance: textfield;
   appearance: textfield;
 }
+.setpoint-input::placeholder { color: var(--ink); opacity: 1; }
 .setpoint-input::-webkit-outer-spin-button,
 .setpoint-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 
