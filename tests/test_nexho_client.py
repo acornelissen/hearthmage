@@ -878,8 +878,62 @@ def test_a_zone_the_hub_no_longer_lists_is_forgotten(tmp_path):
         "OPS2/": "OPOK,OPS2,1,2,0", "OPS3/": "OPOK,OPS3,1,1",
     }.get(cmd, "OK,19,00,020")
     client._poll_once()
-    assert [r.id for r in client.list_rooms()] == ["1", "2"]
+    assert [r.id for r in client.list_rooms()] == ["1", "2", "3"]  # one answer is not enough
+    client._poll_once()
+    assert [r.id for r in client.list_rooms()] == ["1", "2"]  # the hub said it twice
     assert sorted(json.loads(path.read_text())) == ["1", "2"]  # and not reloaded next start
+
+
+def test_one_odd_zone_list_does_not_wipe_anything(tmp_path):
+    # A hub that is rebooting can answer with an empty or short list once. That
+    # must not throw away readings or a setpoint that is waiting to be sent.
+    answers = ["OPOK,OPS2,1,2", "OPOK,OPS2,1,2", "OPOK,OPS2,0", "OPOK,OPS2,1,2"]
+    client = NexhoLocalClient("10.0.0.99")
+
+    def ask(cmd, *a, **k):
+        if cmd == "OPS2/":
+            return answers.pop(0)
+        return {"OPS3/": "OPOK,OPS3,1,1"}.get(cmd, "OK,19,00,020")
+
+    client._ask = ask  # type: ignore[method-assign]
+    client._poll_once()
+    client._poll_once()
+    with client._lock:
+        client._pending[2] = 22.0
+        client._desired[2] = 22.0
+    client._poll_once()  # the odd one
+    assert [r.id for r in client.list_rooms()] == ["1", "2"]
+    assert client._pending == {2: 22.0} and client._desired == {2: 22.0}
+    client._poll_once()
+    assert [r.id for r in client.list_rooms()] == ["1", "2"]
+
+
+def test_a_zero_heater_count_is_checked_again_before_the_zone_is_dropped():
+    # OPS3 is normally re-read every ten minutes. When it makes a zone vanish it
+    # is read again on the very next poll, so one bad answer cannot hide a zone
+    # for ten minutes or drop its state.
+    heaters = ["OPOK,OPS3,1,1", "OPOK,OPS3,1,0", "OPOK,OPS3,1,1"]
+    sent: list[str] = []
+    client = NexhoLocalClient("10.0.0.99")
+
+    def ask(cmd, *a, **k):
+        sent.append(cmd)
+        if cmd == "OPS3/":
+            return heaters.pop(0) if len(heaters) > 1 else heaters[0]
+        return {"OPS2/": "OPOK,OPS2,1,2"}.get(cmd, "OK,19,00,020")
+
+    client._ask = ask  # type: ignore[method-assign]
+    client._poll_once()
+    client._poll_once()
+    assert sent.count("OPS3/") == 1
+    client._heaters_read_at = 0.0  # the ten-minute refresh comes due and reads a bad 0
+    client._poll_once()
+    assert client._zones == [1, 2]  # one answer does not hide the zone...
+    assert 2 in client._state
+    client._poll_once()  # ...and the count is read again straight away: a blip
+    assert sent.count("OPS3/") == 3
+    assert client._zones == [1, 2]
+    assert [r.id for r in client.list_rooms()] == ["1", "2"]
 
 
 def test_zones_are_kept_when_the_hub_does_not_answer(tmp_path):
@@ -920,7 +974,8 @@ def test_a_zone_deleted_in_the_vendor_app_is_noticed_without_a_restart(monkeypat
     assert client._zone_ids() == [1, 2, 3]  # not re-read on every poll
     assert sent.count("OPS3/") == 1
     clock["now"] += mod._HEATERS_REFRESH
-    assert client._zone_ids() == [1, 2]
+    assert client._zone_ids() == [1, 2, 3]  # seen once: checked again before acting
+    assert client._zone_ids() == [1, 2]  # the hub said it twice
 
 
 def test_a_zone_the_hub_does_not_have_is_refused_before_anything_is_sent():

@@ -113,7 +113,8 @@ class NexhoLocalClient:
         self._write_kick: set[int] = set()  # zones whose waiting retry should go now
         # Wakes write workers that are waiting to retry (new target, kick, stop).
         self._write_wake = threading.Condition()
-        self._zones: list[int] | None = None  # cached zone list (it is fixed)
+        self._zones: list[int] | None = None  # the accepted zone list
+        self._zones_seen: list[int] | None = None  # the hub's previous answer, accepted or not
         # Heaters (modules) per zone from OPS3/, read when the zone list changes.
         # Every D# write carries the count, as the vendor app does; unknown = 1.
         self._heaters: dict[int, int] = {}
@@ -277,18 +278,31 @@ class NexhoLocalClient:
         if ids != self._heaters_for or now - self._heaters_read_at >= _HEATERS_REFRESH:
             self._read_heater_counts(ids)
         # A zone with no heaters is a deleted slot; the vendor app hides it too.
-        ids = [z for z in ids if self._heaters.get(z, 1) > 0]
-        self._forget_zones_except(ids)
-        return ids
+        visible = [z for z in ids if self._heaters.get(z, 1) > 0]
+        # A changed list is only believed once the hub has said it twice in a
+        # row: a hub that is rebooting can answer with a short or empty list,
+        # and acting on one such answer would hide zones and throw away their
+        # readings and any setpoint waiting to be sent. The very first answer
+        # is taken as it is (there is nothing to compare it with).
+        with self._lock:
+            confirmed = visible == self._zones_seen
+            self._zones_seen = visible
+            if self._zones is None or confirmed:
+                self._zones = visible
+            accepted = self._zones
+        if visible != accepted:
+            self._heaters_read_at = 0.0  # disputed: read the heater counts again next poll
+        if confirmed:
+            self._forget_zones_except(visible)
+        return accepted
 
     def _forget_zones_except(self, ids: list[int]) -> None:
-        """The hub has just told us its zones: drop everything held for any
-        other zone. Without this a zone that was deleted, or that came from the
+        """The hub has confirmed its zones: drop everything held for any other
+        zone. Without this a zone that was deleted, or that came from the
         readings cache of another hub, stays on screen as "ok" with its last
-        reading for ever. Only called on a real answer, never on a hub failure."""
+        reading for ever. Never called on a hub failure or a single answer."""
         keep = set(ids)
         with self._lock:
-            self._zones = ids
             for table in (self._state, self._last, self._pending, self._desired,
                           self._next_poll, self._backoff, self._last_fresh, self._write_seq):
                 for zone in [z for z in table if z not in keep]:
