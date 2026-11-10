@@ -1,3 +1,4 @@
+from pathlib import Path
 import json
 
 import pytest
@@ -166,3 +167,40 @@ def test_restore_bundle_rejects_invalid_schedules_without_writing(tmp_path):
             )
     assert json.loads(cfg.read_text())["hub_ip"] == "old"  # nothing half-restored
     assert json.loads(sched.read_text()) == {"1": {}}
+
+
+def test_snapshot_is_private_like_the_file_it_copies(tmp_path):
+    # config.json holds the session secret and the MQTT password, so a snapshot
+    # must not be readable by other local users.
+    import os
+    import stat
+
+    from hearthmage.atomicio import write_json_atomic
+    from hearthmage.backups import rotate_backup
+
+    src = tmp_path / "config.json"
+    write_json_atomic(str(src), {"secret_key": "s3cret"})
+    snap = rotate_backup(str(src))
+    assert snap is not None
+    assert stat.S_IMODE(os.stat(snap).st_mode) & 0o077 == 0
+    assert Path(snap).read_bytes() == src.read_bytes()
+
+
+def test_snapshot_leaves_no_partial_file_behind(tmp_path, monkeypatch):
+    import os
+
+    import hearthmage.backups as backups
+    from hearthmage.atomicio import write_json_atomic
+
+    src = tmp_path / "config.json"
+    write_json_atomic(str(src), {"a": 1})
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(backups.os, "replace", boom)
+    try:
+        backups.rotate_backup(str(src))
+    except OSError:
+        pass
+    assert os.listdir(tmp_path / "backups") == []

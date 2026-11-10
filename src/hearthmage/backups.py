@@ -19,6 +19,7 @@ import glob
 import json
 import os
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from typing import Any
 
@@ -51,9 +52,32 @@ def rotate_backup(source_path: str, keep: int = _DEFAULT_KEEP) -> str | None:
     os.makedirs(directory, exist_ok=True)
     base = os.path.basename(source_path)
     dest = os.path.join(directory, f"{base}.{_timestamp()}{_SUFFIX}")
-    shutil.copyfile(source_path, dest)
+    _copy_private(source_path, dest)
     _prune(source_path, keep)
     return dest
+
+
+def _copy_private(source_path: str, dest: str) -> None:
+    """Copy bytes to ``dest`` atomically, readable by the owner only.
+
+    The config file holds the session secret and the MQTT password and is
+    itself created 0600, so a snapshot must not be more readable than that.
+    ``mkstemp`` creates the temp file 0600; ``os.replace`` then makes the
+    snapshot appear whole or not at all.
+    """
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest), prefix=".tmp-", suffix=_SUFFIX)
+    try:
+        with os.fdopen(fd, "wb") as out, open(source_path, "rb") as src:
+            shutil.copyfileobj(src, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def list_backups(source_path: str) -> list[str]:
