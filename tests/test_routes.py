@@ -117,6 +117,22 @@ def test_readout_says_when_the_radiator_has_stopped_answering(silent_for, text):
     assert "Idle" not in page and "At target" not in page
 
 
+def test_readout_says_when_a_target_is_not_confirmed_yet():
+    fake = FakeHearthClient([
+        Room("1", "Lounge", 15.8, 21.0, is_off=False, min_temp=5.0, max_temp=30.0,
+             unconfirmed=True)
+    ])
+    app.dependency_overrides[get_client] = lambda: fake
+    try:
+        page = TestClient(app).get("/rooms/1/status").text
+    finally:
+        app.dependency_overrides.clear()
+    assert "Target 21.0" in page and 'data-target="21.0"' in page  # the wanted target stays
+    assert "hasn&rsquo;t confirmed" in page and "Still trying" in page
+    assert "Not confirmed" in page  # the chip must not claim Heating
+    assert "Heating" not in page
+
+
 def test_readout_has_no_silence_note_for_a_radiator_that_answers(client: TestClient):
     page = client.get("/rooms/1/status").text
     assert "answered" not in page and "No answer" not in page

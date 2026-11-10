@@ -49,6 +49,12 @@ _STALE_INTERVALS = 4
 # not worth a message. Silent for longer than this, the UI says so next to the
 # last reading (it may be switched off at the wall).
 _SILENT_AFTER = 600.0
+# A setpoint the hub does not acknowledge (radiator asleep or switched off) is
+# sent again after this long, doubling up to the cap, until it is acknowledged
+# or replaced by a newer target. A radiator that starts answering polls again
+# after a silence gets it at once.
+_SETPOINT_RETRY_FIRST = 30.0
+_SETPOINT_RETRY_MAX = 900.0
 # Heater counts (OPS3) are re-read this often even when the zone list has not
 # changed: a zone deleted in the vendor app keeps its OPS2 slot and only shows
 # up as zero heaters. The hub answers OPS3 itself, with no radio involved.
@@ -103,6 +109,10 @@ class NexhoLocalClient:
         self._desired: dict[int, int] = {}  # zone -> latest requested target (writes coalesce)
         self._writers: set[int] = set()  # zones with a live single-flight write worker
         self._write_seq: dict[int, int] = {}  # zone -> bumped on every requested write
+        self._unconfirmed: set[int] = set()  # zones whose target the hub has not acked yet
+        self._write_kick: set[int] = set()  # zones whose waiting retry should go now
+        # Wakes write workers that are waiting to retry (new target, kick, stop).
+        self._write_wake = threading.Condition()
         self._zones: list[int] | None = None  # cached zone list (it is fixed)
         # Heaters (modules) per zone from OPS3/, read when the zone list changes.
         # Every D# write carries the count, as the vendor app does; unknown = 1.
@@ -280,9 +290,13 @@ class NexhoLocalClient:
         with self._lock:
             self._zones = ids
             for table in (self._state, self._last, self._pending, self._desired,
-                          self._next_poll, self._backoff, self._last_fresh):
+                          self._next_poll, self._backoff, self._last_fresh, self._write_seq):
                 for zone in [z for z in table if z not in keep]:
                     del table[zone]
+            self._unconfirmed &= keep
+            self._write_kick &= keep
+        with self._write_wake:
+            self._write_wake.notify_all()  # a worker retrying for a dropped zone ends
 
     def _read_heater_counts(self, ids: list[int]) -> None:
         """Read OPS3/ (heaters per zone, in OPS2 order). On failure the counts
@@ -337,6 +351,7 @@ class NexhoLocalClient:
             status=status,
             error=error,
             silent_for=self._silent_for(zone),
+            unconfirmed=zone in self._unconfirmed,
         )
 
     def _silent_for(self, zone: int) -> float | None:
@@ -373,6 +388,8 @@ class NexhoLocalClient:
         """Stop the poller (e.g. the app switched to a different hub). A poll
         already talking to the hub finishes first; nothing new starts."""
         self._stop.set()
+        with self._write_wake:
+            self._write_wake.notify_all()  # end any write worker waiting to retry
 
     def _poll_loop(self) -> None:
         while not self._stop.is_set():
@@ -442,10 +459,13 @@ class NexhoLocalClient:
         with self._lock:
             seq_before = self._write_seq.get(zone, 0)
             writing_before = zone in self._writers
+        was_silent = self._backoff.get(zone, 0.0) > self._poll_interval  # backing off
         current, target, fresh = self._read_zone_raw(zone)
         if fresh:
             self._last_fresh[zone] = time.monotonic()
             _log.debug("zone %s fresh: current=%s target=%s", zone, current, target)
+            if was_silent:
+                self._kick_write_retry(zone)
             if self._on_reading is not None:
                 try:
                     self._on_reading(zone, current, target)
@@ -523,6 +543,7 @@ class NexhoLocalClient:
             zones = {
                 str(z): {
                     "status": self._state[z].status,
+                    "unconfirmed": z in self._unconfirmed,
                     "last_fresh_seconds_ago": (
                         round(now - self._last_fresh[z], 1) if z in self._last_fresh else None
                     ),
@@ -537,12 +558,27 @@ class NexhoLocalClient:
             "zones": zones,
         }
 
+    def _kick_write_retry(self, zone: int) -> None:
+        """The radiator has just come back after not answering polls, so it is
+        awake now: if a setpoint is waiting to be retried for it, send it now
+        rather than later. Only called on that silent-to-answering change; a
+        radiator that answers every poll but refuses the setpoint is left to
+        the retry backoff, or it would get a burst of writes on every poll."""
+        with self._lock:
+            if zone not in self._unconfirmed:
+                return
+            self._write_kick.add(zone)
+        with self._write_wake:
+            self._write_wake.notify_all()
+
     def set_temperature(self, room_id: str, temperature: float) -> None:
         """Optimistic write: reflect the new setpoint instantly, send in the
         background. Writes to a zone are coalesced through a single-flight worker
         so rapid taps converge on the last requested target instead of racing -
         at most one datagram is in flight per zone, and only the final value is
-        confirmed. ``_last`` (the confirmed cache) is updated only on ack.
+        confirmed. ``_last`` (the confirmed cache) is updated only on ack. A
+        target the hub does not acknowledge is shown as not confirmed and
+        re-sent until it is, or until a newer target replaces it.
         """
         zone = self._require_zone(room_id)
         if not math.isfinite(temperature):
@@ -564,43 +600,79 @@ class NexhoLocalClient:
             self._write_seq[zone] = self._write_seq.get(zone, 0) + 1  # see _poll_zone
             self._state[zone] = self._room(zone, current, target, "ok")
             if zone in self._writers:
-                return  # the running worker will pick up the new desired target
-            self._writers.add(zone)
+                running = True  # the running worker will pick up the new desired target
+                self._write_kick.add(zone)  # ...now, even if it is the same target again
+            else:
+                running = False
+                self._writers.add(zone)
+        if running:
+            with self._write_wake:
+                self._write_wake.notify_all()  # it may be waiting to retry the old one
+            return
         threading.Thread(
             target=self._drain_writes, args=(zone,), name="nexho-write", daemon=True
         ).start()
 
     def _drain_writes(self, zone: int) -> None:
         """Single-flight write worker: send the desired target, and if a newer
-        one arrived while sending, send that instead - repeat until settled."""
+        one arrived while sending, send that instead - repeat until the hub has
+        acknowledged the latest one. A target the hub does not acknowledge
+        (radiator asleep or switched off) is kept, marked not confirmed, and
+        sent again after a growing wait; it is never dropped silently."""
+        failures = 0
         try:
-            while True:
+            while not self._stop.is_set():
                 with self._lock:
                     target = self._desired.get(zone)
                     if target is None:
                         self._writers.discard(zone)  # atomic with the empty check
                         return
+                    self._write_kick.discard(zone)
                 ok = self._send_once(zone, target)
                 with self._lock:
                     if self._desired.get(zone) != target:
+                        failures = 0
                         continue  # superseded by a newer tap; loop to send the latest
-                    self._desired.pop(zone, None)
+                    prev = self._state.get(zone)
+                    current = prev.current_temp if prev else None
                     if ok:
-                        prev = self._state.get(zone)
-                        current = prev.current_temp if prev else None
+                        self._desired.pop(zone, None)
+                        self._unconfirmed.discard(zone)
+                        self._write_kick.discard(zone)
                         self._last[zone] = (current, float(target))
                         self._pending.pop(zone, None)  # confirmed - release poll guard
                         self._state[zone] = self._room(zone, current, float(target), "ok")
-                    # On no-ack (radiator asleep on RF) keep the optimistic value and
-                    # leave it pending; the poller reconciles from the next read.
-                    self._writers.discard(zone)
-                    return
+                        self._writers.discard(zone)
+                        return
+                    # No ack. Stay the zone's writer so the poller keeps the
+                    # user's target (see _poll_zone), and say it is not confirmed.
+                    failures += 1
+                    self._unconfirmed.add(zone)
+                    self._state[zone] = self._room(zone, current, float(target), "ok")
+                wait = _setpoint_retry_wait(failures)
+                _log.info("zone %s setpoint %s not confirmed; retrying in %.0fs", zone, target, wait)
+                self._wait_to_retry(zone, target, wait)
         finally:
             # Safety net: never leave the zone marked as having a live worker if
             # the loop raised unexpectedly, or no future write to it would ever
             # be sent (set_temperature would assume a worker is running).
             with self._lock:
                 self._writers.discard(zone)
+
+    def _wait_to_retry(self, zone: int, target: float, wait: float) -> None:
+        """Sleep before re-sending ``target``, but wake at once if a newer
+        target arrives, the radiator answers a poll, the zone is dropped, or the
+        client is stopped."""
+
+        def wake() -> bool:
+            return (
+                self._stop.is_set()
+                or self._desired.get(zone) != target
+                or zone in self._write_kick
+            )
+
+        with self._write_wake:
+            self._write_wake.wait_for(wake, timeout=wait)
 
     def _send_once(self, zone: int, target: float) -> bool:
         """Send one setpoint command; True if the hub acknowledged. ``target`` is
@@ -880,6 +952,12 @@ def _encode_setpoint(temp: float | None) -> int:
     if half == int(half):
         return int(half)
     return int(half + 127.5)
+
+
+def _setpoint_retry_wait(failures: int) -> float:
+    """Seconds to wait before re-sending a setpoint after ``failures`` tries in
+    a row went unacknowledged: 30 s, doubling, capped at 15 minutes."""
+    return min(_SETPOINT_RETRY_FIRST * 2 ** (failures - 1), _SETPOINT_RETRY_MAX)
 
 
 def _decode_offset(value: int) -> float:

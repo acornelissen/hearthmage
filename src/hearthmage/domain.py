@@ -30,6 +30,9 @@ class Room:
     # Seconds since the radiator last answered, once that is long enough to be
     # worth telling the user (the reading shown is then the last one it gave).
     silent_for: float | None = None
+    # The target shown was asked for but the radiator has not acknowledged it
+    # yet (asleep or switched off); the client keeps re-sending it.
+    unconfirmed: bool = False
 
 
 class HearthError(Exception):

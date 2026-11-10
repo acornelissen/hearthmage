@@ -216,20 +216,6 @@ def test_drain_confirms_on_ok():
     assert room.error is None
 
 
-def test_drain_keeps_optimistic_value_on_failure():
-    client = make_client({"D#": "ER,1"})
-    with client._lock:
-        client._state[2] = client._room(2, 19.0, 20.0, "ok")  # optimistic target 20
-        client._last[2] = (19.0, 18.0)  # last confirmed target was 18
-    _queue_write(client, 2, 20)
-    client._drain_writes(2)
-    assert client._pending[2] == 20.0  # unconfirmed: poll keeps showing the target
-    assert 2 not in client._writers
-    room = next(r for r in client.list_rooms() if r.id == "2")
-    assert room.error is None  # no scary error for an unconfirmed write
-    assert room.target_temp == 20.0  # keeps the value the user set
-
-
 def test_rapid_writes_coalesce_to_latest_target():
     """A newer tap arriving mid-send supersedes the in-flight one: the radiator
     receives the latest value last, and only that value is confirmed."""
@@ -1069,3 +1055,145 @@ def test_an_undisturbed_read_is_still_the_truth():
         client._last[1] = (19.0, 20.0)
     client._poll_zone(1)
     assert client.list_rooms()[0].target_temp == 16.0
+
+
+# ---- an unacknowledged setpoint is retried, and shown as such (sdm) ------
+
+
+def _scripted_sends(client, script):
+    """Replace the wire send with a script: target -> list of results, used in
+    order (the last one repeats). Returns the list of targets sent."""
+    sent: list[float] = []
+    results = {target: list(outcomes) for target, outcomes in script.items()}
+
+    def send_once(zone, target):
+        sent.append(target)
+        outcomes = results[target]
+        return outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
+
+    client._send_once = send_once  # type: ignore[method-assign]
+    return sent
+
+
+def _wait_until(check, what):
+    import time as _time
+
+    deadline = _time.time() + 2
+    while _time.time() < deadline:
+        if check():
+            return
+        _time.sleep(0.005)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+def _zone_ready(client, zone=2, current=19.0, target=18.0):
+    with client._lock:
+        client._last[zone] = (current, target)
+        client._state[zone] = client._room(zone, current, target, "ok")
+
+
+def test_unacknowledged_setpoint_is_retried_until_the_hub_takes_it(monkeypatch):
+    monkeypatch.setattr("hearthmage.nexho_client._SETPOINT_RETRY_FIRST", 0.01)
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    sent = _scripted_sends(client, {21.0: [False, False, True]})
+    client.set_temperature("2", 21.0)
+    _wait_for_writer(client, 2)
+    assert sent == [21.0, 21.0, 21.0]
+    room = next(r for r in client.list_rooms() if r.id == "2")
+    assert (room.target_temp, room.unconfirmed) == (21.0, False)
+    assert client._last[2] == (19.0, 21.0)
+    assert 2 not in client._pending
+
+
+def test_unacknowledged_setpoint_is_shown_as_not_confirmed_and_survives_polls():
+    client = NexhoLocalClient("10.0.0.99")  # default retry wait: long enough to hold here
+    _zone_ready(client)
+    _scripted_sends(client, {21.0: [False]})
+    client.set_temperature("2", 21.0)
+    _wait_until(lambda: client.list_rooms()[0].unconfirmed, "the not-confirmed mark")
+    # The radiator wakes just long enough to answer a poll with its old target.
+    client._read_zone_raw = lambda zone: (19.4, 18.0, True)  # type: ignore[method-assign]
+    client._kick_write_retry = lambda zone: None  # type: ignore[method-assign]  # hold the retry for this check
+    client._poll_zone(2)
+    room = client.list_rooms()[0]
+    assert (room.current_temp, room.target_temp, room.unconfirmed) == (19.4, 21.0, True)
+    assert client._last[2][1] == 18.0  # nothing unconfirmed leaks into the confirmed cache
+    assert client.health()["zones"]["2"]["unconfirmed"] is True
+    client.stop()
+    _wait_for_writer(client, 2)  # the retry worker ends with the client
+
+
+def test_a_newer_target_replaces_one_that_is_still_being_retried():
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    sent = _scripted_sends(client, {21.0: [False], 23.0: [True]})
+    client.set_temperature("2", 21.0)
+    _wait_until(lambda: client.list_rooms()[0].unconfirmed, "the not-confirmed mark")
+    client.set_temperature("2", 23.0)  # must not wait out the retry delay
+    _wait_for_writer(client, 2)
+    assert sent == [21.0, 23.0]
+    room = client.list_rooms()[0]
+    assert (room.target_temp, room.unconfirmed) == (23.0, False)
+
+
+def test_a_radiator_that_answers_a_poll_gets_the_waiting_setpoint_at_once():
+    # It is awake right now, so this is the moment to resend, not minutes later.
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    sent = _scripted_sends(client, {21.0: [False, True]})
+    client.set_temperature("2", 21.0)
+    _wait_until(lambda: client.list_rooms()[0].unconfirmed, "the not-confirmed mark")
+    client._backoff[2] = 60.0  # it had stopped answering polls (backing off)
+    client._read_zone_raw = lambda zone: (19.4, 18.0, True)  # type: ignore[method-assign]
+    client._poll_zone(2)
+    _wait_for_writer(client, 2)
+    assert sent == [21.0, 21.0]
+    assert client.list_rooms()[0].unconfirmed is False
+    assert client._last[2][1] == 21.0
+
+
+def test_a_radiator_that_answers_polls_but_refuses_the_setpoint_is_not_hammered():
+    # It never went silent, so its poll answers are no reason to resend early:
+    # that would be a burst of priority writes on every 15 s poll.
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    sent = _scripted_sends(client, {21.0: [False]})
+    client.set_temperature("2", 21.0)
+    _wait_until(lambda: client.list_rooms()[0].unconfirmed, "the not-confirmed mark")
+    client._read_zone_raw = lambda zone: (19.4, 18.0, True)  # type: ignore[method-assign]
+    for _ in range(3):
+        client._poll_zone(2)
+    import time as _time
+
+    _time.sleep(0.05)
+    assert sent == [21.0]  # still waiting out the retry delay
+    client.stop()
+    _wait_for_writer(client, 2)
+
+
+def test_asking_for_the_same_target_again_retries_it_now():
+    # Pressing Set target a second time must not sit out the retry delay.
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    sent = _scripted_sends(client, {21.0: [False, True]})
+    client.set_temperature("2", 21.0)
+    _wait_until(lambda: client.list_rooms()[0].unconfirmed, "the not-confirmed mark")
+    client.set_temperature("2", 21.0)
+    _wait_for_writer(client, 2)
+    assert sent == [21.0, 21.0]
+    assert client.list_rooms()[0].unconfirmed is False
+    assert client._write_kick == set()  # nothing left over to cut a later wait short
+
+
+def test_setpoint_retry_wait_doubles_and_is_capped():
+    from hearthmage.nexho_client import (
+        _SETPOINT_RETRY_FIRST,
+        _SETPOINT_RETRY_MAX,
+        _setpoint_retry_wait,
+    )
+
+    assert _setpoint_retry_wait(1) == _SETPOINT_RETRY_FIRST
+    assert _setpoint_retry_wait(2) == _SETPOINT_RETRY_FIRST * 2
+    assert _setpoint_retry_wait(3) == _SETPOINT_RETRY_FIRST * 4
+    assert _setpoint_retry_wait(50) == _SETPOINT_RETRY_MAX
