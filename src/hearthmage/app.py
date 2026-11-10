@@ -195,8 +195,13 @@ _PUBLIC_PATHS = frozenset({"/login", "/logout", "/manifest.webmanifest", "/sw.js
 
 
 def _session_token() -> str:
-    """The signed value a valid session cookie must hold (proves the password)."""
-    return hmac.new(settings.secret_key().encode(), b"authenticated:v1", hashlib.sha256).hexdigest()
+    """The signed value a valid session cookie must hold. It is derived from the
+    current password as well as the secret key, so changing the password signs
+    every existing session out."""
+    password = (settings.auth_password or "").encode("utf-8")
+    return hmac.new(
+        settings.secret_key().encode(), b"authenticated:v2:" + password, hashlib.sha256
+    ).hexdigest()
 
 
 def _same_secret(given: str, expected: str) -> bool:

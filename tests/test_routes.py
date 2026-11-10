@@ -288,6 +288,19 @@ def test_non_ascii_guess_is_a_plain_wrong_password(tmp_path, monkeypatch):
     assert resp.status_code == 401
 
 
+def test_changing_the_password_signs_everyone_out(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    c = TestClient(app)
+    c.post("/login", data={"password": "swordfish"})
+    # Signed in: no hub is configured here, so the home page sends us to setup.
+    assert c.get("/", follow_redirects=False).headers["location"] == "/settings"
+    # The owner changes the password; the secret key stays the same.
+    _with_auth(monkeypatch, tmp_path, password="new-password")
+    assert c.get("/", follow_redirects=False).headers["location"] == "/login"
+    denied = c.post("/rooms/1/temperature", data={"temperature": "20"}, follow_redirects=False)
+    assert denied.status_code == 403
+
+
 def test_healthz_stays_public_under_auth(tmp_path, monkeypatch):
     _with_auth(monkeypatch, tmp_path)
     # unconfigured hub -> 503, but crucially not a redirect to /login
