@@ -115,11 +115,14 @@ class MqttBridge:
     def on_message(self, topic: str, payload: str) -> None:
         """Route an inbound command topic to the hub client. Everything flows
         back through the app's serialised client, never straight to the hub."""
-        parts = topic.split("/")
-        # <base>/<zone>/<field>/set
-        if len(parts) != 4 or parts[0] != self._base or parts[3] != "set":
+        # <base>/<zone>/<field>/set, where <base> may itself contain slashes.
+        prefix = self._base + "/"
+        if not topic.startswith(prefix):
             return
-        zone, field = parts[1], parts[2]
+        parts = topic[len(prefix):].split("/")
+        if len(parts) != 3 or parts[2] != "set":
+            return
+        zone, field = parts[0], parts[1]
         if field == "temperature":
             try:
                 value = float(payload)

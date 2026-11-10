@@ -113,3 +113,26 @@ def test_publish_state_off_when_setpoint_is_the_off_temperature():
     bridge.publish_state("2", current=18.0, setpoint=1.0)  # Off is sent as 1 degree
     state = json.loads(published[-1][1])
     assert state["mode"] == "off"
+
+
+def test_commands_work_when_the_base_topic_has_slashes():
+    # "home/hearthmage" is an ordinary MQTT layout; state already published
+    # under it, but every command was dropped by a fixed segment count.
+    class Handler:
+        def __init__(self):
+            self.calls = []
+
+        def set_temperature(self, zone, value):
+            self.calls.append((zone, value))
+
+    handler = Handler()
+    bridge = MqttBridge(
+        publish=lambda *a, **k: None, handler=handler, base_topic="home/hearthmage", node_id="hub"
+    )
+    bridge.on_message("home/hearthmage/1/temperature/set", "20.5")
+    bridge.on_message("home/hearthmage/3/mode/set", "off")
+    # Near misses must still be ignored.
+    bridge.on_message("home/hearthmage2/1/temperature/set", "30")
+    bridge.on_message("home/1/temperature/set", "30")
+    bridge.on_message("home/hearthmage/1/extra/temperature/set", "30")
+    assert handler.calls == [("1", 20.5), ("3", 0.0)]
