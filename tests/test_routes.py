@@ -1256,6 +1256,32 @@ def test_start_holiday_sends_days_from_today(client: TestClient, tmp_path, monke
     assert stored["prev_setpoint"] == 21.0  # the room's target before the hold
 
 
+def test_start_holiday_talks_to_the_hub_off_the_event_loop(client, tmp_path, monkeypatch):
+    # A hub write can block for half a minute when the radiator is asleep. On the
+    # event loop that would freeze every other request, /healthz included.
+    import asyncio
+
+    _with_holiday(tmp_path, monkeypatch)
+    fake = app.dependency_overrides[get_client]()
+    seen = {}
+
+    def set_holiday(room_id, **kwargs):
+        try:
+            asyncio.get_running_loop()
+            seen["on_event_loop"] = True
+        except RuntimeError:
+            seen["on_event_loop"] = False
+
+    monkeypatch.setattr(fake, "set_holiday", set_holiday)
+    resp = client.post(
+        "/zones/1/holiday",
+        data={"until": _in_days(4), "until_time": "17:30", "arrival": "temp", "arrival_temp": "20"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert seen == {"on_event_loop": False}
+
+
 def test_start_holiday_can_resume_the_schedule(client: TestClient, tmp_path, monkeypatch):
     _with_holiday(tmp_path, monkeypatch)
     _with_store(tmp_path, monkeypatch)

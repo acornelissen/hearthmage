@@ -1489,11 +1489,20 @@ def _parse_holiday_form(form) -> tuple[datetime, float | None]:
 
 
 @app.post("/zones/{zone_id}/holiday")
-async def start_holiday(
-    request: Request, zone_id: str, client: HearthClient = Depends(get_client)
+def start_holiday(
+    request: Request,
+    zone_id: str,
+    until: str = Form(""),
+    until_time: str = Form(""),
+    arrival: str = Form(""),
+    arrival_temp: str = Form(""),
+    client: HearthClient = Depends(get_client),
 ) -> Response:
+    # A plain def on purpose: the hub write below can block for a long time when
+    # the radiator is asleep, and must run in the threadpool, not on the event loop.
     _check_zone(zone_id)
-    form = await request.form()
+    form = {"until": until, "until_time": until_time, "arrival": arrival,
+            "arrival_temp": arrival_temp}
     try:
         until, arrival = _parse_holiday_form(form)
     except ValueError as exc:
