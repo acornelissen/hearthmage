@@ -182,6 +182,48 @@ def test_clear_mqtt_disables_bridge(tmp_path):
     assert s.mqtt_config() is None
 
 
+_ENV_BROKER = {
+    "HEARTHMAGE_MQTT_HOST": "10.0.0.5",
+    "HEARTHMAGE_MQTT_USERNAME": "hearth",
+    "HEARTHMAGE_MQTT_PASSWORD": "envpass",
+}
+
+
+def test_first_save_with_blank_password_keeps_the_env_password(tmp_path):
+    # The form says "(set) leave blank to keep". With the broker configured by
+    # environment variables, the first save from the UI must not drop the
+    # password, or the bridge reconnects unauthenticated and is refused.
+    path = str(tmp_path / "c.json")
+    Settings(path, env=_ENV_BROKER).set_mqtt("10.0.0.5", 1883, "hearth", "keep", "", base_topic="home")
+    cfg = Settings(path, env=_ENV_BROKER).mqtt_config()
+    assert cfg["password"] == "envpass"
+    assert cfg["base_topic"] == "home"
+
+
+def test_clearing_the_password_is_final_even_with_an_env_password(tmp_path):
+    path = str(tmp_path / "c.json")
+    Settings(path, env=_ENV_BROKER).set_mqtt("10.0.0.5", 1883, "hearth", "clear", "")
+    s = Settings(path, env=_ENV_BROKER)
+    assert s.mqtt_config()["password"] is None
+    # ...and a later blank-password save keeps it cleared rather than re-reading env.
+    s.set_mqtt("10.0.0.5", 1883, "hearth", "keep", "")
+    assert Settings(path, env=_ENV_BROKER).mqtt_config()["password"] is None
+
+
+def test_disable_stays_disabled_when_env_configures_a_broker(tmp_path):
+    # Disable used to drop the stored object, which handed control straight
+    # back to the environment: the bridge reconnected while the UI said stopped.
+    path = str(tmp_path / "c.json")
+    Settings(path, env=_ENV_BROKER).clear_mqtt()
+    s = Settings(path, env=_ENV_BROKER)
+    assert s.mqtt_enabled is False
+    assert s.mqtt_config() is None
+    assert s.mqtt_password_set is False
+    # Saving the form again turns it back on.
+    s.set_mqtt("10.0.0.6", 1883, "", "keep", "")
+    assert Settings(path, env=_ENV_BROKER).mqtt_config()["host"] == "10.0.0.6"
+
+
 def test_mqtt_bad_port_falls_back(tmp_path):
     s = Settings(
         str(tmp_path / "c.json"),

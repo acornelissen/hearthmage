@@ -261,9 +261,15 @@ class Settings:
         """Save MQTT broker settings. ``password_action`` is ``"set"`` (store the
         given password), ``"keep"`` (leave the stored one alone; blank UI input)
         or ``"clear"`` (remove it)."""
-        stored = self._data.setdefault("mqtt", {})
+        stored = self._data.get("mqtt")
         if not isinstance(stored, dict):
+            # First save from the UI: the environment was in charge until now,
+            # so "keep" has to mean keep the environment's password. From here
+            # on the stored object is authoritative, as documented above.
             stored = self._data["mqtt"] = {}
+            env_password = _env_lookup(self._env, "MQTT_PASSWORD")
+            if env_password and password_action == "keep":
+                stored["password"] = env_password
         stored["host"] = host.strip()
         try:
             stored["port"] = int(port)
@@ -279,8 +285,11 @@ class Settings:
         self._save()
 
     def clear_mqtt(self) -> None:
-        """Disable the bridge: drop the whole stored MQTT object (password too)."""
-        self._data.pop("mqtt", None)
+        """Disable the bridge and forget the stored broker settings (password
+        too). An empty object is kept on purpose: it stays authoritative, so
+        ``HEARTHMAGE_MQTT_*`` in the environment cannot switch the bridge back
+        on behind a UI that says it is stopped."""
+        self._data["mqtt"] = {}
         self._save()
 
     def _save(self) -> None:
