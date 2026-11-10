@@ -204,3 +204,43 @@ def test_snapshot_leaves_no_partial_file_behind(tmp_path, monkeypatch):
     except OSError:
         pass
     assert os.listdir(tmp_path / "backups") == []
+
+
+def test_older_snapshots_of_a_private_file_are_tightened(tmp_path):
+    # Snapshots written before the fix are world-readable copies of a 0600
+    # file. They are fixed the next time a snapshot is taken, not left until
+    # ten more saves have pushed them out.
+    import os
+    import stat
+
+    from hearthmage.atomicio import write_json_atomic
+    from hearthmage.backups import list_backups, rotate_backup
+
+    src = tmp_path / "config.json"
+    write_json_atomic(str(src), {"secret_key": "s3cret"})
+    old = tmp_path / "backups" / "config.json.20260101T000000_000000.bak.json"
+    old.parent.mkdir()
+    old.write_text("{}")
+    os.chmod(old, 0o644)
+    rotate_backup(str(src))
+    for snap in list_backups(str(src)):
+        assert stat.S_IMODE(os.stat(snap).st_mode) & 0o077 == 0, snap
+
+
+def test_snapshots_of_a_shared_file_are_left_as_they_are(tmp_path):
+    # If the file itself is readable by others (a share that manages access its
+    # own way), that is the owner's choice; do not lock its old snapshots.
+    import os
+    import stat
+
+    from hearthmage.backups import rotate_backup
+
+    src = tmp_path / "schedules.json"
+    src.write_text("{}")
+    os.chmod(src, 0o644)
+    old = tmp_path / "backups" / "schedules.json.20260101T000000_000000.bak.json"
+    old.parent.mkdir()
+    old.write_text("{}")
+    os.chmod(old, 0o644)
+    rotate_backup(str(src))
+    assert stat.S_IMODE(os.stat(old).st_mode) == 0o644

@@ -19,6 +19,7 @@ import glob
 import json
 import os
 import shutil
+import stat
 import tempfile
 from datetime import datetime, timezone
 from typing import Any
@@ -54,7 +55,26 @@ def rotate_backup(source_path: str, keep: int = _DEFAULT_KEEP) -> str | None:
     dest = os.path.join(directory, f"{base}.{_timestamp()}{_SUFFIX}")
     _copy_private(source_path, dest)
     _prune(source_path, keep)
+    _tighten_older_snapshots(source_path)
     return dest
+
+
+def _tighten_older_snapshots(source_path: str) -> None:
+    """Snapshots written before they were made private are world-readable copies
+    of a file that is not. If the source is owner-only, make the snapshots that
+    remain owner-only too. A source that others may read is left alone, as are
+    its snapshots. Best-effort: a share that refuses chmod is not an error."""
+    try:
+        if stat.S_IMODE(os.stat(source_path).st_mode) & 0o077:
+            return
+    except OSError:
+        return
+    for snapshot in list_backups(source_path):
+        try:
+            if stat.S_IMODE(os.stat(snapshot).st_mode) & 0o077:
+                os.chmod(snapshot, 0o600)
+        except OSError:
+            pass
 
 
 def _copy_private(source_path: str, dest: str) -> None:
