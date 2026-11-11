@@ -1326,3 +1326,67 @@ def test_the_reading_hook_reports_what_the_radiator_holds_while_unconfirmed():
     assert seen == [(2, 19.4, 18.0)]  # history records the truth, not the wish
     client.stop()
     _wait_for_writer(client, 2)
+
+
+# ---- the retry gives up after two hours (owner's decision 2026-11-11) -----
+
+
+def test_an_unacknowledged_setpoint_is_given_up_after_the_limit(monkeypatch):
+    # A radiator switched off at the wall must not be sent yesterday's target
+    # when it is powered on again.
+    monkeypatch.setattr("hearthmage.nexho_client._SETPOINT_RETRY_FIRST", 0.01)
+    monkeypatch.setattr("hearthmage.nexho_client._SETPOINT_GIVE_UP_AFTER", 0.08)
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)  # confirmed target 18
+    sent = _scripted_sends(client, {21.0: [False]})
+    client.set_temperature("2", 21.0)
+    _wait_for_writer(client, 2)  # the worker ends by itself
+    assert len(sent) >= 2  # it did retry first
+    room = client.list_rooms()[0]
+    assert (room.target_temp, room.unconfirmed) == (18.0, False)  # back to what the radiator holds
+    assert "21.0" in room.error
+    assert "not delivered" in room.error
+    assert 2 not in client._pending and 2 not in client._desired
+    assert client._last[2] == (19.0, 18.0)
+    # The message stays through polls the radiator does not answer...
+    client._read_zone_raw = lambda zone: (None, None, False)  # type: ignore[method-assign]
+    client._poll_zone(2)
+    assert "not delivered" in client.list_rooms()[0].error
+    # ...and goes once it answers again (the card then shows the truth).
+    client._read_zone_raw = lambda zone: (19.5, 18.0, True)  # type: ignore[method-assign]
+    client._poll_zone(2)
+    assert client.list_rooms()[0].error is None
+
+
+def test_giving_up_on_off_says_so(monkeypatch):
+    monkeypatch.setattr("hearthmage.nexho_client._SETPOINT_RETRY_FIRST", 0.01)
+    monkeypatch.setattr("hearthmage.nexho_client._SETPOINT_GIVE_UP_AFTER", 0.05)
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    _scripted_sends(client, {1.0: [False]})
+    client.set_temperature("2", 0)
+    _wait_for_writer(client, 2)
+    assert "Switching off" in client.list_rooms()[0].error
+
+
+def test_a_new_request_restarts_the_give_up_clock_and_clears_the_message(monkeypatch):
+    monkeypatch.setattr("hearthmage.nexho_client._SETPOINT_RETRY_FIRST", 0.01)
+    monkeypatch.setattr("hearthmage.nexho_client._SETPOINT_GIVE_UP_AFTER", 0.05)
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    _scripted_sends(client, {21.0: [False], 22.0: [True]})
+    client.set_temperature("2", 21.0)
+    _wait_for_writer(client, 2)
+    first_request = client._requested_at[2]
+    assert client.list_rooms()[0].error
+    client.set_temperature("2", 22.0)
+    assert client._requested_at[2] > first_request
+    _wait_for_writer(client, 2)
+    room = client.list_rooms()[0]
+    assert (room.target_temp, room.error) == (22.0, None)
+
+
+def test_the_real_give_up_limit_is_two_hours():
+    from hearthmage.nexho_client import _SETPOINT_GIVE_UP_AFTER
+
+    assert _SETPOINT_GIVE_UP_AFTER == 2 * 3600

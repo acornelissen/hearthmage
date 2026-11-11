@@ -55,6 +55,10 @@ _SILENT_AFTER = 600.0
 # after a silence gets it at once.
 _SETPOINT_RETRY_FIRST = 30.0
 _SETPOINT_RETRY_MAX = 900.0
+# ...but not for ever: a radiator switched off at the wall must not be sent an
+# old target when it is powered on again days later. This long after the latest
+# request the setpoint is dropped and the card says it was not delivered.
+_SETPOINT_GIVE_UP_AFTER = 2 * 3600.0
 # Heater counts (OPS3) are re-read this often even when the zone list has not
 # changed: a zone deleted in the vendor app keeps its OPS2 slot and only shows
 # up as zero heaters. The hub answers OPS3 itself, with no radio involved.
@@ -110,6 +114,8 @@ class NexhoLocalClient:
         self._writers: set[int] = set()  # zones with a live single-flight write worker
         self._write_seq: dict[int, int] = {}  # zone -> bumped on every requested write
         self._unconfirmed: set[int] = set()  # zones whose target the hub has not acked yet
+        self._requested_at: dict[int, float] = {}  # zone -> when its latest target was asked for
+        self._gave_up: dict[int, float] = {}  # zone -> target dropped after _SETPOINT_GIVE_UP_AFTER
         self._write_kick: set[int] = set()  # zones whose waiting retry should go now
         # Wakes write workers that are waiting to retry (new target, kick, stop).
         self._write_wake = threading.Condition()
@@ -304,7 +310,8 @@ class NexhoLocalClient:
         keep = set(ids)
         with self._lock:
             for table in (self._state, self._last, self._pending, self._desired,
-                          self._next_poll, self._backoff, self._last_fresh, self._write_seq):
+                          self._next_poll, self._backoff, self._last_fresh, self._write_seq,
+                          self._requested_at, self._gave_up):
                 for zone in [z for z in table if z not in keep]:
                     del table[zone]
             self._unconfirmed &= keep
@@ -363,9 +370,24 @@ class NexhoLocalClient:
             min_temp=_MIN_TEMP,
             max_temp=_MAX_TEMP,
             status=status,
-            error=error,
+            error=error or self._undelivered_message(zone),
             silent_for=self._silent_for(zone),
             unconfirmed=zone in self._unconfirmed,
+        )
+
+    def _undelivered_message(self, zone: int) -> str | None:
+        """What to tell the user about a setpoint that was dropped after going
+        unacknowledged for too long, or None. Shown until the radiator answers
+        again or a new target is set."""
+        target = self._gave_up.get(zone)
+        if target is None:
+            return None
+        what = "Switching off" if target <= _OFF_TEMP else f"The change to {target:.1f} °C"
+        hours = round(_SETPOINT_GIVE_UP_AFTER / 3600)
+        waited = f"for {hours} hours" if hours >= 1 else "in time"
+        return (
+            f"{what} was not delivered: the radiator did not answer {waited}. "
+            "Set it again once it is back."
         )
 
     def _silent_for(self, zone: int) -> float | None:
@@ -483,6 +505,8 @@ class NexhoLocalClient:
         reported = target  # the target handed to the reading hook, see below
         settled_by_read = False
         with self._lock:
+            if fresh:
+                self._gave_up.pop(zone, None)  # it is back: the card shows the truth again
             pending = self._pending.get(zone)
             undisturbed = (
                 not writing_before
@@ -655,6 +679,8 @@ class NexhoLocalClient:
         with self._lock:
             prev = self._state.get(zone)
             current = prev.current_temp if prev else None
+            self._gave_up.pop(zone, None)  # a new request replaces an undelivered one
+            self._requested_at[zone] = time.monotonic()  # the give-up clock starts here
             self._pending[zone] = target  # poll must not revert this
             self._desired[zone] = target  # latest wins
             self._write_seq[zone] = self._write_seq.get(zone, 0) + 1  # see _poll_zone
@@ -678,7 +704,8 @@ class NexhoLocalClient:
         one arrived while sending, send that instead - repeat until the hub has
         acknowledged the latest one. A target the hub does not acknowledge
         (radiator asleep or switched off) is kept, marked not confirmed, and
-        sent again after a growing wait; it is never dropped silently."""
+        sent again after a growing wait. It is never dropped silently: after
+        _SETPOINT_GIVE_UP_AFTER it is dropped with a message on the card."""
         failures = 0
         try:
             while not self._stop.is_set():
@@ -704,12 +731,34 @@ class NexhoLocalClient:
                         self._state[zone] = self._room(zone, current, float(target), "ok")
                         self._writers.discard(zone)
                         return
-                    # No ack. Stay the zone's writer so the poller keeps the
+                    # No ack. Give up if it has been too long since the user
+                    # asked: the card goes back to the last confirmed target and
+                    # says the change was not delivered.
+                    left = _SETPOINT_GIVE_UP_AFTER - (
+                        time.monotonic() - self._requested_at.get(zone, time.monotonic())
+                    )
+                    if left <= 0:
+                        self._desired.pop(zone, None)
+                        self._pending.pop(zone, None)
+                        self._unconfirmed.discard(zone)
+                        self._write_kick.discard(zone)
+                        self._gave_up[zone] = float(target)
+                        last = self._last.get(zone)
+                        self._state[zone] = self._room(
+                            zone, last[0] if last else current, last[1] if last else None, "ok"
+                        )
+                        self._writers.discard(zone)
+                        _log.warning(
+                            "zone %s setpoint %s given up: not acknowledged for %.0f min",
+                            zone, target, _SETPOINT_GIVE_UP_AFTER / 60,
+                        )
+                        return
+                    # Otherwise stay the zone's writer so the poller keeps the
                     # user's target (see _poll_zone), and say it is not confirmed.
                     failures += 1
                     self._unconfirmed.add(zone)
                     self._state[zone] = self._room(zone, current, float(target), "ok")
-                wait = _setpoint_retry_wait(failures)
+                wait = min(_setpoint_retry_wait(failures), left)  # one last try at the limit
                 _log.info("zone %s setpoint %s not confirmed; retrying in %.0fs", zone, target, wait)
                 self._wait_to_retry(zone, target, wait)
         finally:

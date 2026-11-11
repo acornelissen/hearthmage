@@ -74,7 +74,9 @@ Reading a card:
   - **OFF** — the radiator is switched off.
   - **NOT CONFIRMED** — you set a target but the radiator has not acknowledged
     it yet (it may be asleep). HearthMage keeps the target and keeps sending it
-    until the radiator takes it; a note under the reading says so.
+    until the radiator takes it; a note under the reading says so. If two hours
+    pass without an answer it stops, shows the radiator's last known target
+    again, and tells you the change was not delivered.
   - **NO ANSWER** — the radiator has not answered for more than ten minutes, for
     example because it is switched off at the wall. The card keeps showing its
     last reading and says how long it has been silent.
