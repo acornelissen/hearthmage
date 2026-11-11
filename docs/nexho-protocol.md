@@ -240,6 +240,34 @@ needed. Known elements:
 | Output power level | `1#124` | 0..5 (vendor; not used here) |
 | Boost time | `1#22` | 1..19, in 5-minute steps (vendor; not used here) |
 
+### Replies can be one query behind (confirmed live, 2026-11-11)
+
+A reply carries nothing that ties it to its query, and the hub answers a query
+that arrives straight after its last reply with that reply's value. Measured on
+this hub with read-only probes, one client, zone 4, real values keypad 0,
+window 0, anti-ice 7, offset 0:
+
+| Pause after each reply | Rounds of `0#8, 0#6, 1#20, 0#9` read wrong |
+|---|---|
+| none | 5 of 6 (`0, 0, 0, 7`: each answer is the one before) |
+| 0.05 s | 0 of 8 |
+| 0.1 s | 0 of 8 |
+| 0.25 s | 0 of 8 |
+
+The shifted answers came back in about 30 ms, the right ones in about 40 ms.
+The shift crosses command types: a `*?T` sent straight after a burst of `*?E`
+reads came back as `OK,01,22,255`, and the `*?E` after it as `OK,10` (the
+zone's target). Two clients talking at once mix replies the same way (a probe's
+`*?E#0#9` got `OK,10` while the app polled that zone). Why the hub does this is
+not known (inferred: one shared reply buffer).
+
+This app therefore waits 0.1 s after every reply before it sends again
+(`_HUB_QUIET_GAP`) and believes a setting only when two reads in a row agree
+(`_read_element_agreed`). Before that fix the settings page showed anti-ice 0
+and offset 0.7 for radiators set to 7 and 0, and one poll recorded 0.8 C /
+target 0 for a room at 11.3 C / 10. Anything else on the LAN that talks to the
+hub (the vendor app, a probe script) can still garble a reply.
+
 Corrected 2026-11-01 from the decompiled vendor app (HeatApp 4.1.1): `1#20` was
 earlier documented, and exposed in this app, as "temperature offset 0..17". It
 is the anti-ice temperature (vendor screen "Frost protection"); the real offset

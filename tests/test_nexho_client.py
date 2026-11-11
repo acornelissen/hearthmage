@@ -13,6 +13,7 @@ from hearthmage.nexho_client import (
 def _no_resend_gap(monkeypatch):
     """Resends after ER wait a few seconds on a real hub; not in tests."""
     monkeypatch.setattr("hearthmage.nexho_client._ER_GAP", 0.0)
+    monkeypatch.setattr("hearthmage.nexho_client._HUB_QUIET_GAP", 0.0)
 
 
 def make_client(responses: dict[str, str], names=None) -> NexhoLocalClient:
@@ -501,6 +502,102 @@ def test_read_config_reports_an_unread_setting_as_unknown():
 def test_read_config_none_when_asleep():
     client = make_client({"R#3#1#0#0*?E#0#8/": "ER,1"})
     assert client.read_config("3") is None
+
+
+def _lagging_hub(truth: dict[str, int], stale: int = 5):
+    """A hub that answers each settings read with the value of the query before
+    it, as the real one does when a query follows its last reply too closely
+    (live 2026-11-11). ``stale`` is what its buffer holds at the start."""
+    client = NexhoLocalClient("10.0.0.99")
+    sent: list[str] = []
+    held = {"value": stale}
+
+    def ask(cmd, *a, **k):
+        sent.append(cmd)
+        if "*?E#" in cmd:
+            reply = f"OK,{held['value']}"
+            held["value"] = truth[cmd.split("*?E#")[1].rstrip("/")]
+            return reply
+        return "OK"
+
+    client._ask = ask  # type: ignore[method-assign]
+    return client, sent
+
+
+def test_read_config_is_not_fooled_by_a_reply_one_query_behind():
+    # Live 2026-11-11: the page showed anti-ice 0 and offset 0.7 for radiators
+    # whose real values were 7 and 0, because each answer was the one before.
+    client, _ = _lagging_hub({"0#8": 0, "0#6": 0, "1#20": 7, "0#9": 0})
+    assert client.read_config("1") == {
+        "keypad_lock": False, "window_sensor": False, "frost_temp": 7, "sensor_offset": 0.0,
+    }
+
+
+def test_read_config_reports_a_setting_whose_reads_disagree_as_unknown():
+    client = NexhoLocalClient("10.0.0.99")
+    frost = iter([3, 9, 4, 8, 2, 6])
+
+    def ask(cmd, *a, **k):
+        return f"OK,{next(frost)}" if "*?E#1#20" in cmd else "OK,0"
+
+    client._ask = ask  # type: ignore[method-assign]
+    assert client.read_config("1") == {
+        "keypad_lock": False, "window_sensor": False, "frost_temp": None, "sensor_offset": 0.0,
+    }
+
+
+def test_keypad_write_is_based_on_an_agreed_read():
+    # The keypad byte is read, changed and written back; a reply one query
+    # behind must not get its bit 7 written to the radiator.
+    client, sent = _lagging_hub({"0#8": 128}, stale=0)
+    client.set_config("2", keypad_lock=True)
+    assert "D#2#1#0#0*SEP#0#8#129/" in sent
+
+
+def test_ask_leaves_the_hub_a_quiet_gap_between_exchanges(monkeypatch):
+    """A query sent straight after the hub's last reply is answered with that
+    reply's value (live 2026-11-11), so every exchange waits out a short gap."""
+    import hearthmage.nexho_client as nc
+
+    clock = {"now": 100.0}
+    events: list[tuple] = []
+
+    class FakeSocket:
+        def __init__(self, *a):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, addr):
+            pass
+
+        def send(self, data):
+            events.append(("send", clock["now"]))
+
+        def recv(self, n):
+            clock["now"] += 0.04  # the hub takes about 40 ms to answer
+            return b"OK,7\x00"
+
+        def close(self):
+            pass
+
+    def fake_sleep(seconds):
+        events.append(("sleep", round(seconds, 3)))
+        clock["now"] += seconds
+
+    monkeypatch.setattr(nc, "_HUB_QUIET_GAP", 0.1)
+    monkeypatch.setattr(nc.socket, "socket", FakeSocket)
+    monkeypatch.setattr(nc.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(nc.time, "sleep", fake_sleep)
+    client = NexhoLocalClient("10.0.0.99")
+    client._ask("R#1#1#0#0*?E#0#6/", 1, 0.1)  # first exchange: nothing to wait for
+    client._ask("R#1#1#0#0*?E#1#20/", 1, 0.1)  # straight after: waits the gap
+    clock["now"] += 5.0
+    client._ask("R#1#1#0#0*?T/", 1, 0.1)  # the hub has been quiet: no wait
+    sends = [t for kind, t in events if kind == "send"]
+    assert [e for e in events if e[0] == "sleep"] == [("sleep", 0.1)]
+    assert sends[1] - (sends[0] + 0.04) == pytest.approx(0.1)
 
 
 def _recording_client(keypad_raw: str = "OK,0"):

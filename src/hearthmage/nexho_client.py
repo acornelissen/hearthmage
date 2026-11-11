@@ -37,6 +37,14 @@ _PROGRAM_WRITE_RETRIES = 2
 # vendor app resends on ER too. Used for program reads/writes and on/off.
 _ER_ATTEMPTS = 4
 _ER_GAP = 3.0
+# A query that reaches the hub straight after its last reply is answered with
+# that reply's value: four settings reads sent with no pause came back shifted
+# by one, and the poll that followed got a mixed reply (live 2026-11-11). With a
+# 50 ms pause, 24 rounds out of 24 were right; this leaves double that.
+_HUB_QUIET_GAP = 0.1
+# A radiator setting is believed only when two reads in a row agree, so a reply
+# that belongs to another query cannot reach the settings form or a write.
+_ELEMENT_READS = 3
 _POLL_INTERVAL = 15.0
 # Unreachable zones back off exponentially so they stop monopolising the hub;
 # capped so a radiator that wakes is still noticed within a couple of minutes.
@@ -141,6 +149,7 @@ class NexhoLocalClient:
         self._io_lock = threading.Lock()
         self._io_cond = threading.Condition()
         self._writes_pending = 0
+        self._hub_replied_at: float | None = None  # guarded by _io_lock
         # Per-zone poll scheduling (monotonic clock). Unreachable zones back off.
         self._next_poll: dict[int, float] = {}
         self._backoff: dict[int, float] = {}
@@ -211,6 +220,7 @@ class NexhoLocalClient:
             last_exc: Exception | None = None
             for _ in range(retries):
                 sock = None
+                self._let_hub_settle()
                 started = time.monotonic()
                 try:
                     # Socket creation is inside the try so an OSError here (e.g. fd
@@ -223,6 +233,7 @@ class NexhoLocalClient:
                     sock.connect(self._addr)
                     sock.send(cmd.encode("ascii"))
                     data = sock.recv(1024)
+                    self._hub_replied_at = time.monotonic()
                     reply = data.rstrip(_NULL).decode("ascii", errors="replace")
                     _log.debug("hub %s -> %s (%.0fms)", cmd, reply, (time.monotonic() - started) * 1000)
                     return reply
@@ -240,6 +251,15 @@ class NexhoLocalClient:
             raise HearthError(f"No response from hub for {cmd!r}{detail}")
         finally:
             self._wire_release(priority)
+
+    def _let_hub_settle(self) -> None:
+        """Wait out the quiet gap after the hub's last reply (see
+        ``_HUB_QUIET_GAP``). Called with the wire held."""
+        if self._hub_replied_at is None:
+            return
+        wait = self._hub_replied_at + _HUB_QUIET_GAP - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
 
     def _ask_until_answered(
         self, cmd: str, ok_prefix: str, priority: bool,
@@ -822,6 +842,21 @@ class NexhoLocalClient:
             return None
         return _as_int(resp.split(",")[1]) if "," in resp else None
 
+    def _read_element_agreed(self, zone: int, group: int, index: int) -> int | None:
+        """Read one setting until two reads in a row agree; None if the radiator
+        does not answer or the answers keep differing. The reply carries nothing
+        that ties it to its query, so agreement is the only check there is."""
+        previous = self._read_element(zone, group, index)
+        for _ in range(_ELEMENT_READS - 1):
+            if previous is None:
+                return None
+            value = self._read_element(zone, group, index)
+            if value == previous:
+                return value
+            previous = value
+        _log.warning("zone %s setting %s#%s: reads disagree, treating as unread", zone, group, index)
+        return None
+
     def _write_element(
         self, zone: int, group: int, index: int, value: int, op: str = "D", module: int | None = None
     ) -> None:
@@ -841,14 +876,14 @@ class NexhoLocalClient:
         read failed is None (unknown), never a default: the settings form must
         not be able to write a guess back to the radiator."""
         zone = self._require_zone(room_id)
-        keypad = self._read_element(zone, *self._EL_KEYPAD)
-        if keypad is None:  # first read failed: radiator asleep, don't bother more
-            return None
-        window = self._read_element(zone, *self._EL_WINDOW)
-        frost = self._read_element(zone, *self._EL_FROST)
-        offset = self._read_element(zone, *self._EL_OFFSET)
+        if self._read_element(zone, *self._EL_KEYPAD) is None:
+            return None  # first read failed: radiator asleep, don't bother more
+        keypad = self._read_element_agreed(zone, *self._EL_KEYPAD)
+        window = self._read_element_agreed(zone, *self._EL_WINDOW)
+        frost = self._read_element_agreed(zone, *self._EL_FROST)
+        offset = self._read_element_agreed(zone, *self._EL_OFFSET)
         return {
-            "keypad_lock": bool(keypad & 1),
+            "keypad_lock": bool(keypad & 1) if keypad is not None else None,
             "window_sensor": bool(window) if window is not None else None,
             "frost_temp": frost,
             "sensor_offset": _decode_offset(offset) if offset is not None else None,
@@ -873,7 +908,7 @@ class NexhoLocalClient:
         ):
             raise HearthError(f"Sensor offset {sensor_offset} out of range +/-{self.OFFSET_LIMIT}")
         if keypad_lock is not None:
-            current = self._read_element(zone, *self._EL_KEYPAD)
+            current = self._read_element_agreed(zone, *self._EL_KEYPAD)
             if current is None:
                 raise HearthError(f"Zone {zone}: could not read the keypad setting to update it")
             self._write_element(zone, *self._EL_KEYPAD, (current & 0x80) | int(bool(keypad_lock)))
