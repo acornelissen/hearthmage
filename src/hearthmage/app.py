@@ -73,7 +73,7 @@ def _record_reading(zone: int, current, setpoint) -> None:
     """History hook for the poller: log a fresh reading, prune, and mirror to MQTT."""
     now = datetime.now(timezone.utc).timestamp()
     history.record_temp(str(zone), current, setpoint, ts=now)
-    history.prune_temp(before_ts=now - _TEMP_RETAIN_DAYS * 86400)
+    history.prune_old(now, _TEMP_RETAIN_DAYS * 86400)
     try:
         _check_waste(str(zone), now, current, setpoint)
     except Exception:  # noqa: BLE001 - waste detection must not disturb polling

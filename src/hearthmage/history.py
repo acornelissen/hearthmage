@@ -17,6 +17,10 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+import time
+
+_PRUNE_EVERY = 3600.0  # seconds between retention sweeps
+_monotonic = time.monotonic  # indirection so tests can move the clock
 
 
 class HistoryStore:
@@ -25,7 +29,26 @@ class HistoryStore:
         self._lock = threading.Lock()
         directory = os.path.dirname(path) or "."
         os.makedirs(directory, exist_ok=True)
+        self._last_prune: float | None = None
+        self._create_private()
+        self._restrict_files()  # before SQLite builds an index and a journal
         self._init_db()
+        self._restrict_files()  # the file may have just been created by SQLite
+
+    def _create_private(self) -> None:
+        """Create the file owner-only before SQLite does (it would use 0644)."""
+        try:
+            os.close(os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600))
+        except OSError:
+            pass  # SQLite will report a real problem when it connects
+
+    def _restrict_files(self) -> None:
+        """Best effort: owner-only on the database and any sidecar files."""
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            try:
+                os.chmod(self._path + suffix, 0o600)
+            except OSError:
+                pass  # missing sidecar, or a filesystem that refuses chmod
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path)
@@ -41,6 +64,7 @@ class HistoryStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_temp_zone_ts ON temp_readings(zone, ts)"
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_temp_ts ON temp_readings(ts)")
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS energy_daily ("
                 "zone TEXT NOT NULL, day TEXT NOT NULL, kwh REAL, "
@@ -59,6 +83,10 @@ class HistoryStore:
                 "CREATE TABLE IF NOT EXISTS status_snapshots ("
                 "id INTEGER PRIMARY KEY, zone TEXT NOT NULL, ts REAL NOT NULL, "
                 "kind TEXT NOT NULL, raw TEXT NOT NULL, event_id INTEGER)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_status_zone_kind_ts "
+                "ON status_snapshots(zone, kind, ts)"
             )
 
     # ---- temperature -----------------------------------------------------
@@ -80,10 +108,38 @@ class HistoryStore:
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
-    def prune_temp(self, before_ts: float) -> None:
-        """Delete temperature rows older than ``before_ts`` (retention control)."""
+    def prune_old(self, now: float, retain_seconds: float) -> bool:
+        """Apply retention to temperature, waste events and status snapshots.
+
+        Runs at most once an hour (monotonic time; ``now`` only sets the cutoff); returns whether it ran. Open waste
+        events, and snapshots of events still inside the window, are kept. Daily
+        energy is long-term history and is never pruned.
+        """
+        with self._lock:
+            tick = _monotonic()  # not the wall clock: it can jump back
+            if self._last_prune is not None and tick - self._last_prune < _PRUNE_EVERY:
+                return False
+            self._last_prune = tick
+        cutoff = float(now) - float(retain_seconds)
         with self._lock, self._connect() as conn:
-            conn.execute("DELETE FROM temp_readings WHERE ts < ?", (float(before_ts),))
+            conn.execute("DELETE FROM temp_readings WHERE ts < ?", (cutoff,))
+            # Keep: snapshots of open or in-window events, plus the newest resting
+            # snapshot at or before each kept heating one (the event's baseline).
+            live = "(SELECT id FROM waste_events WHERE open = 1 OR start_ts >= :c)"
+            conn.execute(
+                "DELETE FROM status_snapshots WHERE ts < :c "
+                f"AND (event_id IS NULL OR event_id NOT IN {live}) "
+                # One indexed lookup per kept heating snapshot. NULLs are filtered
+                # out: a NULL inside NOT IN would make the delete remove nothing.
+                "AND id NOT IN (SELECT baseline FROM (SELECT (SELECT r.id FROM status_snapshots r "
+                "WHERE r.zone = h.zone AND r.kind = 'rest' AND r.ts <= h.ts "
+                "ORDER BY r.ts DESC LIMIT 1) AS baseline "
+                "FROM status_snapshots h WHERE h.kind = 'heating' "
+                f"AND (h.ts >= :c OR h.event_id IN {live})) WHERE baseline IS NOT NULL)",
+                {"c": cutoff},
+            )
+            conn.execute("DELETE FROM waste_events WHERE open = 0 AND start_ts < ?", (cutoff,))
+        return True
 
     # ---- energy ----------------------------------------------------------
 
