@@ -1323,6 +1323,67 @@ def test_start_holiday_sends_days_from_today(client: TestClient, tmp_path, monke
     assert stored["prev_setpoint"] == 21.0  # the room's target before the hold
 
 
+@pytest.mark.parametrize("asked, restore", [(22.0, 22.0), (0, None)])
+def test_start_holiday_remembers_the_target_asked_for_even_if_unconfirmed(
+    client: TestClient, tmp_path, monkeypatch, asked, restore
+):
+    # The user asked for 22 (or Off); the radiator has not confirmed it when the
+    # holiday starts. set_holiday drops that waiting setpoint, so the card goes
+    # back to the last confirmed 18. Cancelling the holiday early must restore
+    # what the user asked for, not the 18. Off stays "nothing to restore".
+    from dataclasses import replace
+
+    appmod = _with_holiday(tmp_path, monkeypatch)
+    fake = app.dependency_overrides[get_client]()
+    fake.set_temperature("1", asked)
+    real_set_holiday = fake.set_holiday
+
+    def set_holiday_dropping_the_waiting_setpoint(room_id, **kwargs):
+        fake._rooms[room_id] = replace(fake._rooms[room_id], target_temp=18.0, is_off=False)
+        real_set_holiday(room_id, **kwargs)
+
+    monkeypatch.setattr(fake, "set_holiday", set_holiday_dropping_the_waiting_setpoint)
+    resp = client.post(
+        "/zones/1/holiday",
+        data={"until": _in_days(4), "until_time": "17:30", "arrival": "program"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert appmod.holidays.get("1")["prev_setpoint"] == restore
+
+
+def test_starting_a_holiday_again_keeps_the_setpoint_to_restore(
+    client: TestClient, tmp_path, monkeypatch
+):
+    # A second submit (double click, stale tab) while the hold runs must not
+    # replace the 21 to restore with the hold's own frost level.
+    from dataclasses import replace
+
+    appmod = _with_holiday(tmp_path, monkeypatch)
+    fake = app.dependency_overrides[get_client]()
+    form = {"until_time": "17:30", "arrival": "program"}
+    client.post("/zones/1/holiday", data={**form, "until": _in_days(4)}, follow_redirects=False)
+    fake._rooms["1"] = replace(fake._rooms["1"], target_temp=7.0)  # the radiator now holds frost
+    resp = client.post("/zones/1/holiday", data={**form, "until": _in_days(6)}, follow_redirects=False)
+    assert resp.status_code == 303
+    stored = appmod.holidays.get("1")
+    assert stored["prev_setpoint"] == 21.0
+    assert stored["until"] == f"{_in_days(6)}T17:30"  # the new end still applies
+
+
+def test_a_holiday_that_has_ended_does_not_pass_on_its_setpoint(
+    client: TestClient, tmp_path, monkeypatch
+):
+    appmod = _with_holiday(tmp_path, monkeypatch)
+    appmod.holidays.set("1", until="2020-01-01T08:00", arrival_temp=None, prev_setpoint=25.0)
+    client.post(
+        "/zones/1/holiday",
+        data={"until": _in_days(4), "until_time": "17:30", "arrival": "program"},
+        follow_redirects=False,
+    )
+    assert appmod.holidays.get("1")["prev_setpoint"] == 21.0  # the room's target now
+
+
 def test_start_holiday_talks_to_the_hub_off_the_event_loop(client, tmp_path, monkeypatch):
     # A hub write can block for half a minute when the radiator is asleep. On the
     # event loop that would freeze every other request, /healthz included.

@@ -1580,6 +1580,13 @@ def start_holiday(
         return _render_schedule(
             request, zone_id, client, _NEW_EDITOR, status_code=400, holiday_error=str(exc)
         )
+    # Remember the setpoint to restore if the hold is cancelled early. Read it
+    # first: set_holiday drops a setpoint still waiting for the radiator, and the
+    # user's last request is what to restore, confirmed or not.
+    room = _find_room(client, zone_id)
+    prev = room.target_temp if (room and not room.is_off) else None
+    if _current_holiday(zone_id):  # a hold already runs: the room shows its level, keep the original
+        prev = holidays.get(zone_id)["prev_setpoint"]
     setter = getattr(client, "set_holiday", None)
     if setter is not None:
         try:
@@ -1590,9 +1597,6 @@ def start_holiday(
                 request, zone_id, client, _NEW_EDITOR, status_code=502,
                 holiday_error=f"The hub didn't accept the holiday: {exc}",
             )
-    # Remember the setpoint to restore if the hold is cancelled early.
-    room = _find_room(client, zone_id)
-    prev = room.target_temp if (room and not room.is_off) else None
     holidays.set(zone_id, until=f"{until:%Y-%m-%dT%H:%M}", arrival_temp=arrival, prev_setpoint=prev)
     return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
 

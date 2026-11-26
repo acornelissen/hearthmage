@@ -20,7 +20,7 @@ def make_client(responses: dict[str, str], names=None) -> NexhoLocalClient:
     """A client whose UDP layer is replaced by a canned-response lookup."""
     client = NexhoLocalClient("10.0.0.99", zone_names=names or {})
 
-    def fake_ask(cmd: str, retries: int, timeout: float, priority: bool = False) -> str:
+    def fake_ask(cmd: str, retries: int, timeout: float, priority: bool = False, **_) -> str:
         for prefix, resp in responses.items():
             if cmd.startswith(prefix):
                 return resp
@@ -64,7 +64,7 @@ def test_parse_status_decodes_half_degree_setpoint():
 def test_set_temperature_off_marks_zone_off():
     sent: list[str] = []
     client = NexhoLocalClient("10.0.0.99")
-    client._ask = lambda cmd, r, t, priority=False: sent.append(cmd) or "OK"  # type: ignore[method-assign]
+    client._ask = lambda cmd, r, t, priority=False, **_: sent.append(cmd) or "OK"  # type: ignore[method-assign]
     client.set_temperature("2", 0)  # Off
     room = next(r for r in client.list_rooms() if r.id == "2")
     assert room.is_off is True
@@ -85,7 +85,7 @@ def test_set_temperature_half_degree_rounds_to_nearest_half():
 def test_send_once_encodes_half_degree_on_the_wire():
     sent: list[str] = []
     client = NexhoLocalClient("10.0.0.99")
-    client._ask = lambda cmd, r, t, priority=False: sent.append(cmd) or "OK"  # type: ignore[method-assign]
+    client._ask = lambda cmd, r, t, priority=False, **_: sent.append(cmd) or "OK"  # type: ignore[method-assign]
     assert client._send_once(3, 20.5) is True
     assert sent == ["D#3#1#0#0*T148/"]
 
@@ -198,7 +198,7 @@ def _queue_write(client, zone: int, target: int) -> None:
 def test_send_once_sends_the_command():
     sent: list[str] = []
     client = NexhoLocalClient("10.0.0.99")
-    client._ask = lambda cmd, retries, timeout, priority=False: sent.append(cmd) or "OK"  # type: ignore[method-assign]
+    client._ask = lambda cmd, retries, timeout, priority=False, **_: sent.append(cmd) or "OK"  # type: ignore[method-assign]
     assert client._send_once(3, 21) is True
     assert sent == ["D#3#1#0#0*T21/"]
 
@@ -223,7 +223,7 @@ def test_rapid_writes_coalesce_to_latest_target():
     sent: list[str] = []
     client = NexhoLocalClient("10.0.0.99")
 
-    def fake_ask(cmd, retries, timeout, priority=False):
+    def fake_ask(cmd, retries, timeout, priority=False, **_):
         sent.append(cmd)
         if cmd == "D#2#1#0#0*T20/":  # user bumps to 22 while 20 is in flight
             with client._lock:
@@ -856,6 +856,7 @@ def test_setpoint_write_needs_a_bare_ok_and_resends_on_er(monkeypatch):
 
     monkeypatch.setattr(nc.time, "sleep", lambda s: None)
     client = NexhoLocalClient("10.0.0.99")
+    _queue_write(client, 1, 20.0)  # only a target still wanted is resent
     client._ask = lambda cmd, *a, **k: "OK,1"  # type: ignore[method-assign]
     assert client._send_once(1, 20.0) is False  # vendor: OK,<...> is a command error
     replies = ["ER,1", "OK"]
@@ -869,7 +870,7 @@ def test_program_write_waits_longer_and_needs_a_bare_ok():
 
     seen: list[float] = []
     client = NexhoLocalClient("10.0.0.99")
-    client._ask = lambda cmd, retries, timeout, priority=False: seen.append(timeout) or "OK"  # type: ignore[method-assign]
+    client._ask = lambda cmd, retries, timeout, priority=False, **_: seen.append(timeout) or "OK"  # type: ignore[method-assign]
     client.set_day_pattern("1", [Block(20, 0, 60)], [0])
     assert seen == [_PROGRAM_WRITE_TIMEOUT] and _PROGRAM_WRITE_TIMEOUT >= 10
     client._ask = lambda *a, **k: "OK,1"  # type: ignore[method-assign]
@@ -1390,6 +1391,201 @@ def test_a_newer_mode_command_cancels_a_setpoint_that_is_still_waiting(newer_com
     assert room.target_temp == 18.0  # back to the last confirmed target
     assert 2 not in client._pending and 2 not in client._desired
     assert sent == [22.0]  # the stale 22 was never sent again
+
+
+def _fake_hub(monkeypatch, reply):
+    """Replace the UDP socket with a hub that answers each command with
+    ``reply(cmd)``, so the real _ask and its wire lock run. Returns the list of
+    commands sent."""
+    import hearthmage.nexho_client as nc
+
+    sent: list[str] = []
+
+    class FakeSocket:
+        def __init__(self, *a):
+            self.cmd = ""
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, addr):
+            pass
+
+        def send(self, data):
+            self.cmd = data.decode("ascii")
+            sent.append(self.cmd)
+
+        def recv(self, n):
+            return reply(self.cmd).encode("ascii") + b"\x00"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(nc.socket, "socket", FakeSocket)
+    return sent
+
+
+@pytest.mark.parametrize("newer_command", ["holiday", "program_on"])
+def test_a_newer_mode_command_during_the_first_send_stops_the_old_setpoint(
+    monkeypatch, newer_command
+):
+    # heatapp-local-1y2. 22 C goes out to a sleeping radiator; while the hub is
+    # still working on it the user starts a holiday (or switches the program
+    # on). The hub answers ER, so the first send is not done yet. The old 22
+    # must not go out again after the newer command, nor be retried later.
+    import threading
+
+    first_on_air = threading.Event()
+    hub_answers = threading.Event()
+
+    def reply(cmd):
+        if "*T" not in cmd:
+            return "OK"
+        if not first_on_air.is_set():
+            first_on_air.set()
+            hub_answers.wait(2)  # the hub is still trying the radiator
+        return "ER"  # the radiator missed the RF window
+
+    sent = _fake_hub(monkeypatch, reply)
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    client.set_temperature("2", 22.0)
+    assert first_on_air.wait(2)
+    if newer_command == "holiday":
+        def newer():
+            client.set_holiday("2", days=7, hour=18, minute=0, arrival_temp=None)
+    else:
+        def newer():  # what toggle_program does: cancel, then the program goes out
+            client.cancel_waiting_setpoint("2")
+            client.set_program_active("2", True)
+    other = threading.Thread(target=newer)
+    other.start()
+    _wait_until(lambda: client._writes_pending == 2, "the newer command to queue for the wire")
+    hub_answers.set()
+    other.join(2)
+    try:
+        _wait_for_writer(client, 2)  # nothing is left to retry
+    finally:
+        client.stop()
+    newer_at = next(i for i, cmd in enumerate(sent) if "*RH" in cmd or "*ON" in cmd)
+    assert [cmd for cmd in sent[newer_at:] if "*T" in cmd] == []
+    room = client.list_rooms()[0]
+    assert (room.target_temp, room.unconfirmed) == (18.0, False)
+    assert 2 not in client._pending and 2 not in client._desired
+
+
+def test_a_cancel_while_the_hub_settles_sends_nothing(monkeypatch):
+    # The newer command comes in during the quiet gap before the send: the
+    # old 22 must not go out at all.
+    sent = _fake_hub(monkeypatch, lambda cmd: "OK")
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    _queue_write(client, 2, 22.0)
+    client._let_hub_settle = lambda: client.cancel_waiting_setpoint("2")  # type: ignore[method-assign]
+    client._send_once(2, 22.0)
+    assert sent == []
+
+
+def test_a_withdrawn_setpoint_does_not_wait_out_the_er_gap(monkeypatch):
+    # Nothing more will be sent, so there is nothing to wait for; a newer tap
+    # must not sit behind a pointless 3 s pause.
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc, "_ER_GAP", 3.0)
+    slept: list[float] = []
+    monkeypatch.setattr(nc.time, "sleep", slept.append)
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    _queue_write(client, 2, 22.0)
+
+    def reply(cmd):
+        client.cancel_waiting_setpoint("2")  # a holiday arrives while the hub tries
+        return "ER"
+
+    sent = _fake_hub(monkeypatch, reply)
+    client._send_once(2, 22.0)
+    assert len(sent) == 1
+    assert 3.0 not in slept
+
+
+def test_a_withdrawn_send_is_not_counted_as_a_failed_one(monkeypatch):
+    # 22 is cancelled mid-send, then the user asks for 22 again before the
+    # worker looks. That is a new request: no "not confirmed" mark and no
+    # longer backoff for a send that the hub never refused.
+    import hearthmage.nexho_client as nc
+
+    def t_sends():
+        return len([cmd for cmd in sent if "*T" in cmd])
+
+    waits: list[tuple[int, int]] = []  # (failures, *T sends so far) per retry wait
+    monkeypatch.setattr(
+        nc, "_setpoint_retry_wait", lambda failures: waits.append((failures, t_sends())) or 1000.0
+    )
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+
+    def reply(cmd):
+        if t_sends() == 1:
+            client.cancel_waiting_setpoint("2")  # a holiday arrives while the hub tries
+        return "ER"
+
+    sent = _fake_hub(monkeypatch, reply)
+    real_send = client._send_once
+    tapped: list[int] = []
+
+    def send_then_tap_again(zone, target):
+        result = real_send(zone, target)
+        if not tapped:
+            tapped.append(1)
+            client.set_temperature("2", 22.0)  # before the worker takes the lock again
+        return result
+
+    client._send_once = send_then_tap_again  # type: ignore[method-assign]
+    client.set_temperature("2", 22.0)
+    try:
+        _wait_until(lambda: waits, "the first retry wait")
+    finally:
+        client.stop()
+        _wait_for_writer(client, 2)
+    # The first failure counted is the re-sent 22 the hub answered ER to.
+    assert waits[0] == (1, 1 + nc._ER_ATTEMPTS)
+
+
+def test_a_finished_worker_does_not_unregister_the_next_one():
+    # Worker A has its ack and has left the zone. Before its cleanup runs, a
+    # new target starts worker B. A's cleanup must not unregister B, or the
+    # poller would think the zone idle and drop B's pending target.
+    import threading
+
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    _scripted_sends(client, {22.0: [True], 23.0: [False]})
+    _queue_write(client, 2, 22.0)
+    real_lock = client._lock
+    main = threading.current_thread()
+    tapped: list[int] = []
+
+    class LockThatLetsATapIn:
+        def __enter__(self):
+            real_lock.acquire()
+
+        def __exit__(self, *exc):
+            real_lock.release()
+            if not tapped and threading.current_thread() is main and 2 not in client._writers:
+                tapped.append(1)
+                client.set_temperature("2", 23.0)  # worker B starts
+
+    client._lock = LockThatLetsATapIn()  # type: ignore[assignment]
+    client._drain_writes(2)  # worker A: 22 is acknowledged
+    try:
+        assert tapped
+        assert 2 in client._writers  # B is still the zone's writer
+        client._read_zone_raw = lambda zone: (19.4, 18.0, True)  # type: ignore[method-assign]
+        client._poll_zone(2)
+        assert client._pending.get(2) == 23.0  # the poller kept B's target
+    finally:
+        client.stop()
+        _wait_for_writer(client, 2)
 
 
 def test_history_and_mqtt_are_not_told_a_target_from_before_a_write():

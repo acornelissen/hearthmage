@@ -80,6 +80,10 @@ _MAX_TEMP = 30.0
 _OFF_TEMP = 1.0
 
 
+class _Withdrawn(Exception):
+    """A command stopped before it went out again, because it is no longer wanted."""
+
+
 class NexhoLocalClient:
     """Local UDP adapter for the Farho "Nexho NT" hub, backed by a poller.
 
@@ -214,13 +218,22 @@ class NexhoLocalClient:
                 if self._writes_pending == 0:
                     self._io_cond.notify_all()
 
-    def _ask(self, cmd: str, retries: int, timeout: float, priority: bool = False) -> str:
+    def _ask(
+        self, cmd: str, retries: int, timeout: float, priority: bool = False, still_wanted=None
+    ) -> str:
+        """Send ``cmd`` and return the hub's reply. ``still_wanted``, if given, is
+        asked with the wire held before every send; once it says no, nothing more
+        goes out and _Withdrawn is raised. Checking with the wire held matters: a
+        command that withdraws this one and then takes the wire is never followed
+        by it."""
         self._wire_acquire(priority)
         try:
             last_exc: Exception | None = None
             for _ in range(retries):
                 sock = None
                 self._let_hub_settle()
+                if still_wanted is not None and not still_wanted():  # last check before sending
+                    raise _Withdrawn(cmd)
                 started = time.monotonic()
                 try:
                     # Socket creation is inside the try so an OSError here (e.g. fd
@@ -263,19 +276,22 @@ class NexhoLocalClient:
 
     def _ask_until_answered(
         self, cmd: str, ok_prefix: str, priority: bool,
-        retries: int | None = None, timeout: float | None = None,
+        retries: int | None = None, timeout: float | None = None, still_wanted=None,
     ) -> str:
         """Send ``cmd``, resending after a short gap while the hub answers ER
         (radiator missed the RF window). The wire is released between attempts
-        so other traffic is not blocked. Returns the last reply."""
+        so other traffic is not blocked. Returns the last reply. See ``_ask``
+        for ``still_wanted``."""
         default = (_WRITE_RETRIES, _WRITE_TIMEOUT) if priority else (_READ_RETRIES, _READ_TIMEOUT)
         retries = retries if retries is not None else default[0]
         timeout = timeout if timeout is not None else default[1]
         resp = ""
         for attempt in range(_ER_ATTEMPTS):
-            resp = self._ask(cmd, retries, timeout, priority=priority)
+            resp = self._ask(cmd, retries, timeout, priority=priority, still_wanted=still_wanted)
             if resp.startswith(ok_prefix) or not resp.startswith("ER"):
                 return resp
+            if still_wanted is not None and not still_wanted():
+                raise _Withdrawn(cmd)  # nothing more to send, so no gap to wait out
             if attempt + 1 < _ER_ATTEMPTS:
                 _log.debug("hub %s -> %s; retrying in %.0fs", cmd, resp, _ER_GAP)
                 time.sleep(_ER_GAP)
@@ -645,11 +661,14 @@ class NexhoLocalClient:
         newer command for the zone (a holiday, the weekly program switched on)
         is about to be sent. Otherwise the old setpoint would be re-sent after
         the new command and override it, e.g. heat the room for a whole absence.
-        A first send that is simply in flight is left alone: it lands first."""
+        This holds for a first send still in flight too: the hub may be resending
+        it on ER, and _send_once sends nothing more once it is dropped here. A
+        datagram already on the air is answered before the newer command goes out
+        (one conversation on the wire at a time)."""
         zone = _zone_int(room_id)
         with self._lock:
-            if zone not in self._unconfirmed:
-                return
+            if zone not in self._desired:
+                return  # no setpoint waiting to be sent or re-sent
             target = self._desired.pop(zone, None)
             self._pending.pop(zone, None)
             self._unconfirmed.discard(zone)
@@ -727,19 +746,26 @@ class NexhoLocalClient:
         sent again after a growing wait. It is never dropped silently: after
         _SETPOINT_GIVE_UP_AFTER it is dropped with a message on the card."""
         failures = 0
+        # True while this worker is the zone's registered writer. Once it has
+        # discarded itself (under _lock) a new worker may register, and the
+        # finally below must not unregister that one.
+        registered = True
         try:
             while not self._stop.is_set():
                 with self._lock:
                     target = self._desired.get(zone)
                     if target is None:
                         self._writers.discard(zone)  # atomic with the empty check
+                        registered = False
                         return
                     self._write_kick.discard(zone)
                 ok = self._send_once(zone, target)
                 with self._lock:
-                    if self._desired.get(zone) != target:
+                    if ok is None or self._desired.get(zone) != target:
+                        # Superseded by a newer tap, or withdrawn and then asked
+                        # for again: a new request, so loop to send the latest.
                         failures = 0
-                        continue  # superseded by a newer tap; loop to send the latest
+                        continue
                     prev = self._state.get(zone)
                     current = prev.current_temp if prev else None
                     if ok:
@@ -750,6 +776,7 @@ class NexhoLocalClient:
                         self._pending.pop(zone, None)  # confirmed - release poll guard
                         self._state[zone] = self._room(zone, current, float(target), "ok")
                         self._writers.discard(zone)
+                        registered = False
                         return
                     # No ack. Give up if it has been too long since the user
                     # asked: the card goes back to the last confirmed target and
@@ -768,6 +795,7 @@ class NexhoLocalClient:
                             zone, last[0] if last else current, last[1] if last else None, "ok"
                         )
                         self._writers.discard(zone)
+                        registered = False
                         _log.warning(
                             "zone %s setpoint %s given up: not acknowledged for %.0f min",
                             zone, target, _SETPOINT_GIVE_UP_AFTER / 60,
@@ -786,7 +814,8 @@ class NexhoLocalClient:
             # the loop raised unexpectedly, or no future write to it would ever
             # be sent (set_temperature would assume a worker is running).
             with self._lock:
-                self._writers.discard(zone)
+                if registered:
+                    self._writers.discard(zone)
 
     def _wait_to_retry(self, zone: int, target: float, wait: float) -> None:
         """Sleep before re-sending ``target``, but wake at once if a newer
@@ -803,19 +832,33 @@ class NexhoLocalClient:
         with self._write_wake:
             self._write_wake.wait_for(wake, timeout=wait)
 
-    def _send_once(self, zone: int, target: float) -> bool:
+    def _send_once(self, zone: int, target: float) -> bool | None:
         """Send one setpoint command; True if the hub acknowledged. ``target`` is
         the display temperature (_OFF_TEMP = off); it is encoded to the wire value here.
-        Resending the same target is idempotent - the radiator ends at that value."""
+        Resending the same target is idempotent - the radiator ends at that value.
+        Nothing more is sent once ``target`` is no longer the zone's desired one
+        (a newer target, or cancel_waiting_setpoint); that returns None, which
+        is not a refusal by the hub."""
         wire = _encode_setpoint(target)
+
+        def still_wanted() -> bool:
+            with self._lock:
+                return self._desired.get(zone) == target
+
         try:
-            resp = self._ask_until_answered(f"D#{zone}#{self._modules(zone)}#0#0*T{wire}/", "OK", priority=True)
+            resp = self._ask_until_answered(
+                f"D#{zone}#{self._modules(zone)}#0#0*T{wire}/", "OK", priority=True,
+                still_wanted=still_wanted,
+            )
             acked = resp == "OK"  # the vendor treats "OK,<...>" as a command error
             if acked:
                 _log.info("zone %s setpoint %s acknowledged", zone, target)
             else:
                 _log.warning("zone %s setpoint %s not acknowledged: %s", zone, target, resp)
             return acked
+        except _Withdrawn:
+            _log.info("zone %s setpoint %s not sent again: replaced", zone, target)
+            return None
         except HearthError:
             _log.warning("zone %s setpoint %s: no response from hub", zone, target)
             return False
