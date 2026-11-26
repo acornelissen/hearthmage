@@ -177,6 +177,71 @@ def _wire_for(addr: tuple[str, int]) -> _Wire:
         return wire
 
 
+def _settle(wire: _Wire) -> None:
+    """Wait out the quiet gap after the hub's last reply (see
+    ``_HUB_QUIET_GAP``), whichever client it replied to. Called with
+    ``wire.lock`` held."""
+    replied_at = wire.replied_at
+    if replied_at is None:
+        return
+    wait = replied_at + _HUB_QUIET_GAP - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+
+
+class WireBusy(Exception):
+    """The hub's wire stayed taken for the whole wait. ``zone_list_at`` is when
+    the hub last answered the running client's zone list (monotonic), or None
+    if no client is running or it never has."""
+
+    def __init__(self, zone_list_at: float | None) -> None:
+        super().__init__("the hub's wire is busy")
+        self.zone_list_at = zone_list_at
+
+
+def _busy(wire: _Wire) -> WireBusy:
+    with wire.clients:
+        owner = wire.owner
+    # A float read: a hint, no client lock needed.
+    return WireBusy(owner._last_ops2_ok if owner is not None else None)
+
+
+def exchange_on_wire(addr: tuple[str, int], exchange, wait: float, create: bool = False):
+    """Run ``exchange()`` (one query to the hub at ``addr``, returning its
+    reply or None) as a read on that hub's wire: after any pending write, with
+    the wire held, the quiet gap waited out first and its clock restarted
+    after, so neither side's next query gets the other's reply. The clock
+    restarts after a timeout too: the hub may still answer late. (``_ask`` does
+    not do that yet; see bead heatapp-local-41n.) For use from outside a client
+    (discovery).
+
+    With no wire for ``addr`` (no client in this process has talked to it) it
+    just runs, unless ``create``: then the wire is made first, so a client
+    built for that hub meanwhile waits for this exchange. Raises WireBusy if
+    the wire is not free within ``wait`` seconds."""
+    with _wires_lock:
+        wire = _wires.get(addr)
+    if wire is None:
+        if not create:
+            return exchange()
+        wire = _wire_for(addr)
+    deadline = time.monotonic() + wait
+    with wire.cond:  # reads yield to writes, as in _wire_acquire
+        while wire.writes_pending > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _busy(wire)
+            wire.cond.wait(remaining)
+    if not wire.lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise _busy(wire)
+    try:
+        _settle(wire)
+        return exchange()
+    finally:
+        wire.replied_at = time.monotonic()  # answered or not (see above)
+        wire.lock.release()
+
+
 class NexhoLocalClient:
     """Local UDP adapter for the Farho "Nexho NT" hub, backed by a poller.
 
@@ -385,12 +450,7 @@ class NexhoLocalClient:
         """Wait out the quiet gap after the hub's last reply (see
         ``_HUB_QUIET_GAP``), whichever client it replied to. Called with the
         wire held."""
-        replied_at = self._wire.replied_at
-        if replied_at is None:
-            return
-        wait = replied_at + _HUB_QUIET_GAP - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
+        _settle(self._wire)
 
     def _ask_until_answered(
         self, cmd: str, ok_prefix: str, priority: bool,

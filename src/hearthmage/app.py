@@ -1206,8 +1206,10 @@ def disable_mqtt() -> RedirectResponse:
 def discover_hub(request: Request) -> HTMLResponse:
     from hearthmage.discovery import discover_local
 
+    # The configured hub's probe waits its turn on the hub's wire (see discovery).
+    hub = (settings.hub_ip, settings.hub_port) if settings.hub_ip else None
     try:
-        hubs = discover_local()
+        hubs = discover_local(hub=hub)
     except OSError:
         hubs = []  # no usable network interface; fall back to manual entry
     return templates.TemplateResponse(request, "_discover.html", {"hubs": hubs})

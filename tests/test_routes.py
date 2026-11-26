@@ -218,6 +218,28 @@ def test_discover_handles_no_hub_found(tmp_path, monkeypatch):
     assert "No hub found" in resp.text
 
 
+def test_discover_probes_the_configured_hub_through_its_wire(tmp_path, monkeypatch):
+    # The configured hub is handed to the sweep, so its probe takes the hub's
+    # wire instead of talking over the poller.
+    _configured(tmp_path, monkeypatch)
+    import hearthmage.discovery as disc
+
+    seen = []
+    monkeypatch.setattr(disc, "discover_local", lambda *a, **k: seen.append(k) or [])
+    TestClient(app).get("/settings/discover")
+    assert seen == [{"hub": ("10.0.0.20", 6653)}]
+
+
+def test_discover_with_no_hub_configured_names_none(tmp_path, monkeypatch):
+    _unconfigured(tmp_path, monkeypatch)
+    import hearthmage.discovery as disc
+
+    seen = []
+    monkeypatch.setattr(disc, "discover_local", lambda *a, **k: seen.append(k) or [])
+    TestClient(app).get("/settings/discover")
+    assert seen == [{"hub": None}]
+
+
 def test_save_hub_persists_and_redirects_home(tmp_path, monkeypatch):
     appmod = _unconfigured(tmp_path, monkeypatch)
     resp = TestClient(app).post(

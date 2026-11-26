@@ -102,9 +102,11 @@ port-forward the app or the hub on your router.
 The app needs no configuration to start. On the first visit it detects that no
 hub is set and redirects you to the settings page, where you either:
 
-- press **Scan network** to discover the hub automatically — it sweeps your /24
-  with one `OPS1/` UDP probe per address and lists any hub it finds with its IDU
-  serial, so you can pick it with one click; or
+- press **Scan network** to discover the hub automatically — it sweeps the /24
+  of each LAN interface (at most four; VPN, tunnel, point-to-point and
+  Docker/VM bridge interfaces are skipped) with one `OPS1/` UDP probe per
+  address and lists any hub it finds with its IDU serial, so you can pick it
+  with one click; or
 - type the hub's IP by hand (find it in your router's DHCP table and reserve a
   static lease — the hub drops all TCP but answers UDP `OPS1/` on port 6653).
 
