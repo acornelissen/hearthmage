@@ -56,12 +56,21 @@
             <label class="field-label" for="hub_ip">Hub IP address</label>
             <input class="field-input" id="hub_ip" name="hub_ip" value="{{ hub_ip or '' }}"
                    placeholder="10.0.0.20" inputmode="decimal" required
-                   {% if not hub_ip and not mqtt_error %}autofocus{% endif %}>
+                   {% if hub_ip_error %}aria-invalid="true" aria-describedby="hub_ip_error"{% endif %}
+                   {% if focus == 'hub_ip' or (not hub_ip and not mqtt_error and not focus) %}autofocus{% endif %}>
+            {% if hub_ip_error %}
+            <p class="error" id="hub_ip_error" role="alert">{{ hub_ip_error }}</p>
+            {% endif %}
           </div>
           <div class="field">
             <label class="field-label" for="hub_port">Port</label>
             <input class="field-input" id="hub_port" name="hub_port" type="number"
-                   value="{{ hub_port }}" min="1" max="65535">
+                   value="{{ hub_port }}" min="1" max="65535"
+                   {% if hub_port_error %}aria-invalid="true" aria-describedby="hub_port_error"{% endif %}
+                   {% if focus == 'hub_port' %}autofocus{% endif %}>
+            {% if hub_port_error %}
+            <p class="error" id="hub_port_error" role="alert">{{ hub_port_error }}</p>
+            {% endif %}
           </div>
         </div>
         <button type="submit" class="btn">Save hub</button>
@@ -107,7 +116,12 @@
           <div class="field">
             <label class="field-label" for="mqtt_host">Broker host</label>
             <input class="field-input" id="mqtt_host" name="host"
-                   value="{{ mqtt_host or '' }}" placeholder="10.0.0.5" required>
+                   value="{{ mqtt_host or '' }}" placeholder="10.0.0.5" required
+                   {% if mqtt_host_error %}aria-invalid="true" aria-describedby="mqtt_host_error"{% endif %}
+                   {% if focus == 'mqtt_host' %}autofocus{% endif %}>
+            {% if mqtt_host_error %}
+            <p class="error" id="mqtt_host_error" role="alert">{{ mqtt_host_error }}</p>
+            {% endif %}
           </div>
           <div class="field">
             <label class="field-label" for="mqtt_port">Port</label>

@@ -84,11 +84,11 @@ def test_restore_bundle_backs_up_existing_before_overwrite(tmp_path):
     _write(cfg, {"hub_ip": "old"})
     _write(sched, {"1": {}})
     restore_bundle(
-        {"hearthmage_backup": 1, "config": {"hub_ip": "new"}, "schedules": {"9": {}}},
+        {"hearthmage_backup": 1, "config": {"hub_ip": "10.0.0.2"}, "schedules": {"9": {}}},
         str(cfg),
         str(sched),
     )
-    assert json.loads(cfg.read_text())["hub_ip"] == "new"
+    assert json.loads(cfg.read_text())["hub_ip"] == "10.0.0.2"
     # the pre-restore config is recoverable from a backup
     assert list_backups(str(cfg))  # at least one snapshot of the old file
 
@@ -102,7 +102,7 @@ def test_restore_bundle_skips_absent_sections(tmp_path):
     cfg = tmp_path / "config.json"
     sched = tmp_path / "schedules.json"
     _write(sched, {"1": {}})
-    restore_bundle({"hearthmage_backup": 1, "config": {"hub_ip": "x"}}, str(cfg), str(sched))
+    restore_bundle({"hearthmage_backup": 1, "config": {"hub_ip": "10.0.0.2"}}, str(cfg), str(sched))
     assert cfg.exists()  # config written
     assert json.loads(sched.read_text()) == {"1": {}}  # schedules untouched (absent in bundle)
 
@@ -194,7 +194,7 @@ def test_restore_bundle_rejects_invalid_schedules_without_writing(tmp_path):
     ):
         with pytest.raises(ValueError):
             restore_bundle(
-                {"hearthmage_backup": 1, "config": {"hub_ip": "new"}, "schedules": bad},
+                {"hearthmage_backup": 1, "config": {"hub_ip": "10.0.0.2"}, "schedules": bad},
                 str(cfg),
                 str(sched),
             )
@@ -306,3 +306,46 @@ def test_restore_bundle_accepts_usual_port_forms(tmp_path):
                    {"mqtt": {"host": "h"}}, {"mqtt": {"host": "h", "port": None}}):
         restore_bundle({"hearthmage_backup": 1, "config": config},
                        str(cfg), str(tmp_path / "schedules.json"))
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"hub_ip": "8.8.8.8"},
+        {"hub_ip": "100.64.0.7"},  # Tailscale is not the home LAN
+        {"hub_ip": "nexho.local"},  # the hub is an IPv4 literal, not a name
+        {"hub_ip": 167772161},
+        {"hub_ip": ["10.0.0.2"]},
+        {"mqtt": {"host": "mqtt.example.com"}},
+        {"mqtt": {"host": "2001:db8::1"}},
+        {"mqtt": {"host": "134744072"}},
+        {"mqtt": {"host": {"a": 1}}},
+        {"hub_ip": "10.0.0.2", "mqtt": {"host": "100.64.0.9"}},
+    ],
+)
+def test_restore_bundle_rejects_an_address_off_the_lan_without_writing(tmp_path, config):
+    # An import is untrusted input: it must not point the hub's UDP or the
+    # broker's TCP connection outside the LAN.
+    from hearthmage.lan import AddressRejected
+
+    cfg = tmp_path / "config.json"
+    sched = tmp_path / "schedules.json"
+    _write(cfg, {"hub_ip": "10.0.0.1"})
+    with pytest.raises(AddressRejected):
+        restore_bundle({"hearthmage_backup": 1, "config": config, "schedules": {"9": {}}},
+                       str(cfg), str(sched))
+    assert json.loads(cfg.read_text()) == {"hub_ip": "10.0.0.1"}
+    assert not sched.exists()  # the whole import is refused, schedules too
+
+
+def test_restore_bundle_accepts_lan_addresses_and_unset_ones(tmp_path):
+    cfg = tmp_path / "config.json"
+    for config in (
+        {"hub_ip": "192.168.1.20", "mqtt": {"host": "mqtt.local"}},
+        {"hub_ip": "172.16.0.9", "mqtt": {"host": "localhost"}},
+        {"hub_ip": "", "mqtt": {"host": ""}},
+        {"hub_ip": None, "mqtt": {}},
+    ):
+        restore_bundle({"hearthmage_backup": 1, "config": config},
+                       str(cfg), str(tmp_path / "schedules.json"))
+        assert json.loads(cfg.read_text()) == config

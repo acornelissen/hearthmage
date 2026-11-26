@@ -93,14 +93,14 @@ on their own.
 | Var | Meaning | Default |
 | --- | --- | --- |
 | `HEARTHMAGE_CONFIG_FILE` | Config file location (readings and schedules are stored beside it) | `~/.config/hearthmage/config.json` |
-| `HEARTHMAGE_BASE_IP` | Hub LAN IP (seed; the UI-saved value wins) | — |
+| `HEARTHMAGE_BASE_IP` | Hub LAN IP (seed; the UI-saved value wins). Must be an IPv4 address in 10/8, 172.16/12 or 192.168/16; anything else is ignored with a warning | — |
 | `HEARTHMAGE_HUB_PORT` | Hub UDP port | `6653` |
 | `HEARTHMAGE_ZONE_NAMES` | `id:name` pairs, comma-separated | zones show as "Zone N" |
 | `HEARTHMAGE_BIND` / `HEARTHMAGE_PORT` | Web server bind / port | `0.0.0.0` / `8080` |
 | `HEARTHMAGE_FAKE=1` | In-memory demo data, no hub | off |
 | `HEARTHMAGE_LOG_LEVEL` | Log verbosity (`DEBUG`/`INFO`/`WARNING`) | `INFO` |
 | `HEARTHMAGE_PRICE_PER_KWH` | Unit price seed for cost estimates | `0` |
-| `HEARTHMAGE_MQTT_HOST` | MQTT broker host (enables the HA bridge) | off |
+| `HEARTHMAGE_MQTT_HOST` | MQTT broker host (enables the HA bridge). A 10/8, 172.16/12 or 192.168/16 address, loopback, or a single-label, `.local`, `.lan`, `.home.arpa` or `.internal` name; anything else is ignored with a warning | off |
 | `HEARTHMAGE_MQTT_PORT` / `_USERNAME` / `_PASSWORD` | Broker port and credentials | `1883` / — / — |
 | `HEARTHMAGE_MQTT_BASE_TOPIC` / `_NODE_ID` | Topic prefix and device node id | `hearthmage` / `hub` |
 | `HEARTHMAGE_PASSWORD` | Require this password to use the app | off (open) |

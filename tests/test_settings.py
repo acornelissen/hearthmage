@@ -448,3 +448,114 @@ def test_set_mqtt_with_a_non_finite_port_stores_the_default(tmp_path):
     path = str(tmp_path / "c.json")
     Settings(path, env={}).set_mqtt("10.0.0.5", float("inf"), "", "keep", "")
     assert Settings(path, env={}).mqtt_config()["port"] == 1883
+
+
+# ---- LAN-only addresses: the hub and the broker must stay on the home network --
+
+
+@pytest.mark.parametrize("ip", ["8.8.8.8", "100.64.0.7", "hub.local", "::1", "127.0.0.1", ""])
+def test_set_hub_refuses_an_address_off_the_lan_and_writes_nothing(tmp_path, ip):
+    from hearthmage.lan import AddressRejected
+
+    path = tmp_path / "c.json"
+    with pytest.raises(AddressRejected) as caught:
+        Settings(str(path), env={}).set_hub(ip, 6653)
+    assert caught.value.field == "hub_ip"
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("port", [0, 70000, "x", "", float("inf")])
+def test_set_hub_refuses_an_unusable_port_and_writes_nothing(tmp_path, port):
+    from hearthmage.lan import AddressRejected
+
+    path = tmp_path / "c.json"
+    Settings(str(path), env={}).set_hub("10.0.0.20", 6653)
+    before = path.read_text()
+    with pytest.raises(AddressRejected) as caught:
+        Settings(str(path), env={}).set_hub("10.0.0.21", port)
+    assert caught.value.field == "hub_port"
+    assert path.read_text() == before
+
+
+def test_set_hub_takes_the_port_as_form_text(tmp_path):
+    path = str(tmp_path / "c.json")
+    Settings(path, env={}).set_hub(" 192.168.1.20 ", "6654")
+    s = Settings(path, env={})
+    assert (s.hub_ip, s.hub_port) == ("192.168.1.20", 6654)
+    import json as _json
+    assert _json.loads((tmp_path / "c.json").read_text())["hub_port"] == 6654
+
+
+@pytest.mark.parametrize("host", ["8.8.8.8", "100.64.0.7", "mqtt.example.com", "2001:db8::1", "134744072"])
+def test_set_mqtt_refuses_a_broker_off_the_lan_and_writes_nothing(tmp_path, host):
+    from hearthmage.lan import AddressRejected
+
+    path = tmp_path / "c.json"
+    Settings(str(path), env={}).set_mqtt("10.0.0.5", 1883, "u", "set", "sekret")
+    before = path.read_text()
+    for action in ("set", "keep", "clear"):
+        with pytest.raises(AddressRejected) as caught:
+            Settings(str(path), env={}).set_mqtt(host, 1883, "u", action, "new")
+        assert caught.value.field == "host"
+    assert path.read_text() == before
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "mosquitto", "mqtt.lan", "192.168.1.9"])
+def test_set_mqtt_accepts_a_lan_or_same_box_broker(tmp_path, host):
+    path = str(tmp_path / "c.json")
+    Settings(path, env={}).set_mqtt(host, 1883, "", "keep", "")
+    assert Settings(path, env={}).mqtt_config()["host"] == host
+
+
+def _settings_warnings(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.name == "hearthmage.settings" and r.levelname == "WARNING"]
+
+
+def test_an_env_hub_address_off_the_lan_is_ignored_with_a_warning(tmp_path, caplog):
+    with caplog.at_level("WARNING", logger="hearthmage.settings"):
+        s = Settings(str(tmp_path / "c.json"), env={"HEARTHMAGE_BASE_IP": "8.8.8.8"})
+    assert s.hub_ip is None
+    assert not s.is_configured()
+    assert any("HEARTHMAGE_BASE_IP" in m and "8.8.8.8" in m for m in _settings_warnings(caplog))
+
+
+def test_an_env_broker_off_the_lan_is_ignored_with_a_warning(tmp_path, caplog):
+    env = {"HEARTHMAGE_MQTT_HOST": "mqtt.example.com", "HEARTHMAGE_MQTT_PASSWORD": "envpass"}
+    with caplog.at_level("WARNING", logger="hearthmage.settings"):
+        s = Settings(str(tmp_path / "c.json"), env=env)
+    assert s.mqtt_config() is None
+    assert s.mqtt_enabled is False
+    assert any("HEARTHMAGE_MQTT_HOST" in m for m in _settings_warnings(caplog))
+
+
+def test_good_env_and_stored_addresses_log_nothing(tmp_path, caplog):
+    path = tmp_path / "c.json"
+    path.write_text('{"hub_ip": "10.0.0.20", "mqtt": {"host": "mqtt.local"}}')
+    with caplog.at_level("WARNING", logger="hearthmage.settings"):
+        Settings(str(path), env={"HEARTHMAGE_BASE_IP": "10.0.0.21", "HEARTHMAGE_MQTT_HOST": "broker"})
+    assert _settings_warnings(caplog) == []
+
+
+def test_a_stored_address_off_the_lan_is_kept_but_warned_about(tmp_path, caplog):
+    # A config saved before the LAN check keeps working (the owner may have a
+    # name that resolves to the LAN); the settings page and the log say so.
+    path = tmp_path / "c.json"
+    path.write_text('{"hub_ip": "nexho.example.com", "mqtt": {"host": "100.64.0.9"}}')
+    with caplog.at_level("WARNING", logger="hearthmage.settings"):
+        s = Settings(str(path), env={})
+    assert s.hub_ip == "nexho.example.com"
+    assert s.mqtt_config()["host"] == "100.64.0.9"
+    assert s.hub_ip_on_lan is False
+    assert s.mqtt_host_on_lan is False
+    warnings = _settings_warnings(caplog)
+    assert any("nexho.example.com" in m for m in warnings)
+    assert any("100.64.0.9" in m for m in warnings)
+
+
+def test_lan_flags_are_true_when_nothing_or_a_lan_address_is_set(tmp_path):
+    s = Settings(str(tmp_path / "c.json"), env={})
+    assert (s.hub_ip_on_lan, s.mqtt_host_on_lan) == (True, True)
+    s.set_hub("10.0.0.20", 6653)
+    s.set_mqtt("mqtt.local", 1883, "", "keep", "")
+    assert (s.hub_ip_on_lan, s.mqtt_host_on_lan) == (True, True)

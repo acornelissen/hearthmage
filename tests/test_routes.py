@@ -230,6 +230,68 @@ def test_save_hub_persists_and_redirects_home(tmp_path, monkeypatch):
     assert appmod.settings.hub_ip == "10.0.0.20"
 
 
+@pytest.mark.parametrize("ip", ["8.8.8.8", "100.64.0.7", "nexho.example.com", "2001:db8::1"])
+def test_save_hub_off_the_lan_shows_an_accessible_error_and_saves_nothing(tmp_path, monkeypatch, ip):
+    appmod = _unconfigured(tmp_path, monkeypatch)
+    drops: list[bool] = []
+    monkeypatch.setattr(appmod, "_drop_client", lambda: drops.append(True))
+    resp = TestClient(app).post(
+        "/settings/hub", data={"hub_ip": ip, "hub_port": "6653"}, follow_redirects=False
+    )
+    assert resp.status_code == 400
+    assert 'id="hub_ip_error" role="alert"' in resp.text
+    assert 'aria-describedby="hub_ip_error"' in resp.text
+    assert 'aria-invalid="true"' in resp.text
+    assert f'value="{ip}"' in resp.text  # what the user typed is kept
+    assert appmod.settings.hub_ip is None
+    assert not (tmp_path / "c.json").exists()
+    assert not drops
+
+
+@pytest.mark.parametrize("port", ["70000", "0", "x", "-1", "6653.5"])
+def test_save_hub_with_a_bad_port_shows_a_form_error_not_a_422(tmp_path, monkeypatch, port):
+    appmod = _unconfigured(tmp_path, monkeypatch)
+    resp = TestClient(app).post(
+        "/settings/hub", data={"hub_ip": "10.0.0.20", "hub_port": port}, follow_redirects=False
+    )
+    assert resp.status_code == 400
+    assert 'id="hub_port_error" role="alert"' in resp.text
+    assert 'aria-describedby="hub_port_error"' in resp.text
+    assert 'value="10.0.0.20"' in resp.text
+    assert appmod.settings.hub_ip is None
+
+
+def test_save_hub_with_a_blank_port_uses_the_default(tmp_path, monkeypatch):
+    appmod = _unconfigured(tmp_path, monkeypatch)
+    resp = TestClient(app).post(
+        "/settings/hub", data={"hub_ip": "10.0.0.20", "hub_port": ""}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+    assert (appmod.settings.hub_ip, appmod.settings.hub_port) == ("10.0.0.20", 6653)
+
+
+def test_settings_page_warns_about_a_stored_hub_off_the_lan(tmp_path, monkeypatch):
+    (tmp_path / "c.json").write_text('{"hub_ip": "nexho.example.com"}')
+    appmod = _unconfigured(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())  # no real hub
+    resp = TestClient(app).get("/settings")
+    assert resp.status_code == 200
+    assert 'id="hub_ip_error" role="alert"' in resp.text
+    assert 'aria-describedby="hub_ip_error"' in resp.text
+    assert "not on your local network" in resp.text
+    assert 'value="nexho.example.com"' in resp.text  # still shown, still in use
+
+
+def test_settings_page_has_no_address_warning_for_lan_addresses(tmp_path, monkeypatch):
+    (tmp_path / "c.json").write_text('{"hub_ip": "10.0.0.20", "mqtt": {"host": "mqtt.local"}}')
+    appmod = _unconfigured(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())  # no real hub
+    resp = TestClient(app).get("/settings")
+    assert "hub_ip_error" not in resp.text
+    assert "mqtt_host_error" not in resp.text
+    assert 'aria-invalid' not in resp.text
+
+
 # ---- auth -----------------------------------------------------------------
 
 
@@ -2305,3 +2367,84 @@ def test_settings_page_lazy_loads_the_cloud_section(client, tmp_path, monkeypatc
     assert 'hx-get="/settings/cloud"' not in client.get("/settings").text  # no hub yet
     appmod.settings.set_hub("10.0.0.5", 6653)
     assert 'hx-get="/settings/cloud"' in client.get("/settings").text
+
+
+# ---- LAN-only broker and import --------------------------------------------
+
+
+@pytest.mark.parametrize("host", ["8.8.8.8", "100.64.0.7", "mqtt.example.com", "2001:db8::1"])
+def test_save_mqtt_off_the_lan_shows_an_accessible_error_and_saves_nothing(tmp_path, monkeypatch, host):
+    appmod, restarts = _mqtt_env(tmp_path, monkeypatch)
+    resp = TestClient(app).post(
+        "/settings/mqtt",
+        data={"host": host, "port": "1883", "username": "u", "password": "p",
+              "base_topic": "hearthmage"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert 'id="mqtt_host_error" role="alert"' in resp.text
+    assert 'aria-describedby="mqtt_host_error"' in resp.text
+    assert 'aria-invalid="true"' in resp.text
+    assert f'value="{host}"' in resp.text
+    assert "mqtt_password_error" not in resp.text  # the password is not the problem
+    assert not restarts
+    assert not (tmp_path / "c.json").exists()
+
+
+def test_settings_page_warns_about_a_stored_broker_off_the_lan(tmp_path, monkeypatch):
+    (tmp_path / "c.json").write_text('{"mqtt": {"host": "100.64.0.9"}}')
+    _mqtt_env(tmp_path, monkeypatch)
+    resp = TestClient(app).get("/settings")
+    assert resp.status_code == 200
+    assert 'id="mqtt_host_error" role="alert"' in resp.text
+    assert 'aria-describedby="mqtt_host_error"' in resp.text
+    assert "not on your local network" in resp.text
+    assert 'value="100.64.0.9"' in resp.text
+
+
+@pytest.mark.parametrize(
+    "config", [{"hub_ip": "8.8.8.8"}, {"mqtt": {"host": "mqtt.example.com", "port": 1883}}]
+)
+def test_import_with_an_address_off_the_lan_is_rejected(tmp_path, monkeypatch, config):
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    appmod.settings.set_hub("10.0.0.20", 6653)
+    before = (tmp_path / "c.json").read_text()
+    bundle = {"hearthmage_backup": 1, "config": config}
+    resp = TestClient(app).post(
+        "/settings/import",
+        files={"backup": ("b.json", json.dumps(bundle).encode(), "application/json")},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert 'role="alert"' in resp.text
+    assert "not on your local network" in resp.text
+    assert (tmp_path / "c.json").read_text() == before
+
+
+def test_a_hub_port_error_keeps_the_warning_about_the_stored_hub(tmp_path, monkeypatch):
+    (tmp_path / "c.json").write_text('{"hub_ip": "nexho.example.com"}')
+    appmod = _unconfigured(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())  # no real hub
+    resp = TestClient(app).post(
+        "/settings/hub", data={"hub_ip": "10.0.0.20", "hub_port": "70000"}, follow_redirects=False
+    )
+    assert resp.status_code == 400
+    assert 'id="hub_port_error" role="alert"' in resp.text
+    assert 'id="hub_ip_error" role="alert"' in resp.text  # standing warning still shown
+    assert "nexho.example.com" in resp.text  # and it names the stored address
+    assert appmod.settings.hub_ip == "nexho.example.com"
+
+
+def test_a_password_reentry_error_keeps_the_warning_about_the_stored_broker(tmp_path, monkeypatch):
+    (tmp_path / "c.json").write_text('{"mqtt": {"host": "100.64.0.9", "password": "p"}}')
+    _mqtt_env(tmp_path, monkeypatch)
+    resp = TestClient(app).post(
+        "/settings/mqtt",
+        data={"host": "10.0.0.5", "port": "1883", "username": "", "password": "",
+              "base_topic": "hearthmage"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert 'id="mqtt_password_error" role="alert"' in resp.text
+    assert 'id="mqtt_host_error" role="alert"' in resp.text
+    assert "100.64.0.9" in resp.text.split('id="mqtt_host_error"', 1)[1].split("</p>", 1)[0]

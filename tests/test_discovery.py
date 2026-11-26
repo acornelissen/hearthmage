@@ -237,3 +237,13 @@ def test_failed_sweep_does_not_wedge_the_next_one(monkeypatch):
     with pytest.raises(OSError):
         disc.discover_local()
     assert disc.discover_local() == [{"ip": "10.0.0.20", "idu": 1}]
+
+
+def test_subnet_hosts_builds_addresses_from_the_canonical_ip():
+    # A padded address must not produce " 10.0.0.1", which sendto would hand
+    # to the resolver as a name.
+    hosts = subnet_hosts(" 10.0.0.5 ")
+    assert hosts[0] == "10.0.0.1"
+    assert all(h == h.strip() for h in hosts)
+    assert "10.0.0.5" not in hosts
+    assert len(hosts) == 253

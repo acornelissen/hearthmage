@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import threading
@@ -8,9 +9,20 @@ from typing import Mapping
 
 from hearthmage.atomicio import write_json_atomic
 from hearthmage.backups import rotate_backup
+from hearthmage.lan import AddressRejected, is_lan_broker_host, is_lan_ipv4
 
 _DEFAULT_HUB_PORT = 6653
 _DEFAULT_CONFIG = os.path.expanduser("~/.config/hearthmage/config.json")
+_log = logging.getLogger("hearthmage.settings")
+_HUB_IP_RULE = (
+    "Enter the hub’s IPv4 address on your home network: "
+    "10.x.x.x, 172.16–31.x.x or 192.168.x.x."
+)
+_PORT_RULE = "Enter a port from 1 to 65535."
+_BROKER_RULE = (
+    "Enter a broker on your home network: a 10.x, 172.16–31.x or 192.168.x "
+    "address, localhost, or a local name such as mqtt.local or homeassistant."
+)
 
 
 def _env_lookup(env: Mapping[str, str], suffix: str, default: str | None = None) -> str | None:
@@ -84,15 +96,49 @@ class Settings:
                     self._data = loaded
             except (OSError, ValueError):
                 self._data = {}
+        self._warn_about_addresses()
+
+    def _warn_about_addresses(self) -> None:
+        """Log, once at load, any hub or broker address off the LAN. A bad
+        environment value is ignored. A stored one (saved before this check
+        existed) is still used so the app keeps working; the settings page
+        shows a warning next to it."""
+        for suffix, on_lan in (("BASE_IP", is_lan_ipv4), ("MQTT_HOST", is_lan_broker_host)):
+            value = self._clean(_env_lookup(self._env, suffix))
+            if value and not on_lan(value):
+                _log.warning("Ignoring HEARTHMAGE_%s=%r: not an address on the local network",
+                             suffix, value)
+        if not self.hub_ip_on_lan:
+            _log.warning("Stored hub address %r is not a private LAN IPv4 address; still "
+                         "using it. Enter the hub's LAN address in Settings.", self.hub_ip)
+        if not self.mqtt_host_on_lan:
+            _log.warning("Stored MQTT broker %r is not on the local network; still using "
+                         "it. Enter a LAN broker in Settings.", self.mqtt_config()["host"])
 
     # --- read ---------------------------------------------------------
 
     @property
     def hub_ip(self) -> str | None:
         with self._lock:
-            value = self._data.get("hub_ip") or _env_lookup(self._env, "BASE_IP")
+            value = self._data.get("hub_ip")
+        if not value:
+            value = _env_lookup(self._env, "BASE_IP")
+            if not is_lan_ipv4(value):
+                value = None  # logged at load
         value = value.strip() if isinstance(value, str) else None
         return value or None
+
+    @property
+    def hub_ip_on_lan(self) -> bool:
+        """False only when the hub address in use is off the LAN."""
+        hub_ip = self.hub_ip
+        return hub_ip is None or is_lan_ipv4(hub_ip)
+
+    @property
+    def mqtt_host_on_lan(self) -> bool:
+        """False only when the broker in use is off the LAN."""
+        config = self.mqtt_config()
+        return config is None or is_lan_broker_host(config["host"])
 
     @property
     def hub_port(self) -> int:
@@ -238,6 +284,8 @@ class Settings:
             base_topic = self._clean(stored.get("base_topic"))
         else:
             host = self._clean(_env_lookup(self._env, "MQTT_HOST"))
+            if not is_lan_broker_host(host):
+                host = None  # logged at load
             raw_port = _env_lookup(self._env, "MQTT_PORT")
             username = self._clean(_env_lookup(self._env, "MQTT_USERNAME"))
             password = _env_lookup(self._env, "MQTT_PASSWORD") or None
@@ -288,11 +336,21 @@ class Settings:
 
     # --- write --------------------------------------------------------
 
-    def set_hub(self, hub_ip: str, hub_port: int | None = None) -> None:
+    def set_hub(self, hub_ip: str, hub_port=None) -> None:
+        """Save the hub address. ``hub_port`` may be form text; None keeps the
+        stored port. Raises AddressRejected, before anything changes, for an
+        address that is not a private LAN IPv4 address or an unusable port."""
+        if not is_lan_ipv4(hub_ip):
+            raise AddressRejected("hub_ip", _HUB_IP_RULE)
+        port = None
+        if hub_port is not None:
+            port = parse_port(hub_port)
+            if port is None:
+                raise AddressRejected("hub_port", _PORT_RULE)
         with self._lock:
             self._data["hub_ip"] = hub_ip.strip()
-            if hub_port is not None:
-                self._data["hub_port"] = int(hub_port)
+            if port is not None:
+                self._data["hub_port"] = port
             self._save()
 
     def set_price(self, price_per_kwh: float) -> None:
@@ -322,11 +380,14 @@ class Settings:
     ) -> None:
         """Save MQTT broker settings. ``password_action`` is ``"set"`` (store the
         given password), ``"keep"`` (leave the stored one alone; blank UI input)
-        or ``"clear"`` (remove it). ``"keep"`` for a different host, port or
+        or ``"clear"`` (remove it). A host off the LAN raises AddressRejected.
+        ``"keep"`` for a different host, port or
         username raises MqttPasswordReentry before anything changes: the
         password has to be entered again for the new broker. The check, the
         change and the save happen under one hold of the lock, and the new
         object replaces the old one in a single assignment."""
+        if not is_lan_broker_host(host):
+            raise AddressRejected("host", _BROKER_RULE)
         with self._lock:
             if password_action == "keep" and self.mqtt_password_needs_reentry(host, port, username):
                 raise MqttPasswordReentry("enter the broker password again for a different broker")

@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from hearthmage.atomicio import write_json_atomic
+from hearthmage.lan import AddressRejected, is_lan_broker_host, is_lan_ipv4
 
 BUNDLE_VERSION = 1
 _DEFAULT_KEEP = 10
@@ -175,6 +176,7 @@ def restore_bundle(bundle: Any, config_path: str, schedules_path: str) -> None:
             raise ValueError(f"backup section {key!r} is not an object")
         if key == "config":
             _check_ports(section)  # an import is untrusted input
+            _check_addresses(section)
             section = _restore_secrets(section, _read_json(path))
         else:
             section = validate_data(section)  # an import is untrusted input
@@ -195,6 +197,20 @@ def _check_ports(config: dict) -> None:
     for raw in ports:
         if raw is not None and parse_port(raw) is None:
             raise ValueError("backup has an unusable port number")
+
+
+def _check_addresses(config: dict) -> None:
+    """Refuse a config that points the hub or the MQTT broker off the LAN, by
+    the same rules as the settings forms. A blank or missing address is fine."""
+    mqtt = config.get("mqtt")
+    checks = (
+        ("hub_ip", config.get("hub_ip"), is_lan_ipv4),
+        ("host", mqtt.get("host") if isinstance(mqtt, dict) else None, is_lan_broker_host),
+    )
+    for field, value, on_lan in checks:
+        blank = value is None or (isinstance(value, str) and not value.strip())
+        if not blank and not on_lan(value):
+            raise AddressRejected(field, "backup has an address off the local network")
 
 
 def _restore_secrets(incoming: dict, existing: Any) -> dict:

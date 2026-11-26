@@ -31,6 +31,7 @@ from hearthmage.energy import cost, daily_kwh
 from hearthmage.energy_store import EnergyStore
 from hearthmage.fake_client import FakeHearthClient
 from hearthmage.history import HistoryStore
+from hearthmage.lan import LAN_SUFFIXES, AddressRejected, host_name
 from hearthmage.holiday_store import HolidayStore
 from hearthmage.schedule import (
     DAY_MINUTES,
@@ -244,21 +245,6 @@ def _is_authenticated(request: Request) -> bool:
 
 _security_log = logging.getLogger("hearthmage.security")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
-_LAN_SUFFIXES = (".local", ".lan", ".home.arpa", ".internal")
-_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-_.")
-
-
-def _host_name(raw: str) -> str | None:
-    """A DNS name lowercased with one trailing dot dropped, or None if it is
-    not a plain name (empty label, stray character, too long)."""
-    name = raw.lower()
-    if name.endswith("."):
-        name = name[:-1]
-    if not name or len(name) > 253 or not set(name) <= _NAME_CHARS:
-        return None
-    if any(label == "" for label in name.split(".")):
-        return None
-    return name
 
 
 def _split_host(raw: str) -> tuple[str, int | None] | None:
@@ -287,7 +273,7 @@ def _split_host(raw: str) -> tuple[str, int | None] | None:
         try:
             host = str(ip_address(name))
         except ValueError:
-            host = _host_name(name)
+            host = host_name(name)
             if host is None:
                 return None
     if port_text is None:
@@ -316,7 +302,7 @@ def _parse_allowed_hosts(raw: str) -> tuple[frozenset[str], tuple[str, ...]]:
         if not entry:
             continue
         wildcard = entry.startswith("*.")
-        name = _host_name(entry[2:] if wildcard else entry)
+        name = host_name(entry[2:] if wildcard else entry)
         if name is None or (wildcard and "." not in name):
             _security_log.warning("Ignoring HEARTHMAGE_ALLOWED_HOSTS entry %r", entry)
             continue
@@ -350,7 +336,7 @@ def _host_allowed(host: str) -> bool:
         return True
     except ValueError:
         pass
-    if host == "localhost" or "." not in host or host.endswith(_LAN_SUFFIXES):
+    if host == "localhost" or "." not in host or host.endswith(LAN_SUFFIXES):
         return True
     exact, wildcards = _parse_allowed_hosts(settings.allowed_hosts)
     if host in exact:
@@ -782,11 +768,23 @@ def settings_page(request: Request) -> HTMLResponse:
     return _settings_response(request)
 
 
+def _off_lan_warning(address: str) -> str:
+    """The standing warning for a stored address off the LAN. It names the
+    address, so it still reads right after the user types a different one."""
+    return (
+        f"The saved address {address} is not on your local network. HearthMage "
+        "still uses it, but will not save it again: enter an address on your "
+        "home network."
+    )
+
+
 def _settings_response(
-    request: Request, mqtt_form: dict | None = None, status_code: int = 200
+    request: Request, form: dict | None = None, status_code: int = 200
 ) -> HTMLResponse:
-    """The settings page. ``mqtt_form`` re-shows a rejected MQTT form: the
-    values the user typed (never the password) plus ``mqtt_error``."""
+    """The settings page. ``form`` re-shows a rejected hub or MQTT form: the
+    values the user typed (never the password) plus the field's error
+    (``hub_ip_error``, ``hub_port_error``, ``mqtt_host_error``, ``mqtt_error``).
+    A stored address off the LAN gets a standing warning on its field."""
     rooms: list = []
     if settings.is_configured():
         try:
@@ -802,8 +800,13 @@ def _settings_response(
             "rooms": rooms,
             "auth_enabled": settings.auth_enabled,
             "hub_ready": settings.is_configured(),
+            "hub_ip_error": None if settings.hub_ip_on_lan else _off_lan_warning(settings.hub_ip),
             **_mqtt_view(),
-            **(mqtt_form or {}),
+            "mqtt_host_error": (
+                None if settings.mqtt_host_on_lan
+                else _off_lan_warning(settings.mqtt_config()["host"])
+            ),
+            **(form or {}),
         },
         status_code=status_code,
     )
@@ -842,6 +845,20 @@ def save_mqtt(
     action = "clear" if clear_password is not None else ("set" if password else "keep")
     try:
         settings.set_mqtt(host, port_num, username, action, password, base_topic=base_topic)
+    except AddressRejected as exc:
+        # Nothing was saved: the bridge must not connect off the LAN.
+        return _settings_response(
+            request,
+            {
+                "mqtt_host": host,
+                "mqtt_port": port_num,
+                "mqtt_username": username.strip(),
+                "mqtt_base_topic": base_topic,
+                "mqtt_host_error": str(exc),
+                "focus": "mqtt_host",
+            },
+            status_code=400,
+        )
     except MqttPasswordReentry:
         # The stored password would go, in plaintext, to a broker it was not
         # entered for. Nothing was saved; ask for it again.
@@ -881,8 +898,21 @@ def discover_hub(request: Request) -> HTMLResponse:
 
 
 @app.post("/settings/hub")
-def save_hub(hub_ip: str = Form(...), hub_port: int = Form(6653)) -> RedirectResponse:
-    settings.set_hub(hub_ip, hub_port)
+def save_hub(
+    request: Request,
+    hub_ip: str = Form(...),
+    hub_port: str = Form("6653"),  # str, then parsed: a stray value must not 422
+) -> Response:
+    try:
+        settings.set_hub(hub_ip, hub_port)
+    except AddressRejected as exc:
+        # Nothing was saved; the hub client keeps talking to the old address.
+        field = "hub_port" if exc.field == "hub_port" else "hub_ip"
+        form = {"hub_ip": hub_ip.strip(), "hub_port": hub_port.strip(), "focus": field}
+        # A port error leaves hub_ip_error alone: a standing warning about the
+        # stored hub stays on the page.
+        form[f"{field}_error"] = str(exc)
+        return _settings_response(request, form, status_code=400)
     _drop_client()  # force a rebuild against the new hub
     return RedirectResponse("/", status_code=303)
 
@@ -960,10 +990,16 @@ async def import_backup(request: Request, backup: UploadFile = File(...)) -> Res
     """Restore a previously exported bundle, then reload the live stores."""
     global settings, schedules
     raw = await backup.read()
+    error = None
     try:
         bundle = json.loads(raw.decode("utf-8"))
         restore_bundle(bundle, settings.config_file, settings.schedules_path)
+    except AddressRejected:
+        error = ("That backup was not restored: its hub or broker address is not "
+                 "on your local network.")
     except (ValueError, UnicodeDecodeError):
+        error = "That file is not a valid HearthMage backup."
+    if error:
         return templates.TemplateResponse(
             request,
             "settings.html",
@@ -971,7 +1007,7 @@ async def import_backup(request: Request, backup: UploadFile = File(...)) -> Res
                 "hub_ip": settings.hub_ip,
                 "hub_port": settings.hub_port,
                 "rooms": [],
-                "import_error": "That file is not a valid HearthMage backup.",
+                "import_error": error,
             },
             status_code=400,
         )

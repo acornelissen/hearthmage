@@ -20,14 +20,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
+from hearthmage.lan import is_lan_ipv4
+
 _DEFAULT_PORT = 6653
 _PROBE = b"OPS1/"
 _WORKERS = 64
 _ATTEMPTS = 2
 _WAIT_SLACK = 1.0
-# Explicit RFC 1918 ranges rather than ipaddress.is_private, which also accepts
-# documentation ranges (192.0.2/24, 203.0.113/24, ...) and others.
-_LAN_NETS = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 
 
 def parse_ops1_idu(resp: str) -> int | None:
@@ -64,15 +63,10 @@ def subnet_hosts(ip: str | None) -> list[str]:
 
     Empty unless ``ip`` is a private LAN IPv4 address (see module docstring).
     """
-    if not ip:
+    # 100.64.0.0/10 (Tailscale/CGNAT), loopback and link-local are not RFC 1918.
+    if not is_lan_ipv4(ip):
         return []
-    try:
-        addr = ipaddress.IPv4Address(ip)
-    except ValueError:
-        return []
-    # 100.64.0.0/10 (Tailscale/CGNAT), loopback and link-local are not in these.
-    if not any(addr in net for net in _LAN_NETS):
-        return []
+    ip = str(ipaddress.IPv4Address(ip.strip()))  # build from the canonical form only
     prefix = ".".join(ip.split(".")[:3])
     return [f"{prefix}.{i}" for i in range(1, 255) if f"{prefix}.{i}" != ip]
 
