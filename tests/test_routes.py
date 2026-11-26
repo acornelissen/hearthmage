@@ -631,6 +631,19 @@ def test_startup_makes_the_apps_own_data_files_private(monkeypatch):
                      s.sessions_path, s.cache_path, s.energy_path]]
 
 
+def test_startup_removes_leftover_temp_files_next_to_the_config(monkeypatch):
+    import os
+
+    import hearthmage.app as appmod
+
+    swept = []
+    monkeypatch.setattr(appmod, "remove_stale_temp_files", lambda d: swept.append(d) or 0)
+    with TestClient(app):
+        pass
+    data_dir = os.path.dirname(appmod.settings.config_file) or "."
+    assert swept == [data_dir, os.path.join(data_dir, "backups")]
+
+
 def test_request_scheme_follows_forwarded_proto_only_from_a_trusted_proxy(monkeypatch):
     from starlette.requests import Request as StarletteRequest
 

@@ -76,3 +76,32 @@ def test_make_private_tightens_an_existing_file_and_skips_missing_ones(tmp_path)
     make_private(str(path))
     make_private(str(tmp_path / "absent.json"))  # no error
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+def test_stale_temp_files_are_removed_and_nothing_else(tmp_path):
+    # A write cut off by a stop leaves its temp file behind (seen on the NAS
+    # 2026-11-26); one from config.json would hold the session secret.
+    import time
+
+    from hearthmage.atomicio import remove_stale_temp_files
+
+    old = tmp_path / ".tmp-abc.json"
+    old.write_text("{}")
+    fresh = tmp_path / ".tmp-new.json"  # a write may be in progress
+    fresh.write_text("{}")
+    keep = [tmp_path / "config.json", tmp_path / ".tmp-notes.txt", tmp_path / "x.tmp-a.json"]
+    for p in keep:
+        p.write_text("x")
+    target = tmp_path / "elsewhere.json"
+    target.write_text("{}")
+    link = tmp_path / ".tmp-link.json"
+    link.symlink_to(target)
+    hour_ago = time.time() - 3600
+    for p in [old, *keep, target]:
+        os.utime(p, (hour_ago, hour_ago))
+    os.utime(link, (hour_ago, hour_ago), follow_symlinks=False)
+    assert remove_stale_temp_files(str(tmp_path)) == 1
+    assert not old.exists()
+    assert fresh.exists() and all(p.exists() for p in keep)
+    assert link.is_symlink() and target.exists()  # links are not followed or removed
+    assert remove_stale_temp_files(str(tmp_path / "missing")) == 0

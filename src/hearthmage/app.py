@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import math
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ from starlette.concurrency import run_in_threadpool
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
+from hearthmage.atomicio import remove_stale_temp_files
 from hearthmage.auth import (
     IDLE_SECONDS,
     LoginThrottle,
@@ -93,6 +95,12 @@ async def _lifespan(_app: FastAPI):
         settings.config_file, settings.schedules_path, settings.sync_path, settings.holiday_path,
         settings.sessions_path, settings.cache_path, settings.energy_path,
     ])
+    # A stop mid-write leaves a temp file behind (one from config.json holds
+    # the secrets); every store lives next to the config file.
+    data_dir = os.path.dirname(settings.config_file) or "."
+    removed = sum(remove_stale_temp_files(d) for d in (data_dir, os.path.join(data_dir, "backups")))
+    if removed:
+        logging.getLogger("hearthmage.app").info("removed %d leftover temp file(s)", removed)
     if settings.auth_enabled:
         _sessions()  # load now: seeds the throttle's known addresses
     yield
