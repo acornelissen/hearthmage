@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from hearthmage.domain import HearthError, Room, Scene
+from hearthmage.domain import MAX_TEMP, MIN_TEMP, HearthError, Room
 
 
 class FakeHearthClient:
@@ -47,11 +47,6 @@ class FakeHearthClient:
             return False
         self.set_temperature(room_id, self._last_on.get(room_id, default))
         return True
-
-    def set_scene_membership(self, room_id: str, scene: Scene, member: bool) -> None:
-        room = self._get(room_id)
-        if scene is Scene.STANDBY:
-            self._rooms[room_id] = replace(room, is_off=member)
 
     def set_day_pattern(self, room_id: str, blocks, days) -> None:
         self._get(room_id)  # validate the zone exists
@@ -142,6 +137,6 @@ _DEFAULT_CONFIG = {"keypad_lock": False, "window_sensor": False, "frost_temp": 7
 
 def _default_rooms() -> list[Room]:
     return [
-        Room("1", "Living Room", 19.5, 21.0, is_off=False, min_temp=5.0, max_temp=30.0),
-        Room("2", "Bedroom", 17.0, 18.0, is_off=False, min_temp=5.0, max_temp=30.0),
+        Room("1", "Living Room", 19.5, 21.0, is_off=False, min_temp=float(MIN_TEMP), max_temp=float(MAX_TEMP)),
+        Room("2", "Bedroom", 17.0, 18.0, is_off=False, min_temp=float(MIN_TEMP), max_temp=float(MAX_TEMP)),
     ]

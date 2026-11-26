@@ -10,7 +10,7 @@ import threading
 import time
 
 from hearthmage.atomicio import write_json_atomic
-from hearthmage.domain import HearthError, Room, Scene
+from hearthmage.domain import MAX_TEMP, MIN_TEMP, HearthError, Room
 from hearthmage.energy import DAILY_BUCKETS, MONTHLY_BUCKETS_MAX, parse_energy
 from hearthmage.schedule import Block, build_program_command, parse_program_day
 
@@ -85,8 +85,6 @@ _STATUS_F_FIELDS = 21
 # A zone whose status replies keep being rejected for their shape is logged at
 # most this often, so it does not look like a radiator that is simply asleep.
 _REJECTED_STATUS_LOG_EVERY = 600.0
-_MIN_TEMP = 5.0
-_MAX_TEMP = 30.0
 # "Off" is sent as a 1 degree setpoint: *T0 did not reliably turn radiators off.
 _OFF_TEMP = 1.0
 # Turning a zone back on (MQTT mode "heat") with no earlier target known.
@@ -668,8 +666,8 @@ class NexhoLocalClient:
             target_temp=target,
             # 0 (*T0) or our 1 degree "off" setpoint both mean the heater is off
             is_off=(target is not None and target <= _OFF_TEMP),
-            min_temp=_MIN_TEMP,
-            max_temp=_MAX_TEMP,
+            min_temp=float(MIN_TEMP),
+            max_temp=float(MAX_TEMP),
             status=status,
             error=error or self._undelivered_message(zone),
             silent_for=self._silent_for(zone),
@@ -1379,8 +1377,7 @@ class NexhoLocalClient:
             _WRITE_TIMEOUT,
             priority=True,
         )
-        if resp != "OK":
-            raise HearthError(f"Config write failed for zone {zone} ({group}#{index}): {resp!r}")
+        _require_ok(resp, f"Config write failed for zone {zone} ({group}#{index})")
 
     def read_config(self, room_id: str) -> dict | None:
         """Read keypad lock, window sensor, anti-ice temperature and sensor
@@ -1464,7 +1461,7 @@ class NexhoLocalClient:
             raise HearthError(f"Invalid holiday end: {days} days, {hour}:{minute:02d}")
         if arrival_temp is None:
             arrival = self._RH_RESUME_PROGRAM
-        elif _MIN_TEMP <= arrival_temp <= _MAX_TEMP:
+        elif MIN_TEMP <= arrival_temp <= MAX_TEMP:
             arrival = _encode_setpoint(arrival_temp)
         else:
             raise HearthError(f"Arrival temperature {arrival_temp} out of range")
@@ -1475,8 +1472,7 @@ class NexhoLocalClient:
             )
         finally:
             self._detach_read("holiday", zone)
-        if resp != "OK":
-            raise HearthError(f"Holiday set failed for zone {zone}: {resp!r}")
+        _require_ok(resp, f"Holiday set failed for zone {zone}")
 
     def clear_holiday(self, room_id: str) -> None:
         """Cancel a zone's holiday hold (the vendor's clear: *RH#0#0#0#251)."""
@@ -1487,8 +1483,7 @@ class NexhoLocalClient:
             )
         finally:
             self._detach_read("holiday", zone)
-        if resp != "OK":
-            raise HearthError(f"Holiday clear failed for zone {zone}: {resp!r}")
+        _require_ok(resp, f"Holiday clear failed for zone {zone}")
 
     def read_holiday(self, room_id: str) -> dict | None:
         """Read a zone's holiday hold; None if the radiator did not answer."""
@@ -1589,11 +1584,6 @@ class NexhoLocalClient:
         with self._lock:
             self._reads.pop((kind, zone), None)
 
-    def set_scene_membership(self, room_id: str, scene: Scene, member: bool) -> None:
-        # Nexho climate zones expose no on/off or scene-activate opcode on the
-        # LAN protocol; the web UI is setpoint-only. Present for the interface.
-        raise HearthError("On/off and presets are not supported by the Nexho local protocol")
-
     # ---- weekly schedule (native hub programs) --------------------------
 
     def read_day_pattern(self, room_id: str, day: int) -> list[Block]:
@@ -1631,8 +1621,7 @@ class NexhoLocalClient:
             cmd, "OK", priority=True,
             retries=_PROGRAM_WRITE_RETRIES, timeout=_PROGRAM_WRITE_TIMEOUT,
         )
-        if resp != "OK":
-            raise HearthError(f"Schedule write failed for zone {zone}: {resp!r}")
+        _require_ok(resp, f"Schedule write failed for zone {zone}")
 
     def set_program_active(self, room_id: str, active: bool) -> None:
         """Turn a zone's weekly program on (``*ON``) or off (``*OFF``).
@@ -1643,8 +1632,7 @@ class NexhoLocalClient:
         zone = self._require_zone(room_id)
         op = "ON" if active else "OFF"
         resp = self._ask_until_answered(f"D#{zone}#{self._modules(zone)}#0#0*{op}/", "OK", priority=True)
-        if resp != "OK":
-            raise HearthError(f"Program {op} failed for zone {zone}: {resp!r}")
+        _require_ok(resp, f"Program {op} failed for zone {zone}")
 
     # ---- hub cloud reporting (memory address 3898) ------------------------
     # OPMR<addr>/ -> OPOK,<value>; OPMW<addr>,<value>/ -> OPOK. Confirmed live.
@@ -1668,6 +1656,12 @@ class NexhoLocalClient:
 
 
 _CLOUD_REPORTING_ADDR = 3898  # hub memory: "send data to external server" (vendor app)
+
+
+def _require_ok(resp: str, what: str) -> None:
+    """A command's reply must be a bare ``OK`` (``OK,<...>`` is a command error)."""
+    if resp != "OK":
+        raise HearthError(f"{what}: {resp!r}")
 
 
 def _encode_setpoint(temp: float | None) -> int:
@@ -1694,7 +1688,7 @@ def _setpoint_target(temperature: float) -> float:
         raise HearthError(f"Invalid temperature: {temperature!r}")
     if temperature <= 0:
         return _OFF_TEMP
-    temperature = max(_MIN_TEMP, min(_MAX_TEMP, temperature))
+    temperature = max(float(MIN_TEMP), min(float(MAX_TEMP), temperature))
     return round(temperature * 2) / 2
 
 

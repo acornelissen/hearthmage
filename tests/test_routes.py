@@ -160,9 +160,6 @@ def test_index_survives_unreachable_hub():
         def set_temperature(self, room_id, temperature):  # pragma: no cover
             raise HearthError("hub unreachable")
 
-        def set_scene_membership(self, room_id, scene, member):  # pragma: no cover
-            raise HearthError("hub unreachable")
-
     app.dependency_overrides[get_client] = lambda: BoomClient()
     try:
         resp = TestClient(app).get("/")

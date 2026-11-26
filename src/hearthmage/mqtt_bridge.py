@@ -25,12 +25,11 @@ import string
 import threading
 from typing import Callable
 
+from hearthmage.domain import MAX_TEMP, MIN_TEMP, TEMP_STEP
 from hearthmage.lan import is_ip_literal, is_lan_broker_address
 
 _log = logging.getLogger("hearthmage.mqtt")
 
-_MIN_TEMP = 5
-_MAX_TEMP = 30
 _OFF_TEMP = 1  # the client sends Off as a 1 degree setpoint
 _LOOKUP_POLL = 0.1  # seconds between stop checks while a broker lookup runs
 _MAX_LOOKUPS = 4  # broker lookups waiting on DNS at once; past this, refuse
@@ -169,9 +168,9 @@ class MqttBridge:
             "name": name,
             "unique_id": f"hearthmage_{self._node}_{zone}",
             "modes": ["off", "heat"],
-            "min_temp": _MIN_TEMP,
-            "max_temp": _MAX_TEMP,
-            "temp_step": 0.5,
+            "min_temp": MIN_TEMP,
+            "max_temp": MAX_TEMP,
+            "temp_step": TEMP_STEP,
             "temperature_unit": "C",
             "current_temperature_topic": state,
             "current_temperature_template": "{{ value_json.current_temperature }}",

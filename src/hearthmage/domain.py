@@ -5,15 +5,11 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 
-class Scene(str, Enum):
-    STANDBY = "Standby"
-    BOOST = "Boost"
-    HOLIDAY = "Holiday"
-    LEAVE = "Leave"
-    PARTY = "Party"
-
-
-PRESETS = (Scene.BOOST, Scene.HOLIDAY, Scene.LEAVE, Scene.PARTY)
+# Setpoint range and step in degrees C. Weekly-schedule block targets use the
+# same range (schedule.MIN_TARGET/MAX_TARGET).
+MIN_TEMP = 5
+MAX_TEMP = 30
+TEMP_STEP = 0.5
 
 
 @dataclass(frozen=True)
@@ -44,5 +40,3 @@ class HearthClient(Protocol):
     def list_rooms(self) -> list[Room]: ...
 
     def set_temperature(self, room_id: str, temperature: float) -> None: ...
-
-    def set_scene_membership(self, room_id: str, scene: Scene, member: bool) -> None: ...

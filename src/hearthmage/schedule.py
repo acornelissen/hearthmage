@@ -32,9 +32,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from hearthmage.domain import MAX_TEMP, MIN_TEMP
+
 MAX_BLOCKS = 6
-MIN_TARGET = 5  # same range as the manual setpoint (nexho_client _MIN_TEMP/_MAX_TEMP)
-MAX_TARGET = 30
+MIN_TARGET = MIN_TEMP  # same range as the manual setpoint
+MAX_TARGET = MAX_TEMP
 DAY_MINUTES = 24 * 60
 DISABLED_CMD = 5  # climate "off"/disabled block sentinel (f1/h.java:287)
 DISABLED_BLOCK = f"{DISABLED_CMD}#24#60#24#60"
