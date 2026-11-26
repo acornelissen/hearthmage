@@ -889,6 +889,22 @@ a.link-btn:hover { text-decoration: underline; }
 .waste-table thead th { color: var(--muted); font-size: .8rem; }
 .waste-diag .raw code { overflow-wrap: anywhere; font-size: .8rem; }
 
+/* ---- signed-in devices --------------------------------------------------- */
+
+.status-note:empty { display: none; }
+.status-note { margin: 0 0 1rem; font-weight: 700; }
+.device-list { list-style: none; margin: 0 0 1rem; padding: 0; display: grid; gap: .6rem; }
+.device { padding: .8rem 1rem; border-radius: var(--radius-sm); background: var(--paper-2); }
+.device-name { margin: 0 0 .35rem; font-size: 1rem; }
+.device-mine {
+  display: inline-block; margin-left: .4rem; padding: .05rem .5rem; border-radius: 999px;
+  border: 1px solid var(--ink); font-size: .8rem; font-weight: 700;
+}
+.device-meta { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .9rem; margin: 0 0 .6rem; }
+.device-meta dt { color: var(--muted); }
+.device-meta dd { margin: 0; overflow-wrap: anywhere; }
+.device form { margin: 0; }
+
 /* ---- holiday ------------------------------------------------------------ */
 
 .holiday-arrival { margin: .4rem 0 1rem; display: grid; gap: .5rem; }

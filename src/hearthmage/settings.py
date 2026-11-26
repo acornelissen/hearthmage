@@ -213,6 +213,12 @@ class Settings:
         return os.path.join(directory, "holiday.json")
 
     @property
+    def sessions_path(self) -> str:
+        """Where signed-in device sessions are kept (next to the config)."""
+        directory = os.path.dirname(self._path) or "."
+        return os.path.join(directory, "sessions.json")
+
+    @property
     def price_per_kwh(self) -> float:
         """Electricity unit price for cost estimates (0.0 if unset)."""
         with self._lock:
@@ -322,7 +328,8 @@ class Settings:
         return self.auth_password is not None
 
     def secret_key(self) -> str:
-        """Key used to sign the session cookie; generated and persisted once."""
+        """Key for the password fingerprint that ties sessions to the current
+        password (changing either signs everyone out); generated and persisted once."""
         with self._lock:
             key = _env_lookup(self._env, "SECRET_KEY") or self._data.get("secret_key")
             if not key:

@@ -202,12 +202,39 @@
     </section>
 
     {% if auth_enabled %}
-    <section class="panel">
-      <h2 class="panel-title">Session</h2>
-      <p class="panel-note">You are signed in.</p>
-      <form method="post" action="/logout">
-        <button type="submit" class="btn btn-ghost">Sign out</button>
+    <section class="panel" id="devices" aria-labelledby="devices-title">
+      <h2 class="panel-title" id="devices-title">Signed-in devices</h2>
+      <p class="panel-note">Every browser signed in with the password. A device not
+        used for 90 days is signed out on its own. Addresses are approximate.</p>
+      <p class="status-note" role="status">{% if signed_out == "one" %}Signed out that device.{% elif signed_out == "others" %}Signed out all other devices.{% endif %}</p>
+      <ul class="device-list">
+        {% for d in devices %}
+        <li class="device">
+          <h3 class="device-name">{{ d.label }}{% if d.current %} <span class="device-mine">This device</span>{% endif %}</h3>
+          <dl class="device-meta">
+            <dt>Address</dt><dd>{{ d.address }}</dd>
+            <dt>Last seen</dt><dd><time datetime="{{ d.last_seen_iso }}">{{ d.last_seen }}</time></dd>
+            <dt>Signed in</dt><dd><time datetime="{{ d.created_iso }}">{{ d.created }}</time></dd>
+          </dl>
+          {% if d.current %}
+          <form method="post" action="/logout">
+            <button type="submit" class="btn btn-ghost">Sign out this device</button>
+          </form>
+          {% else %}
+          <form method="post" action="/settings/sessions/sign-out">
+            <input type="hidden" name="device" value="{{ d.handle }}">
+            <button type="submit" class="btn btn-ghost"
+                    aria-label="Sign out {{ d.label }} at {{ d.address }}, last seen {{ d.last_seen }}">Sign out</button>
+          </form>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      {% if devices | rejectattr("current") | list %}
+      <form method="post" action="/settings/sessions/sign-out-others">
+        <button type="submit" class="btn">Sign out all other devices</button>
       </form>
+      {% endif %}
     </section>
     {% endif %}
   </main>

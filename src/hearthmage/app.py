@@ -24,7 +24,17 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
 
+from hearthmage.auth import (
+    IDLE_SECONDS,
+    LoginThrottle,
+    Session,
+    SessionStore,
+    describe_device,
+    password_fingerprint,
+    throttle_key,
+)
 from hearthmage.backups import build_bundle, restore_bundle
 from hearthmage.domain import HearthClient, HearthError
 from hearthmage.energy import cost, daily_kwh
@@ -69,6 +79,8 @@ async def _lifespan(_app: FastAPI):
     # first request (the parsers cache, so it is logged once).
     _parse_allowed_hosts(settings.allowed_hosts)
     _parse_trusted_proxies(settings.trusted_proxies)
+    if settings.auth_enabled:
+        _sessions()  # load now: seeds the throttle's known addresses
     yield
 
 
@@ -221,16 +233,30 @@ _SESSION_COOKIE = "hearth_session"
 # Paths reachable without a session even when auth is on (login, assets, health).
 _PUBLIC_PATHS = frozenset({"/login", "/logout", "/manifest.webmanifest", "/sw.js",
                            "/healthz", "/favicon.ico"})
+_HSTS = "max-age=31536000"
+
+# Process-wide; tests swap both. The store follows settings.sessions_path.
+_login_throttle = LoginThrottle()
+_session_store: SessionStore | None = None
+_session_store_lock = threading.Lock()
 
 
-def _session_token() -> str:
-    """The signed value a valid session cookie must hold. It is derived from the
-    current password as well as the secret key, so changing the password signs
-    every existing session out."""
-    password = (settings.auth_password or "").encode("utf-8")
-    return hmac.new(
-        settings.secret_key().encode(), b"authenticated:v2:" + password, hashlib.sha256
-    ).hexdigest()
+def _sessions() -> SessionStore:
+    """The session store. Loading it (at startup or first use) also marks the
+    addresses of its sessions as known to the throttle, so after a restart or
+    a password change a flood of failures elsewhere cannot keep the owner out."""
+    global _session_store
+    with _session_store_lock:
+        if _session_store is None or _session_store.path != settings.sessions_path:
+            _session_store = SessionStore(settings.sessions_path)
+            _login_throttle.remember(throttle_key(a) for a in _session_store.addresses())
+        return _session_store
+
+
+def _fingerprint() -> str:
+    """Ties sessions to the current password and secret key: change either
+    and every session opened before counts as signed out."""
+    return password_fingerprint(settings.auth_password or "", settings.secret_key())
 
 
 def _same_secret(given: str, expected: str) -> bool:
@@ -239,8 +265,24 @@ def _same_secret(given: str, expected: str) -> bool:
     return hmac.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
 
 
+def _current_session(request: Request) -> Session | None:
+    token = request.cookies.get(_SESSION_COOKIE, "")
+    if not token or not settings.auth_enabled:
+        return None
+    return _sessions().lookup(token, _fingerprint())
+
+
 def _is_authenticated(request: Request) -> bool:
-    return _same_secret(request.cookies.get(_SESSION_COOKIE, ""), _session_token())
+    return _current_session(request) is not None
+
+
+def _set_session_cookie(response: Response, request: Request, token: str) -> None:
+    # Secure only over https: on the plain-http LAN default the browser would
+    # drop a Secure cookie and nobody could sign in.
+    response.set_cookie(
+        _SESSION_COOKIE, token, max_age=IDLE_SECONDS, httponly=True, samesite="strict",
+        path="/", secure=_request_scheme(request) == "https",
+    )
 
 
 _security_log = logging.getLogger("hearthmage.security")
@@ -376,7 +418,21 @@ def _request_scheme(request: Request) -> str:
         proto = (_forwarded(request, "x-forwarded-proto") or "").lower()
         if proto in _DEFAULT_PORTS:
             return proto
-    return request.url.scheme
+    # From the scope, not request.url: that rebuilds the URL from the Host
+    # header and raises on a malformed one (this runs for every response).
+    return request.scope.get("scheme", "http")
+
+
+def _client_address(request: Request) -> str:
+    """The client's IP: from a trusted proxy, the address it forwarded for
+    (the last X-Forwarded-For entry, if it is a valid IP); else the peer."""
+    peer = request.client.host if request.client else ""
+    if _from_trusted_proxy(request):
+        try:
+            return str(ip_address(_forwarded(request, "x-forwarded-for") or ""))
+        except ValueError:
+            pass
+    return peer or "unknown"
 
 
 def _direct_host(request: Request) -> tuple[str, int | None] | None:
@@ -465,13 +521,16 @@ async def _security(request: Request, call_next):
     path = request.url.path
     if path in _PUBLIC_PATHS or path.startswith("/static"):
         return await call_next(request)
-    if mutating:
-        if not _is_authenticated(request):
+    # In the threadpool: the lookup may write the sessions file.
+    session = await run_in_threadpool(_current_session, request)
+    if session is None:
+        if mutating:
             return PlainTextResponse("Forbidden", status_code=403)
-        return await call_next(request)
-    if not _is_authenticated(request):
         return RedirectResponse("/login", status_code=303)
-    return await call_next(request)
+    response = await call_next(request)
+    if session.renewed:  # keep the cookie's 90 days in step with the server's
+        _set_session_cookie(response, request, request.cookies[_SESSION_COOKIE])
+    return response
 
 
 _SECURITY_HEADERS = {
@@ -499,6 +558,10 @@ async def _security_headers(request: Request, call_next):
         response = PlainTextResponse("Internal Server Error", status_code=500)
     for name, value in _SECURITY_HEADERS.items():
         response.headers[name] = value
+    # HSTS only over https: on plain http (the LAN default) a browser that
+    # saw it would refuse that host name over http from then on.
+    if _request_scheme(request) == "https":
+        response.headers["Strict-Transport-Security"] = _HSTS
     return response
 
 
@@ -736,28 +799,119 @@ def set_temperature(
 # ---- auth ---------------------------------------------------------------
 
 
+def _plural(count: int, unit: str) -> str:
+    return f"{count} {unit}" if count == 1 else f"{count} {unit}s"
+
+
+def _wait_text(seconds: float) -> str:
+    """A wait as people say it: whole seconds under a minute, else minutes."""
+    whole = math.ceil(seconds)
+    if whole < 60:
+        return _plural(whole, "second")
+    return _plural(math.ceil(whole / 60), "minute")
+
+
+def _login_response(
+    request: Request, status_code: int = 200, error: bool = False, wait: float = 0.0
+) -> HTMLResponse:
+    context = {"error": error, "retry_in": _wait_text(wait) if wait > 0 else None,
+               "throttled": status_code == 429}
+    resp = templates.TemplateResponse(request, "login.html", context, status_code=status_code)
+    if status_code == 429:
+        resp.headers["Retry-After"] = str(math.ceil(wait))
+    return resp
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(request, "login.html", {"error": False})
+    return _login_response(request)
 
 
 @app.post("/login")
 def login(request: Request, password: str = Form(...)) -> Response:
     expected = settings.auth_password
-    if expected and _same_secret(password, expected):
-        resp = RedirectResponse("/", status_code=303)
-        resp.set_cookie(
-            _SESSION_COOKIE, _session_token(), httponly=True, samesite="strict", path="/"
-        )
-        return resp
-    return templates.TemplateResponse(request, "login.html", {"error": True}, status_code=401)
+    if not expected:  # no password set: nothing to sign in to, nothing to throttle
+        return _login_response(request, 401, error=True)
+    address = _client_address(request)
+    key = throttle_key(address)
+    store = _sessions()  # loads it, which marks known addresses for the throttle
+    wait = _login_throttle.wait(key)
+    if wait > 0:  # not checked and not counted
+        return _login_response(request, 429, wait=wait)
+    if not _same_secret(password, expected):
+        wait = _login_throttle.failure(key)
+        _security_log.warning("failed sign-in from %r", address)
+        return _login_response(request, 401, error=True, wait=wait)
+    _login_throttle.success(key)
+    store.revoke(request.cookies.get(_SESSION_COOKIE, ""))  # this device's old session
+    token = store.create(_fingerprint(), request.headers.get("user-agent", ""), address)
+    _security_log.info("signed in from %r", address)
+    resp = RedirectResponse("/", status_code=303)
+    _set_session_cookie(resp, request, token)
+    return resp
 
 
 @app.post("/logout")
-def logout() -> RedirectResponse:
+def logout(request: Request) -> RedirectResponse:
+    if settings.auth_enabled:
+        _sessions().revoke(request.cookies.get(_SESSION_COOKIE, ""))
     resp = RedirectResponse("/login", status_code=303)
-    resp.delete_cookie(_SESSION_COOKIE, path="/")
+    resp.delete_cookie(
+        _SESSION_COOKIE, path="/", httponly=True, samesite="strict",
+        secure=_request_scheme(request) == "https",
+    )
     return resp
+
+
+@app.post("/settings/sessions/sign-out")
+def sign_out_device(device: str = Form(...)) -> RedirectResponse:
+    """Sign out one other device from the devices list (session required by
+    the middleware, same-origin checked like every POST)."""
+    if settings.auth_enabled:
+        _sessions().revoke_handle(device, _fingerprint())
+    return RedirectResponse("/settings?signed_out=one#devices", status_code=303)
+
+
+@app.post("/settings/sessions/sign-out-others")
+def sign_out_other_devices(request: Request) -> RedirectResponse:
+    if settings.auth_enabled:
+        _sessions().revoke_others(request.cookies.get(_SESSION_COOKIE, ""))
+    return RedirectResponse("/settings?signed_out=others#devices", status_code=303)
+
+
+def _ago(seconds: float) -> str:
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return _plural(int(seconds // 60), "minute") + " ago"
+    if seconds < 2 * 86400:
+        return _plural(int(seconds // 3600), "hour") + " ago"
+    return _plural(int(seconds // 86400), "day") + " ago"
+
+
+def _devices_view(request: Request) -> list[dict]:
+    """Signed-in devices for the settings page, this one first."""
+    if not settings.auth_enabled:
+        return []
+    current = _current_session(request)
+    store = _sessions()
+    now = store.now()
+    devices = []
+    for s in store.list(_fingerprint()):
+        created = datetime.fromtimestamp(s.created)
+        devices.append({
+            "handle": s.handle,
+            "label": describe_device(s.user_agent),
+            "address": s.address or "unknown address",
+            "current": current is not None and s.handle == current.handle,
+            "last_seen": "Now" if current is not None and s.handle == current.handle
+            else _ago(max(0.0, now - s.last_seen)),
+            "last_seen_iso": datetime.fromtimestamp(s.last_seen, timezone.utc).isoformat(),
+            "created": f"{created.day} {created:%b %Y}",
+            "created_iso": created.date().isoformat(),
+        })
+    devices.sort(key=lambda d: not d["current"])  # stable: then most recent first
+    return devices
 
 
 # ---- settings / setup ---------------------------------------------------
@@ -799,6 +953,8 @@ def _settings_response(
             "hub_port": settings.hub_port,
             "rooms": rooms,
             "auth_enabled": settings.auth_enabled,
+            "devices": _devices_view(request),
+            "signed_out": request.query_params.get("signed_out"),
             "hub_ready": settings.is_configured(),
             "hub_ip_error": None if settings.hub_ip_on_lan else _off_lan_warning(settings.hub_ip),
             **_mqtt_view(),

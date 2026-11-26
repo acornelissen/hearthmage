@@ -295,12 +295,13 @@ def test_settings_page_has_no_address_warning_for_lan_addresses(tmp_path, monkey
 # ---- auth -----------------------------------------------------------------
 
 
-def _with_auth(monkeypatch, tmp_path, password="swordfish"):
+def _with_auth(monkeypatch, tmp_path, password="swordfish", env=None):
     import hearthmage.app as appmod
     from hearthmage.settings import Settings
 
     s = Settings(str(tmp_path / "c.json"), env={"HEARTHMAGE_PASSWORD": password,
-                                                "HEARTHMAGE_SECRET_KEY": "testkey"})
+                                                "HEARTHMAGE_SECRET_KEY": "testkey",
+                                                **(env or {})})
     monkeypatch.setattr(appmod, "settings", s)
     return appmod
 
@@ -722,6 +723,425 @@ def test_healthz_with_auth_off_shows_full_detail(tmp_path, monkeypatch):
         assert "zones" in TestClient(app).get("/healthz").json()
     finally:
         app.dependency_overrides.clear()
+
+
+# ---- per-device sessions ----------------------------------------------------
+
+_FIREFOX_MAC = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:132.0) Gecko/20100101 Firefox/132.0"
+_SAFARI_IPHONE = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1"
+)
+
+
+class _Clock:
+    def __init__(self, now: float = 1_000_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _signed_in(peer=("192.168.1.20", 50000), agent=_FIREFOX_MAC) -> TestClient:
+    c = TestClient(app, client=peer, headers={"user-agent": agent})
+    resp = c.post("/login", data={"password": "swordfish"}, follow_redirects=False)
+    assert resp.status_code == 303
+    return c
+
+
+def _with_session_clock(appmod, clock):
+    from hearthmage.auth import SessionStore
+
+    appmod._session_store = SessionStore(appmod.settings.sessions_path, clock=clock)
+
+
+def test_each_device_gets_its_own_random_session(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    a = _signed_in()
+    b = _signed_in(peer=("192.168.1.21", 50000), agent=_SAFARI_IPHONE)
+    assert a.cookies["hearth_session"] != b.cookies["hearth_session"]
+    assert a.get("/", follow_redirects=False).headers["location"] == "/settings"  # signed in
+    assert b.get("/", follow_redirects=False).headers["location"] == "/settings"
+
+
+def test_session_cookie_attributes_over_plain_http(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    c = TestClient(app)
+    resp = c.post("/login", data={"password": "swordfish"}, follow_redirects=False)
+    cookie = resp.headers["set-cookie"]
+    assert "HttpOnly" in cookie and "SameSite=strict" in cookie and "Path=/" in cookie
+    assert f"Max-Age={90 * 86400}" in cookie
+    assert "Secure" not in cookie  # plain-http LAN access must keep working
+    assert "strict-transport-security" not in resp.headers
+
+
+_PROXY_ENV = {"HEARTHMAGE_ALLOWED_HOSTS": "heat.example.com",
+              "HEARTHMAGE_TRUSTED_PROXIES": "10.0.0.5"}
+
+
+def _https_proxy(monkeypatch) -> TestClient:
+    for name, value in _PROXY_ENV.items():  # for the module settings (no password)
+        monkeypatch.setenv(name, value)
+    return TestClient(app, client=("10.0.0.5", 50000), headers={
+        "host": "127.0.0.1:8080",
+        "x-forwarded-host": "heat.example.com",
+        "x-forwarded-proto": "https",
+        "x-forwarded-for": "203.0.113.7",
+    })
+
+
+def test_session_cookie_is_secure_and_hsts_sent_over_https(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path, env=_PROXY_ENV)
+    proxy = _https_proxy(monkeypatch)
+    resp = proxy.post("/login", data={"password": "swordfish"}, follow_redirects=False)
+    assert "Secure" in resp.headers["set-cookie"]
+    assert resp.headers["strict-transport-security"] == "max-age=31536000"
+    assert proxy.get("/login").headers["strict-transport-security"] == "max-age=31536000"
+
+
+def test_hsts_over_https_even_without_a_password(client, monkeypatch):
+    proxy = _https_proxy(monkeypatch)
+    assert proxy.get("/").headers["strict-transport-security"] == "max-age=31536000"
+    assert "strict-transport-security" not in client.get("/").headers  # plain http
+
+
+def test_malformed_host_is_a_400_not_a_crash_with_a_password(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    for host in ("[127.0.0.1]", "[::1"):
+        assert TestClient(app).get("/", headers={"host": host}).status_code == 400
+
+
+def test_no_hsts_over_plain_http_with_a_password(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    assert "strict-transport-security" not in TestClient(app).get("/login").headers
+
+
+def test_forwarded_proto_from_an_untrusted_peer_gets_no_secure_or_hsts(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    c = TestClient(app, client=("10.0.0.9", 50000))
+    resp = c.post("/login", data={"password": "swordfish"},
+                  headers={"x-forwarded-proto": "https"}, follow_redirects=False)
+    assert "Secure" not in resp.headers["set-cookie"]
+    assert "strict-transport-security" not in resp.headers
+
+
+def test_old_shared_hmac_cookie_no_longer_signs_in(tmp_path, monkeypatch):
+    import hashlib
+    import hmac as hmac_mod
+
+    _with_auth(monkeypatch, tmp_path)
+    old = hmac_mod.new(b"testkey", b"authenticated:v2:swordfish", hashlib.sha256).hexdigest()
+    c = TestClient(app, cookies={"hearth_session": old})
+    assert c.get("/", follow_redirects=False).headers["location"] == "/login"
+
+
+def test_logout_deletes_the_server_side_session(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    a = _signed_in()
+    b = _signed_in(peer=("192.168.1.21", 50000))
+    stolen = a.cookies["hearth_session"]
+    a.post("/logout")
+    replay = TestClient(app, cookies={"hearth_session": stolen})
+    assert replay.get("/", follow_redirects=False).headers["location"] == "/login"
+    assert b.get("/", follow_redirects=False).headers["location"] == "/settings"  # still in
+
+
+def test_signing_in_again_replaces_this_devices_session(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    c = _signed_in()
+    first = c.cookies["hearth_session"]
+    c.post("/login", data={"password": "swordfish"})
+    assert c.cookies["hearth_session"] != first
+    assert len(appmod._sessions().list(appmod._fingerprint())) == 1
+
+
+def test_session_expires_after_90_idle_days_and_use_renews_it(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    clock = _Clock()
+    _with_session_clock(appmod, clock)
+    c = _signed_in()
+    clock.now += 60 * 86400
+    renewed = c.get("/", follow_redirects=False)
+    assert renewed.headers["location"] == "/settings"
+    assert "hearth_session=" in renewed.headers.get("set-cookie", "")  # cookie Max-Age renewed
+    clock.now += 60 * 86400  # 120 days after sign-in, 60 after last use
+    assert c.get("/", follow_redirects=False).headers["location"] == "/settings"
+    clock.now += 90 * 86400 + 1
+    assert c.get("/", follow_redirects=False).headers["location"] == "/login"
+
+
+def test_requests_within_minutes_do_not_rewrite_the_session(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    clock = _Clock()
+    _with_session_clock(appmod, clock)
+    c = _signed_in()
+    clock.now += 60
+    resp = c.get("/", follow_redirects=False)
+    assert "set-cookie" not in resp.headers
+
+
+def test_changing_the_secret_key_signs_everyone_out(tmp_path, monkeypatch):
+    import hearthmage.app as appmod
+    from hearthmage.settings import Settings
+
+    _with_auth(monkeypatch, tmp_path)
+    c = _signed_in()
+    monkeypatch.setattr(appmod, "settings", Settings(str(tmp_path / "c.json"), env={
+        "HEARTHMAGE_PASSWORD": "swordfish", "HEARTHMAGE_SECRET_KEY": "otherkey"}))
+    assert c.get("/", follow_redirects=False).headers["location"] == "/login"
+
+
+def test_sessions_are_stored_next_to_the_config(tmp_path, monkeypatch):
+    import os
+    import stat as stat_mod
+
+    _with_auth(monkeypatch, tmp_path)
+    c = _signed_in()
+    path = tmp_path / "sessions.json"
+    assert path.exists()
+    assert stat_mod.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert c.cookies["hearth_session"] not in path.read_text()
+
+
+def test_settings_lists_signed_in_devices(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    mine = _signed_in()
+    _signed_in(peer=("192.168.1.21", 50000), agent=_SAFARI_IPHONE)
+    page = mine.get("/settings").text
+    assert "Signed-in devices" in page
+    assert "Firefox on macOS" in page and "Safari on iPhone" in page
+    assert "192.168.1.20" in page and "192.168.1.21" in page
+    assert "This device" in page
+    assert 'aria-label="Sign out Safari on iPhone at 192.168.1.21' in page
+    assert 'aria-label="Sign out Firefox on macOS' not in page  # no per-row button for me
+    assert 'role="status"' in page
+    assert "Sign out all other devices" in page
+
+
+def test_sign_out_one_other_device(tmp_path, monkeypatch):
+    import re
+
+    _with_auth(monkeypatch, tmp_path)
+    mine = _signed_in()
+    other = _signed_in(peer=("192.168.1.21", 50000), agent=_SAFARI_IPHONE)
+    page = mine.get("/settings").text
+    handle = re.search(r'name="device" value="([^"]+)"', page).group(1)
+    resp = mine.post("/settings/sessions/sign-out", data={"device": handle}, follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/settings?signed_out=one#devices"
+    assert other.get("/", follow_redirects=False).headers["location"] == "/login"
+    page = mine.get(resp.headers["location"]).text
+    assert re.search(r'role="status"[^>]*>\s*Signed out that device\.', page)
+    assert "Safari on iPhone" not in page  # gone from the list
+    assert mine.get("/", follow_redirects=False).headers["location"] == "/settings"
+
+
+def test_sign_out_all_other_devices(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    mine = _signed_in()
+    others = [_signed_in(peer=(f"192.168.1.{n}", 50000)) for n in (21, 22)]
+    resp = mine.post("/settings/sessions/sign-out-others", follow_redirects=False)
+    assert resp.headers["location"] == "/settings?signed_out=others#devices"
+    assert all(o.get("/", follow_redirects=False).headers["location"] == "/login" for o in others)
+    page = mine.get(resp.headers["location"]).text
+    assert "Signed out all other devices" in page
+    assert mine.get("/", follow_redirects=False).headers["location"] == "/settings"
+
+
+def test_device_sign_out_needs_a_session_and_same_origin(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    mine = _signed_in()
+    stranger = TestClient(app)
+    assert stranger.post("/settings/sessions/sign-out-others").status_code == 403
+    cross = mine.post("/settings/sessions/sign-out-others",
+                      headers={"origin": "http://evil.example"})
+    assert cross.status_code == 403
+
+
+def test_no_devices_section_without_a_password(tmp_path, monkeypatch):
+    _unconfigured(tmp_path, monkeypatch)
+    page = TestClient(app).get("/settings").text
+    assert "Signed-in devices" not in page
+    assert not (tmp_path / "sessions.json").exists()
+
+
+# ---- login throttle --------------------------------------------------------
+
+
+def _with_throttle_clock(appmod, clock):
+    from hearthmage.auth import LoginThrottle
+
+    appmod._login_throttle = LoginThrottle(clock=clock)
+
+
+def _guess(c: TestClient, password="wrong", **kw):
+    return c.post("/login", data={"password": password}, follow_redirects=False, **kw)
+
+
+def test_five_wrong_passwords_then_each_try_waits(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    clock = _Clock()
+    _with_throttle_clock(appmod, clock)
+    c = TestClient(app, client=("192.168.1.20", 50000))
+    for _ in range(5):
+        assert _guess(c).status_code == 401
+    blocked = _guess(c, password="swordfish")  # even the right one waits
+    assert blocked.status_code == 429
+    assert blocked.headers["retry-after"] == "1"
+    assert "Try again in 1 second" in blocked.text
+    assert 'role="alert"' in blocked.text
+    clock.now += 1
+    assert _guess(c).status_code == 401  # the wait has passed: a real try
+    blocked = _guess(c)
+    assert blocked.status_code == 429 and blocked.headers["retry-after"] == "2"
+    clock.now += 2
+    assert _guess(c, password="swordfish").status_code == 303
+    assert _guess(TestClient(app, client=("192.168.1.20", 50000))).status_code == 401  # cleared
+
+
+def test_a_try_inside_the_wait_is_refused_and_changes_nothing(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    clock = _Clock()
+    _with_throttle_clock(appmod, clock)
+    c = TestClient(app, client=("192.168.1.20", 50000))
+    for _ in range(6):
+        clock.now += 2  # each wait has passed: six real tries
+        assert _guess(c).status_code == 401
+    for _ in range(10):  # hammering inside the 2 s wait
+        assert _guess(c, password="swordfish").headers["retry-after"] == "2"
+    clock.now += 2  # the wait still ends 2 s after the last real try
+    assert _guess(c, password="swordfish").status_code == 303
+
+
+def _restart(appmod, clock):
+    """What a process restart forgets: the throttle and the loaded store."""
+    from hearthmage.auth import LoginThrottle
+
+    appmod._login_throttle = LoginThrottle(clock=clock)
+    appmod._session_store = None
+
+
+def _flood(clock, count=30):
+    for n in range(count):
+        clock.now += 1
+        _guess(TestClient(app, client=(f"198.51.100.{n}", 50000)))
+
+
+def test_after_a_restart_a_signed_in_owners_address_skips_the_global_cap(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    clock = _Clock()
+    _signed_in()  # the owner's phone, 192.168.1.20, has a session on disk
+    _restart(appmod, clock)
+    _flood(clock)
+    assert _guess(TestClient(app, client=("192.168.1.30", 50000)), password="swordfish").status_code == 429
+    new_browser = TestClient(app, client=("192.168.1.20", 50000))
+    assert _guess(new_browser, password="swordfish").status_code == 303
+
+
+def test_after_a_password_change_the_owners_address_skips_the_global_cap(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    clock = _Clock()
+    _signed_in()
+    _with_auth(monkeypatch, tmp_path, password="new-password")  # needs a restart
+    _restart(appmod, clock)
+    _flood(clock)
+    owner = TestClient(app, client=("192.168.1.20", 50000))
+    assert _guess(owner, password="new-password").status_code == 303
+
+
+def test_a_device_that_signed_in_before_gets_past_the_global_cap(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    clock = _Clock()
+    _with_throttle_clock(appmod, clock)
+    owner = TestClient(app, client=("192.168.1.20", 50000))
+    assert _guess(owner, password="swordfish").status_code == 303
+    for n in range(30):  # many addresses failing: the global cap is on
+        clock.now += 1
+        _guess(TestClient(app, client=(f"198.51.100.{n}", 50000)))
+    assert _guess(TestClient(app, client=("192.168.1.30", 50000)), password="swordfish").status_code == 429
+    assert _guess(owner, password="swordfish").status_code == 303
+
+
+def test_changing_the_password_signs_an_existing_session_out(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    c = _signed_in()
+    assert c.get("/", follow_redirects=False).headers["location"] == "/settings"
+    _with_auth(monkeypatch, tmp_path, password="new-password")
+    assert c.get("/settings", follow_redirects=False).headers["location"] == "/login"
+    assert c.post("/settings/sessions/sign-out-others").status_code == 403
+    assert appmod._sessions().list(appmod._fingerprint()) == []
+    # The old password no longer signs in; the new one does.
+    assert _guess(c, password="swordfish").status_code == 401
+    assert _guess(c, password="new-password").status_code == 303
+
+
+def test_wrong_password_page_says_when_a_wait_starts(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    _with_throttle_clock(appmod, _Clock())
+    c = TestClient(app, client=("192.168.1.20", 50000))
+    for _ in range(4):
+        assert "Try again in" not in _guess(c).text
+    assert "Try again in 1 second" in _guess(c).text
+
+
+def test_throttle_is_per_client_address(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    _with_throttle_clock(appmod, _Clock())
+    attacker = TestClient(app, client=("192.168.1.66", 50000))
+    for _ in range(8):
+        _guess(attacker)
+    assert _guess(attacker).status_code == 429
+    owner = TestClient(app, client=("192.168.1.20", 50000))
+    assert _guess(owner, password="swordfish").status_code == 303
+
+
+def test_many_failing_addresses_slow_every_sign_in(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    _with_throttle_clock(appmod, _Clock())
+    for n in range(21):
+        assert _guess(TestClient(app, client=(f"198.51.100.{n}", 50000))).status_code == 401
+    fresh = TestClient(app, client=("192.168.1.20", 50000))
+    assert _guess(fresh, password="swordfish").status_code == 429
+
+
+def test_failed_sign_in_is_logged_with_the_address(tmp_path, monkeypatch, caplog):
+    _with_auth(monkeypatch, tmp_path)
+    c = TestClient(app, client=("192.168.1.66", 50000))
+    with caplog.at_level("WARNING", logger="hearthmage.security"):
+        _guess(c)
+    assert any("'192.168.1.66'" in r.getMessage() and r.levelname == "WARNING"
+               for r in caplog.records)
+
+
+def test_trusted_proxy_forwarded_for_is_the_client_address(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path, env=_PROXY_ENV)
+    _with_throttle_clock(appmod, _Clock())
+    proxy = _https_proxy(monkeypatch)  # forwards for 203.0.113.7
+    for _ in range(5):
+        _guess(proxy)
+    assert _guess(proxy).status_code == 429
+    other = {"x-forwarded-for": "203.0.113.8"}
+    resp = proxy.post("/login", data={"password": "swordfish"}, headers=other, follow_redirects=False)
+    assert resp.status_code == 303
+    token = resp.cookies["hearth_session"]  # Secure: httpx keeps it off the http test URL
+    page = proxy.get("/settings", headers={**other, "cookie": f"hearth_session={token}"}).text
+    assert "203.0.113.8" in page
+
+
+def test_forwarded_for_from_an_untrusted_peer_is_ignored(tmp_path, monkeypatch):
+    appmod = _with_auth(monkeypatch, tmp_path)
+    _with_throttle_clock(appmod, _Clock())
+    c = TestClient(app, client=("192.168.1.66", 50000))
+    for n in range(6):  # a new spoofed address each time does not help
+        _guess(c, headers={"x-forwarded-for": f"10.9.9.{n}"})
+    assert _guess(c, headers={"x-forwarded-for": "10.9.9.99"}).status_code == 429
+
+
+def test_no_throttle_or_sessions_without_a_password(tmp_path, monkeypatch):
+    _unconfigured(tmp_path, monkeypatch)
+    c = TestClient(app)
+    assert all(_guess(c).status_code == 401 for _ in range(10))
+    assert not (tmp_path / "sessions.json").exists()
 
 
 # ---- PWA ------------------------------------------------------------------

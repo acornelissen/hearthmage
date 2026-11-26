@@ -20,8 +20,42 @@ screenshots.
   is fine on a trusted home network. On a shared or untrusted network (guest
   wifi, IoT VLAN), set `HEARTHMAGE_PASSWORD` to require a sign-in: the app is then
   the only thing that can control the heaters, since the hub itself can't
-  authenticate. The session cookie is `HttpOnly` and `SameSite=Strict`, and
-  mutating requests also get a same-origin (CSRF) check.
+  authenticate. Mutating requests also get a same-origin (CSRF) check.
+- **Sessions (with a password).** Each signed-in browser gets its own random
+  session, kept server-side in `sessions.json` next to the config (mode 0600;
+  only a SHA-256 of each session id is stored). A session not used for 90 days
+  expires; Settings lists the signed-in devices and can sign out one or all
+  others. Changing `HEARTHMAGE_PASSWORD` or `HEARTHMAGE_SECRET_KEY` signs every
+  device out. The cookie is `HttpOnly`, `SameSite=Strict`, and `Secure` when
+  the request came over HTTPS (directly or via a trusted proxy's
+  `X-Forwarded-Proto`). Upgrading from a version before per-device sessions
+  signs every device out once.
+- **Sign-in throttle (with a password).** Per client address, five wrong
+  passwords are free; after that each try waits 1 s, doubling up to 15
+  minutes. A try inside the wait gets `429`, is not checked and changes
+  nothing, so the wait always ends on schedule, at most 15 minutes after the
+  last checked try. More than 20 failures across all addresses without a
+  10-minute pause slows every sign-in the same way, so many addresses (or
+  rotating within an IPv6 range) cannot brute force. Known addresses skip that
+  global slowdown (their own wait still applies): one that signed in correctly
+  in the last 90 days, or that a session in `sessions.json` was opened from,
+  so a restart or a password change does not forget them. Devices already
+  signed in are never slowed. A correct password clears that address.
+- **Limit: an attacker who shares your address.** If an attacker reaches the
+  app from the same address as you (for example through a proxy that is not
+  listed in `HEARTHMAGE_TRUSTED_PROXIES`, so every client shows the proxy's
+  address), the app cannot tell you apart: you share one wait. Signed-in
+  devices are unaffected. Each wait lasts at most 15 minutes, but someone
+  retrying every second will usually take the next try before you do, so sign
+  in from a device that is already signed in, or list the proxy as trusted. The throttle lives in memory and resets when
+  the app restarts. Failed sign-ins are logged at `WARNING` with the address.
+- **HSTS (HTTPS only).** Every response that came over HTTPS (directly or via
+  a trusted proxy's `X-Forwarded-Proto`), password or not, carries
+  `Strict-Transport-Security: max-age=31536000`; plain-HTTP responses never do.
+  HSTS and the `Secure` cookie bind to the host name on every port, so do not
+  also open the same name over plain HTTP (e.g. `https://heat.example.com` via
+  the proxy and `http://heat.example.com:8080` direct): use the IP or another
+  name for direct access.
 - **Bind deliberately.** `HEARTHMAGE_BIND` defaults to `0.0.0.0` (all interfaces).
   To limit exposure, bind to a specific LAN address, or bind to `127.0.0.1` and
   put a reverse proxy (with TLS) in front.
@@ -33,11 +67,13 @@ screenshots.
   (comma-separated, exact; `*.example.com` matches one level of subdomain).
   Prefer exact names: a wildcard over a suffix other people can register
   under (`*.duckdns.org`, `*.co.uk`) lets anyone with a sibling name rebind.
-- **Reverse proxy.** `X-Forwarded-Host`, `X-Forwarded-Proto` and
-  `X-Forwarded-Port` count only from addresses in `HEARTHMAGE_TRUSTED_PROXIES`;
-  from anyone else they are ignored. The proxy must set `X-Forwarded-Host`
-  itself (overwriting any value the client sent) and pass `Host` through
-  unchanged or as its upstream address; both must pass the host check above.
+- **Reverse proxy.** `X-Forwarded-Host`, `X-Forwarded-Proto`,
+  `X-Forwarded-Port` and `X-Forwarded-For` (the client address for the
+  throttle and the devices list) count only from addresses in
+  `HEARTHMAGE_TRUSTED_PROXIES`; from anyone else they are ignored. The proxy
+  must set `X-Forwarded-Host` itself (overwriting any value the client sent),
+  append the client to `X-Forwarded-For`, and pass `Host` through unchanged
+  or as its upstream address; both must pass the host check above.
 - **Start it with `python run.py`**, not the `uvicorn` command line: the CLI
   turns on uvicorn's own proxy-header handling, which trusts `X-Forwarded-For`
   and `X-Forwarded-Proto` from `127.0.0.1` before the app's check runs.
@@ -85,7 +121,8 @@ a value saved through the UI wins over its environment seed.
 Several sidecar files are written next to the config file: `readings.json`
 (last-known temperatures), `schedules.json` (weekly programs), `energy.json`
 (last energy reading per zone), `history.db` (SQLite temperature/energy
-history), `sync.json` (schedule-sync state), `holiday.json` (holiday holds), and
+history), `sync.json` (schedule-sync state), `holiday.json` (holiday holds),
+`sessions.json` (signed-in devices, only with a password), and
 a `backups/` folder of timestamped config/schedule snapshots. Only the config
 and schedules are irreplaceable — the rest are caches or history that repopulate
 on their own.
@@ -104,9 +141,9 @@ on their own.
 | `HEARTHMAGE_MQTT_PORT` / `_USERNAME` / `_PASSWORD` | Broker port and credentials | `1883` / — / — |
 | `HEARTHMAGE_MQTT_BASE_TOPIC` / `_NODE_ID` | Topic prefix and device node id | `hearthmage` / `hub` |
 | `HEARTHMAGE_PASSWORD` | Require this password to use the app | off (open) |
-| `HEARTHMAGE_SECRET_KEY` | Session-cookie signing key | generated and stored |
+| `HEARTHMAGE_SECRET_KEY` | Key that ties sessions to the current password (changing it signs everyone out) | generated and stored |
 | `HEARTHMAGE_ALLOWED_HOSTS` | Extra host names the app answers to, comma-separated (`*.` = one subdomain level) | IPs, `localhost`, single-label and `.local`/`.lan`/`.home.arpa`/`.internal` names only |
-| `HEARTHMAGE_TRUSTED_PROXIES` | Reverse-proxy IPs or CIDRs whose `X-Forwarded-Host`/`-Proto`/`-Port` are honoured | none (headers ignored) |
+| `HEARTHMAGE_TRUSTED_PROXIES` | Reverse-proxy IPs or CIDRs whose `X-Forwarded-Host`/`-Proto`/`-Port`/`-For` are honoured | none (headers ignored) |
 
 ## Capabilities and limits
 

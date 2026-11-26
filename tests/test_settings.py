@@ -559,3 +559,8 @@ def test_lan_flags_are_true_when_nothing_or_a_lan_address_is_set(tmp_path):
     s.set_hub("10.0.0.20", 6653)
     s.set_mqtt("mqtt.local", 1883, "", "keep", "")
     assert (s.hub_ip_on_lan, s.mqtt_host_on_lan) == (True, True)
+
+
+def test_sessions_are_stored_next_to_the_config(tmp_path):
+    s = Settings(str(tmp_path / "conf" / "config.json"), env={})
+    assert s.sessions_path == str(tmp_path / "conf" / "sessions.json")

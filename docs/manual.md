@@ -36,8 +36,19 @@ option. It then runs full screen and remembers where it is.
 ## Signing in
 
 If your install has a password set, you are asked for it once per device. Enter
-the password and tap **Sign in**. A signed-in session is remembered until you
-sign out (there is a **Sign out** button at the bottom of Settings).
+the password and tap **Sign in**. Each device stays signed in until you sign
+it out, or until it goes 90 days without being used. Changing the password
+signs every device out.
+
+After five wrong passwords from the same device or network address, each
+further try has to wait, starting at one second and doubling up to 15 minutes.
+The sign-in page tells you how long ("Too many wrong passwords. Try again in 2
+minutes."); a try made during the wait is not checked and does not change the
+wait. If many wrong passwords come in from different addresses, every sign-in
+slows down the same way for a while, except from an address that has signed
+in before (in the last 90 days, or that a signed-in device uses). Devices that are already
+signed in keep working throughout. The count
+resets when you sign in correctly, and when the app restarts.
 
 If no password is set, the app opens straight to your rooms with no sign-in.
 This is fine on a trusted home network; if you want a password, see
@@ -243,6 +254,15 @@ tap **Save names**. Leave a name blank to reset it to "Zone N".
 **Home Assistant (MQTT).** Connects HearthMage to Home Assistant so your
 radiators appear there as thermostats. See [Home Assistant](#home-assistant)
 below. If you leave the broker host blank, the bridge stays off.
+
+**Signed-in devices** (only when a password is set). Lists every browser that
+is signed in: its name (like "Firefox on macOS"), its approximate network
+address, when it was last seen, and when it signed in. Your current browser is
+marked **This device** and has **Sign out this device**. Every other device has
+its own **Sign out** button, and **Sign out all other devices** signs out
+everything except the browser you are using; a lost phone, for example. The
+page confirms with "Signed out that device." A device that goes 90 days
+without being used is signed out on its own.
 
 **Backup & restore.** Your schedules live only in HearthMage, so keep a copy.
 Tap **Export backup** to download a file with your settings and schedules.
