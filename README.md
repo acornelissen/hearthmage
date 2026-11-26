@@ -25,6 +25,30 @@ screenshots.
 - **Bind deliberately.** `HEARTHMAGE_BIND` defaults to `0.0.0.0` (all interfaces).
   To limit exposure, bind to a specific LAN address, or bind to `127.0.0.1` and
   put a reverse proxy (with TLS) in front.
+- **Known host names only.** The app answers only when the browser reached it
+  by an IP address, `localhost`, a single-label name (`nas`), or a name ending
+  in `.local`, `.lan`, `.home.arpa` or `.internal`. Any other name gets
+  `400 Unknown host`; this stops DNS rebinding, where a web page re-points its
+  own domain at the app. Add other names to `HEARTHMAGE_ALLOWED_HOSTS`
+  (comma-separated, exact; `*.example.com` matches one level of subdomain).
+  Prefer exact names: a wildcard over a suffix other people can register
+  under (`*.duckdns.org`, `*.co.uk`) lets anyone with a sibling name rebind.
+- **Reverse proxy.** `X-Forwarded-Host`, `X-Forwarded-Proto` and
+  `X-Forwarded-Port` count only from addresses in `HEARTHMAGE_TRUSTED_PROXIES`;
+  from anyone else they are ignored. The proxy must set `X-Forwarded-Host`
+  itself (overwriting any value the client sent) and pass `Host` through
+  unchanged or as its upstream address; both must pass the host check above.
+- **Start it with `python run.py`**, not the `uvicorn` command line: the CLI
+  turns on uvicorn's own proxy-header handling, which trusts `X-Forwarded-For`
+  and `X-Forwarded-Proto` from `127.0.0.1` before the app's check runs.
+
+**Reaching it from outside.** Install Tailscale on the NAS and open the app
+from your tailnet, by the NAS's Tailscale IP (works as is) or its MagicDNS name:
+set `HEARTHMAGE_ALLOWED_HOSTS` to that exact name (e.g.
+`nas.tail1234.ts.net`). Tailscale needs no proxy setting: do not add
+`127.0.0.1` to `HEARTHMAGE_TRUSTED_PROXIES` because of it (with userspace
+networking, tailnet connections can arrive from `127.0.0.1`). Never
+port-forward the app or the hub on your router.
 
 ## Setup
 
@@ -81,6 +105,8 @@ on their own.
 | `HEARTHMAGE_MQTT_BASE_TOPIC` / `_NODE_ID` | Topic prefix and device node id | `hearthmage` / `hub` |
 | `HEARTHMAGE_PASSWORD` | Require this password to use the app | off (open) |
 | `HEARTHMAGE_SECRET_KEY` | Session-cookie signing key | generated and stored |
+| `HEARTHMAGE_ALLOWED_HOSTS` | Extra host names the app answers to, comma-separated (`*.` = one subdomain level) | IPs, `localhost`, single-label and `.local`/`.lan`/`.home.arpa`/`.internal` names only |
+| `HEARTHMAGE_TRUSTED_PROXIES` | Reverse-proxy IPs or CIDRs whose `X-Forwarded-Host`/`-Proto`/`-Port` are honoured | none (headers ignored) |
 
 ## Capabilities and limits
 

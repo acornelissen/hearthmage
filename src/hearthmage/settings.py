@@ -260,6 +260,16 @@ class Settings:
         return value or None
 
     @property
+    def allowed_hosts(self) -> str:
+        """Extra host names the app answers to, comma-separated. Env only."""
+        return _env_lookup(self._env, "ALLOWED_HOSTS", "")
+
+    @property
+    def trusted_proxies(self) -> str:
+        """Proxy IPs/CIDRs whose X-Forwarded-Host/-Proto count. Env only."""
+        return _env_lookup(self._env, "TRUSTED_PROXIES", "")
+
+    @property
     def auth_enabled(self) -> bool:
         return self.auth_password is not None
 

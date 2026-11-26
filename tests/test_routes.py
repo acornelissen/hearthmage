@@ -327,6 +327,253 @@ def test_cross_origin_login_post_is_rejected(tmp_path, monkeypatch):
     assert resp.status_code == 403
 
 
+# ---- Host allowlist (DNS rebinding) and reverse proxies --------------------
+
+
+def test_rebinding_host_is_rejected_even_with_a_matching_origin(client: TestClient):
+    # A page at evil.example whose name now points at the app sends Host and
+    # Origin that agree with each other; the Host itself must be refused.
+    headers = {"host": "evil.example:8080", "origin": "http://evil.example:8080"}
+    resp = client.post("/rooms/1/temperature", data={"temperature": "30"}, headers=headers)
+    assert resp.status_code == 400
+    assert resp.text == "Unknown host"
+    assert client.get("/", headers=headers).status_code == 400
+    assert "Target 21" in client.get("/rooms/1/status").text  # nothing was changed
+
+
+@pytest.mark.parametrize("path", ["/", "/login", "/static/icon.svg", "/healthz", "/sw.js"])
+def test_unknown_host_is_rejected_on_every_path(client: TestClient, path):
+    resp = client.get(path, headers={"host": "evil.example"}, follow_redirects=False)
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "127.0.0.1",
+        "127.0.0.1:8080",
+        "192.168.1.20:8080",
+        "100.101.102.103:8080",  # Tailscale client address
+        "[::1]:8080",
+        "[fd7a:115c:a1e0::1]",  # Tailscale IPv6
+        "localhost",
+        "LocalHost:8080",
+        "nas",
+        "nas.:8080",  # trailing dot
+        "nas.local",
+        "nas.lan",
+        "nas.home.arpa",
+        "nas.internal:8080",
+    ],
+)
+def test_lan_hosts_are_accepted(client: TestClient, host):
+    assert client.get("/", headers={"host": host}).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "evil.example",
+        "nas.local.evil.example",
+        "user@127.0.0.1",
+        "127.0.0.1 ",
+        "nas lan",
+        "::1",  # IPv6 must be bracketed
+        "fe80::1:8080",
+        "[127.0.0.1]",
+        "[::1",
+        "[fe80::1%en0]:8080",  # no IPv6 zone ids
+        "127.0.0.1:",
+        "127.0.0.1:99999",
+        "127.0.0.1:80a",
+        "nas..lan",
+        "nas/evil",
+        "",
+    ],
+)
+def test_malformed_or_public_hosts_are_rejected(client: TestClient, host):
+    assert client.get("/", headers={"host": host}).status_code == 400
+
+
+def test_allowed_hosts_lists_exact_names(client: TestClient, monkeypatch):
+    monkeypatch.setenv("HEARTHMAGE_ALLOWED_HOSTS", "nas.tail1234.ts.net, heat.example.com")
+    assert client.get("/", headers={"host": "nas.tail1234.ts.net"}).status_code == 200
+    assert client.get("/", headers={"host": "HEAT.example.com.:8080"}).status_code == 200
+    assert client.get("/", headers={"host": "other.tail1234.ts.net"}).status_code == 400
+    assert client.get("/", headers={"host": "example.com"}).status_code == 400
+
+
+def test_allowed_hosts_wildcard_matches_one_subdomain_level(client: TestClient, monkeypatch):
+    monkeypatch.setenv("HEARTHMAGE_ALLOWED_HOSTS", "*.tail1234.ts.net")
+    assert client.get("/", headers={"host": "nas.tail1234.ts.net"}).status_code == 200
+    assert client.get("/", headers={"host": "a.nas.tail1234.ts.net"}).status_code == 400
+    assert client.get("/", headers={"host": "tail1234.ts.net"}).status_code == 400
+
+
+def test_allowed_hosts_ignores_entries_that_would_open_everything(client: TestClient, monkeypatch):
+    monkeypatch.setenv("HEARTHMAGE_ALLOWED_HOSTS", "*, *., *.com, evil.example:8080")
+    assert client.get("/", headers={"host": "evil.com"}).status_code == 400
+    assert client.get("/", headers={"host": "evil.example"}).status_code == 400
+
+
+def test_forwarded_headers_are_ignored_from_an_untrusted_peer(client: TestClient, monkeypatch):
+    monkeypatch.setenv("HEARTHMAGE_ALLOWED_HOSTS", "heat.example.com")
+    peer = TestClient(app, client=("10.0.0.5", 50000))
+    # No trusted proxies configured: Host is what counts.
+    assert peer.get("/", headers={"host": "127.0.0.1", "x-forwarded-host": "evil.example"}).status_code == 200
+    assert peer.get("/", headers={"host": "evil.example", "x-forwarded-host": "heat.example.com"}).status_code == 400
+    proxied = {
+        "host": "127.0.0.1:8080",
+        "x-forwarded-host": "heat.example.com",
+        "x-forwarded-proto": "https",
+        "origin": "https://heat.example.com",
+    }
+    resp = peer.post("/rooms/1/temperature", data={"temperature": "22"}, headers=proxied)
+    assert resp.status_code == 403  # Origin is compared with the real Host
+
+
+def test_forwarded_headers_are_honoured_from_a_trusted_proxy(client: TestClient, monkeypatch):
+    monkeypatch.setenv("HEARTHMAGE_ALLOWED_HOSTS", "heat.example.com")
+    monkeypatch.setenv("HEARTHMAGE_TRUSTED_PROXIES", "192.168.9.9, 10.0.0.0/24")
+    proxy = TestClient(app, client=("10.0.0.5", 50000))
+    proxied = {
+        "host": "127.0.0.1:8080",
+        "x-forwarded-host": "heat.example.com",
+        "x-forwarded-proto": "https",
+        "origin": "https://heat.example.com",
+    }
+    resp = proxy.post("/rooms/1/temperature", data={"temperature": "22"}, headers=proxied)
+    assert resp.status_code == 200
+    # The forwarded host is the one checked against the allowlist.
+    rebound = {"host": "127.0.0.1:8080", "x-forwarded-host": "evil.example"}
+    assert proxy.get("/", headers=rebound).status_code == 400
+    # A peer outside the trusted range gets its forwarded headers ignored.
+    outsider = TestClient(app, client=("10.0.1.5", 50000))
+    resp = outsider.post("/rooms/1/temperature", data={"temperature": "23"}, headers=proxied)
+    assert resp.status_code == 403
+
+
+def test_trusted_proxy_does_not_launder_a_rebinding_host(client: TestClient, monkeypatch):
+    # A rebinding page reaching the app through a trusted local hop sends its
+    # own name in Host; a LAN name in X-Forwarded-Host must not cover for it.
+    monkeypatch.setenv("HEARTHMAGE_TRUSTED_PROXIES", "127.0.0.1")
+    proxy = TestClient(app, client=("127.0.0.1", 50000))
+    laundered = {"host": "evil.example", "x-forwarded-host": "nas.lan"}
+    assert proxy.get("/settings/export", headers=laundered).status_code == 400
+    assert proxy.get("/", headers={"host": "127.0.0.1:8080", "x-forwarded-host": "nas.lan"}).status_code == 200
+
+
+def test_forwarded_port_from_a_trusted_proxy_is_used_for_the_origin_check(
+    client: TestClient, monkeypatch
+):
+    # nginx: proxy_set_header X-Forwarded-Host $host (no port) behind :8443.
+    monkeypatch.setenv("HEARTHMAGE_ALLOWED_HOSTS", "heat.example.com")
+    monkeypatch.setenv("HEARTHMAGE_TRUSTED_PROXIES", "10.0.0.5")
+    proxied = {
+        "host": "127.0.0.1:8080",
+        "x-forwarded-host": "heat.example.com",
+        "x-forwarded-proto": "https",
+        "x-forwarded-port": "8443",
+        "origin": "https://heat.example.com:8443",
+    }
+    proxy = TestClient(app, client=("10.0.0.5", 50000))
+    assert proxy.post("/rooms/1/temperature", data={"temperature": "22"}, headers=proxied).status_code == 200
+    # Without the port header, the default https port no longer matches.
+    no_port = {k: v for k, v in proxied.items() if k != "x-forwarded-port"}
+    assert proxy.post("/rooms/1/temperature", data={"temperature": "22"}, headers=no_port).status_code == 403
+    # A malformed port is ignored, never trusted.
+    for bad in ("0", "65536", "84a3", "+8443"):
+        resp = proxy.post(
+            "/rooms/1/temperature", data={"temperature": "22"},
+            headers={**proxied, "x-forwarded-port": bad},
+        )
+        assert resp.status_code == 403, bad
+    # From an untrusted peer the port header is ignored like the others.
+    outsider = TestClient(app, client=("10.0.0.6", 50000))
+    direct = {"host": "127.0.0.1:8080", "x-forwarded-port": "9999", "origin": "http://127.0.0.1:8080"}
+    assert outsider.post("/rooms/1/temperature", data={"temperature": "22"}, headers=direct).status_code == 200
+
+
+def test_port_in_forwarded_host_beats_forwarded_port(client: TestClient, monkeypatch):
+    # nginx in Docker published as 8443:443: X-Forwarded-Host carries the
+    # public port, X-Forwarded-Port the container's own 443.
+    monkeypatch.setenv("HEARTHMAGE_ALLOWED_HOSTS", "heat.example.com")
+    monkeypatch.setenv("HEARTHMAGE_TRUSTED_PROXIES", "10.0.0.5")
+    proxied = {
+        "host": "127.0.0.1:8080",
+        "x-forwarded-host": "heat.example.com:8443",
+        "x-forwarded-proto": "https",
+        "x-forwarded-port": "443",
+        "origin": "https://heat.example.com:8443",
+    }
+    proxy = TestClient(app, client=("10.0.0.5", 50000))
+    assert proxy.post("/rooms/1/temperature", data={"temperature": "22"}, headers=proxied).status_code == 200
+    wrong = {**proxied, "origin": "https://heat.example.com"}
+    assert proxy.post("/rooms/1/temperature", data={"temperature": "22"}, headers=wrong).status_code == 403
+
+
+def test_bad_trusted_proxy_entries_are_reported_at_startup(monkeypatch, caplog):
+    monkeypatch.setenv("HEARTHMAGE_TRUSTED_PROXIES", "192.168.77.1/24, 10.0.0.5")
+    monkeypatch.setenv("HEARTHMAGE_ALLOWED_HOSTS", "*.startup-test")
+    with caplog.at_level("WARNING", logger="hearthmage.security"):
+        with TestClient(app):
+            pass  # startup only, no request
+    messages = [r.getMessage() for r in caplog.records if r.name == "hearthmage.security"]
+    assert any("192.168.77.1/24" in m for m in messages)
+    assert any("*.startup-test" in m for m in messages)
+
+
+def test_request_scheme_follows_forwarded_proto_only_from_a_trusted_proxy(monkeypatch):
+    from starlette.requests import Request as StarletteRequest
+
+    from hearthmage import app as appmod
+
+    def request(peer: str) -> StarletteRequest:
+        return StarletteRequest({
+            "type": "http", "scheme": "http", "method": "GET", "path": "/",
+            "headers": [(b"host", b"127.0.0.1"), (b"x-forwarded-proto", b"https")],
+            "client": (peer, 50000), "server": ("127.0.0.1", 8080), "query_string": b"",
+        })
+
+    monkeypatch.setenv("HEARTHMAGE_TRUSTED_PROXIES", "10.0.0.1")
+    assert appmod._request_scheme(request("10.0.0.1")) == "https"
+    assert appmod._request_scheme(request("10.0.0.2")) == "http"
+
+
+@pytest.mark.parametrize(
+    "origin, expected",
+    [
+        ("http://127.0.0.1:8080", 200),
+        ("https://127.0.0.1:8080", 403),  # different scheme
+        ("http://127.0.0.1:9090", 403),  # different port
+        ("http://127.0.0.1", 403),  # default port 80, not 8080
+        ("null", 403),
+    ],
+)
+def test_origin_must_match_scheme_host_and_port(client: TestClient, origin, expected):
+    headers = {"host": "127.0.0.1:8080", "origin": origin}
+    resp = client.post("/rooms/1/temperature", data={"temperature": "22"}, headers=headers)
+    assert resp.status_code == expected
+
+
+def test_referer_with_a_path_counts_as_same_origin(client: TestClient):
+    headers = {"host": "127.0.0.1:8080", "referer": "http://127.0.0.1:8080/rooms/1?x=1"}
+    resp = client.post("/rooms/1/temperature", data={"temperature": "22"}, headers=headers)
+    assert resp.status_code == 200
+
+
+def test_origin_default_port_matches_a_host_without_port(client: TestClient):
+    headers = {"host": "nas.lan", "origin": "http://nas.lan:80"}
+    resp = client.post("/rooms/1/temperature", data={"temperature": "22"}, headers=headers)
+    assert resp.status_code == 200
+
+
+def test_healthz_works_for_the_docker_healthcheck(client: TestClient):
+    # The Dockerfile HEALTHCHECK fetches http://127.0.0.1:8080/healthz.
+    docker = TestClient(app, base_url="http://127.0.0.1:8080")
+    assert docker.get("/healthz").status_code == 200
+
+
 def test_non_ascii_password_can_sign_in(tmp_path, monkeypatch):
     _with_auth(monkeypatch, tmp_path, password="geheim-p\u00e4ssword")
     c = TestClient(app)

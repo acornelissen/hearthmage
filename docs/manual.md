@@ -278,6 +278,11 @@ to you.
 
 ## Troubleshooting
 
+**The page says "Unknown host".** The app only answers to its IP address,
+`localhost`, a one-word name like `nas`, or a name ending in `.local`, `.lan`,
+`.home.arpa` or `.internal`. To use another name (such as a Tailscale MagicDNS
+name), add it to `HEARTHMAGE_ALLOWED_HOSTS`; see the README's Security section.
+
 **A room shows a stale or old reading.** The radiator may be briefly unreachable
 over RF. HearthMage keeps the last known value and retries; it usually recovers
 on its own. A hub-wide problem shows a banner at the top of the rooms screen.

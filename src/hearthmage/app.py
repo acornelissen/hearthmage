@@ -7,7 +7,10 @@ import logging
 import math
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
+from functools import lru_cache
+from ipaddress import IPv6Address, ip_address, ip_network
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -45,7 +48,16 @@ from hearthmage.waste import WasteDetector, status_diff
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
-app = FastAPI(title="Heating")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Parse the host settings now so a typo is logged at startup, not at the
+    # first request (the parsers cache, so it is logged once).
+    _parse_allowed_hosts(settings.allowed_hosts)
+    _parse_trusted_proxies(settings.trusted_proxies)
+    yield
+
+
+app = FastAPI(title="Heating", lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 settings = Settings(config_path())
@@ -215,32 +227,237 @@ def _is_authenticated(request: Request) -> bool:
     return _same_secret(request.cookies.get(_SESSION_COOKIE, ""), _session_token())
 
 
-def _same_origin(request: Request) -> bool:
-    """CSRF guard: a mutating request's Origin/Referer must match this host.
-    Browsers always send Origin on a cross-site POST, so a request with neither
-    header is a script or curl on the LAN, which the open default allows."""
+_security_log = logging.getLogger("hearthmage.security")
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+_LAN_SUFFIXES = (".local", ".lan", ".home.arpa", ".internal")
+_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-_.")
+
+
+def _host_name(raw: str) -> str | None:
+    """A DNS name lowercased with one trailing dot dropped, or None if it is
+    not a plain name (empty label, stray character, too long)."""
+    name = raw.lower()
+    if name.endswith("."):
+        name = name[:-1]
+    if not name or len(name) > 253 or not set(name) <= _NAME_CHARS:
+        return None
+    if any(label == "" for label in name.split(".")):
+        return None
+    return name
+
+
+def _split_host(raw: str) -> tuple[str, int | None] | None:
+    """Parse a Host-style ``host[:port]`` strictly: an IPv4 address or name, or
+    a bracketed IPv6 address, then an optional port. Returns (host, port) with
+    IPv6 unbracketed, or None for anything else (userinfo, spaces, a path,
+    an unbracketed IPv6 address, an empty or out-of-range port)."""
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end < 0 or "%" in raw[:end]:  # no zone ids
+            return None
+        try:
+            host = str(IPv6Address(raw[1:end]))
+        except ValueError:
+            return None
+        rest = raw[end + 1:]
+        if rest and not rest.startswith(":"):
+            return None
+        port_text = rest[1:] if rest else None
+    else:
+        if raw.count(":") > 1:
+            return None
+        name, sep, port_text = raw.partition(":")
+        if not sep:
+            port_text = None
+        try:
+            host = str(ip_address(name))
+        except ValueError:
+            host = _host_name(name)
+            if host is None:
+                return None
+    if port_text is None:
+        return host, None
+    port = _parse_port(port_text)
+    return (host, port) if port is not None else None
+
+
+def _parse_port(text: str) -> int | None:
+    """A port of 1-5 ASCII digits in 1..65535, or None."""
+    if not (text.isascii() and text.isdigit() and len(text) <= 5):
+        return None
+    port = int(text)
+    return port if 1 <= port <= 65535 else None
+
+
+@lru_cache(maxsize=8)
+def _parse_allowed_hosts(raw: str) -> tuple[frozenset[str], tuple[str, ...]]:
+    """HEARTHMAGE_ALLOWED_HOSTS -> (exact names, wildcard suffixes). A ``*.``
+    entry matches one extra label and needs at least two labels after it, so
+    ``*`` or ``*.com`` cannot open the app to every name. Bad entries are
+    logged and skipped."""
+    exact: set[str] = set()
+    wildcards: list[str] = []
+    for entry in (e.strip() for e in raw.split(",")):
+        if not entry:
+            continue
+        wildcard = entry.startswith("*.")
+        name = _host_name(entry[2:] if wildcard else entry)
+        if name is None or (wildcard and "." not in name):
+            _security_log.warning("Ignoring HEARTHMAGE_ALLOWED_HOSTS entry %r", entry)
+            continue
+        if wildcard:
+            wildcards.append("." + name)
+        else:
+            exact.add(name)
+    return frozenset(exact), tuple(wildcards)
+
+
+@lru_cache(maxsize=8)
+def _parse_trusted_proxies(raw: str) -> tuple:
+    """HEARTHMAGE_TRUSTED_PROXIES -> networks. Each entry is an IP or a CIDR
+    with no host bits set; bad entries are logged and skipped."""
+    networks = []
+    for entry in (e.strip() for e in raw.split(",")):
+        if not entry:
+            continue
+        try:
+            networks.append(ip_network(entry))
+        except ValueError:
+            _security_log.warning("Ignoring HEARTHMAGE_TRUSTED_PROXIES entry %r", entry)
+    return tuple(networks)
+
+
+def _host_allowed(host: str) -> bool:
+    """Names a DNS-rebinding page cannot hold: IP literals, localhost,
+    single-label and LAN-suffix names, plus the owner's own list."""
+    try:
+        ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if host == "localhost" or "." not in host or host.endswith(_LAN_SUFFIXES):
+        return True
+    exact, wildcards = _parse_allowed_hosts(settings.allowed_hosts)
+    if host in exact:
+        return True
+    return any(
+        host.endswith(suffix) and "." not in host[: -len(suffix)] and len(host) > len(suffix)
+        for suffix in wildcards
+    )
+
+
+def _from_trusted_proxy(request: Request) -> bool:
+    """True if the direct peer is in HEARTHMAGE_TRUSTED_PROXIES."""
+    networks = _parse_trusted_proxies(settings.trusted_proxies)
+    if not networks or request.client is None:
+        return False
+    try:
+        peer = ip_address(request.client.host)
+    except ValueError:
+        return False
+    if isinstance(peer, IPv6Address) and peer.ipv4_mapped is not None:
+        peer = peer.ipv4_mapped
+    return any(peer.version == net.version and peer in net for net in networks)
+
+
+def _forwarded(request: Request, name: str) -> str | None:
+    """The value the nearest proxy put in a forwarded header (the last one in
+    a comma list), or None if there is none."""
+    values = ",".join(request.headers.getlist(name))
+    last = values.split(",")[-1].strip()
+    return last or None
+
+
+def _request_scheme(request: Request) -> str:
+    """``http`` or ``https`` as the browser sees it: X-Forwarded-Proto from a
+    trusted proxy, else the scheme of the connection itself."""
+    if _from_trusted_proxy(request):
+        proto = (_forwarded(request, "x-forwarded-proto") or "").lower()
+        if proto in _DEFAULT_PORTS:
+            return proto
+    return request.url.scheme
+
+
+def _direct_host(request: Request) -> tuple[str, int | None] | None:
+    """(host, port) from the single Host header, or None if it is missing,
+    repeated or malformed."""
+    hosts = request.headers.getlist("host")
+    return _split_host(hosts[0]) if len(hosts) == 1 else None
+
+
+def _request_host(request: Request) -> tuple[str, int | None] | None:
+    """(host, port) as the browser sees it: from a trusted proxy,
+    X-Forwarded-Host overrides the Host header, and X-Forwarded-Port the port
+    unless X-Forwarded-Host already names one; else the Host header. None if
+    the header used is malformed."""
+    target = _direct_host(request)
+    if target is None or not _from_trusted_proxy(request):
+        return target
+    forwarded = _forwarded(request, "x-forwarded-host")
+    if forwarded is not None:
+        target = _split_host(forwarded)
+        if target is None:
+            return None
+        if target[1] is not None:
+            # A port here is the public one (proxy published as 8443:443);
+            # X-Forwarded-Port would then be the proxy's own 443.
+            return target
+    port = _parse_port(_forwarded(request, "x-forwarded-port") or "")
+    return (target[0], port) if port is not None else target
+
+
+def _same_origin(request: Request, host: str, port: int | None) -> bool:
+    """CSRF guard: a mutating request's Origin/Referer must have this request's
+    scheme, host and port. Browsers always send Origin on a cross-site POST, so
+    a request with neither header is a script or curl on the LAN, which the
+    open default allows."""
     origin = request.headers.get("origin") or request.headers.get("referer")
     if not origin:
         return True
-    return urlparse(origin).netloc == request.url.netloc
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    origin_scheme = parsed.scheme.lower()
+    origin_host = _split_host(parsed.netloc)
+    if origin_scheme not in _DEFAULT_PORTS or origin_host is None:
+        return False
+    scheme = _request_scheme(request)
+    return (
+        origin_scheme == scheme
+        and origin_host[0] == host
+        and (origin_host[1] or _DEFAULT_PORTS[origin_scheme]) == (port or _DEFAULT_PORTS[scheme])
+    )
 
 
 @app.middleware("http")
 async def _security(request: Request, call_next):
-    """Every mutating request must come from this site (CSRF guard), password or
-    not: without it any web page a LAN user opens could drive the heating or
-    repoint the hub and MQTT broker with a plain cross-site form post. When a
-    password is set, the UI also needs a session. No password => open to anyone
-    on the LAN (as before).
+    """Every request must name a host this app answers to, on every path: an
+    IP literal, localhost, a single-label name, a .local/.lan/.home.arpa/
+    .internal name, or one listed in HEARTHMAGE_ALLOWED_HOSTS. That stops DNS
+    rebinding, where a hostile page re-points its own name at this app's LAN
+    address. Behind a proxy listed in HEARTHMAGE_TRUSTED_PROXIES, the
+    X-Forwarded-Host/-Proto/-Port it sends stand in for host, scheme and port,
+    and both the Host header and the forwarded host must pass; from anyone
+    else those headers are ignored.
 
-    Known limit: the check compares Origin with the request's own Host header,
-    so it does not stop DNS rebinding (a hostile page whose name is re-pointed
-    at this app's LAN address sends matching Origin and Host). Closing that
-    needs a list of the hostnames this app is reached by; see bead
-    heatapp-local-hr0. A reverse proxy that rewrites Host fails this check
-    for the same reason."""
+    Every mutating request must also come from this site (CSRF guard), password
+    or not: its Origin must match the scheme, host and port above. Without it
+    any web page a LAN user opens could drive the heating or repoint the hub and
+    MQTT broker with a plain cross-site form post. When a password is set, the
+    UI also needs a session. No password => open to anyone on the LAN."""
+    # The Host header must pass even behind a trusted proxy (which keeps Host
+    # and sets X-Forwarded-Host itself): a rebinding page reaching the app
+    # through that hop sends its own name in Host and could pick any
+    # X-Forwarded-Host it likes.
+    direct = _direct_host(request)
+    target = _request_host(request)
+    if direct is None or target is None or not (
+        _host_allowed(direct[0]) and _host_allowed(target[0])
+    ):
+        return PlainTextResponse("Unknown host", status_code=400)
     mutating = request.method in ("POST", "PUT", "PATCH", "DELETE")
-    if mutating and not _same_origin(request):
+    if mutating and not _same_origin(request, *target):
         return PlainTextResponse("CSRF check failed", status_code=403)
     if not settings.auth_enabled:
         return await call_next(request)
