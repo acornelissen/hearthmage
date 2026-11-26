@@ -498,6 +498,10 @@ class NexhoLocalClient:
                         on_reply(reply)
                     return reply
                 except socket.timeout:
+                    # A late reply we never read poisons the next query just as
+                    # a read one does (live 2026-11-26), so a timeout restarts
+                    # the quiet-gap clock too.
+                    self._wire.replied_at = time.monotonic()
                     _log.debug("hub %s timed out after %.1fs", cmd, timeout)
                     continue
                 except OSError as exc:  # noqa: BLE001 - surface transport failures

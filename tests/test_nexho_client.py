@@ -657,6 +657,55 @@ def test_ask_leaves_the_hub_a_quiet_gap_between_exchanges(monkeypatch):
     assert sends[1] - (sends[0] + 0.04) == pytest.approx(0.1)
 
 
+def test_a_retry_after_a_timeout_waits_the_quiet_gap(monkeypatch):
+    """A reply we never read still poisons the next query: live 2026-11-26, a
+    query sent within 50 ms of an abandoned one got the abandoned one's value
+    in 10 of 18 tries, and 0 of 18 from 100 ms on. A late reply can land just
+    as our timeout fires, so the retry after a timeout waits the gap too."""
+    import hearthmage.nexho_client as nc
+
+    clock = {"now": 100.0}
+    events: list[tuple] = []
+    answers = iter([None, b"OK,7\x00"])  # first try times out, retry answers
+
+    class FakeSocket:
+        def __init__(self, *a):
+            pass
+
+        def settimeout(self, t):
+            self.timeout = t
+
+        def connect(self, addr):
+            pass
+
+        def send(self, data):
+            events.append(("send", clock["now"]))
+
+        def recv(self, n):
+            answer = next(answers)
+            if answer is None:
+                clock["now"] += self.timeout
+                raise nc.socket.timeout()
+            clock["now"] += 0.04
+            return answer
+
+        def close(self):
+            pass
+
+    def fake_sleep(seconds):
+        events.append(("sleep", round(seconds, 3)))
+        clock["now"] += seconds
+
+    monkeypatch.setattr(nc, "_HUB_QUIET_GAP", 0.1)
+    monkeypatch.setattr(nc.socket, "socket", FakeSocket)
+    monkeypatch.setattr(nc.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(nc.time, "sleep", fake_sleep)
+    client = NexhoLocalClient("10.0.0.99")
+    assert client._ask("R#1#1#0#0*?E#1#20/", 2, 6.0) == "OK,7"
+    sends = [t for kind, t in events if kind == "send"]
+    assert sends[1] - (sends[0] + 6.0) == pytest.approx(0.1)
+
+
 def _recording_client(keypad_raw: str = "OK,0"):
     sent: list[str] = []
     client = NexhoLocalClient("10.0.0.99")
