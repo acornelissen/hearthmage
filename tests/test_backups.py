@@ -139,6 +139,39 @@ def test_restore_bundle_keeps_stored_secrets_when_absent(tmp_path):
     assert restored["mqtt"]["password"] == "brokerpass"
 
 
+@pytest.mark.parametrize(
+    "imported",
+    [
+        {"host": "10.0.0.66", "port": 1883, "username": "u"},
+        {"host": "10.0.0.5", "port": 8883, "username": "u"},
+        {"host": "10.0.0.5", "port": 1883, "username": "someone"},
+        {"host": "10.0.0.5", "port": 1883},
+    ],
+)
+def test_restore_bundle_drops_stored_password_for_a_different_broker(tmp_path, imported):
+    # An imported file must not redirect the stored password to another broker.
+    cfg = tmp_path / "config.json"
+    _write(cfg, {"mqtt": {"host": "10.0.0.5", "port": 1883, "username": "u", "password": "p"}})
+    restore_bundle(
+        {"hearthmage_backup": 1, "config": {"mqtt": imported}},
+        str(cfg), str(tmp_path / "schedules.json"),
+    )
+    restored = json.loads(cfg.read_text())["mqtt"]
+    assert "password" not in restored
+    assert restored["host"] == imported["host"]
+
+
+def test_restore_bundle_keeps_password_for_the_same_broker_written_differently(tmp_path):
+    cfg = tmp_path / "config.json"
+    _write(cfg, {"mqtt": {"host": "10.0.0.5", "username": "u", "password": "p"}})
+    restore_bundle(
+        {"hearthmage_backup": 1,
+         "config": {"mqtt": {"host": " 10.0.0.5 ", "port": "1883", "username": "u "}}},
+        str(cfg), str(tmp_path / "schedules.json"),
+    )
+    assert json.loads(cfg.read_text())["mqtt"]["password"] == "p"
+
+
 def test_restore_bundle_does_not_inject_mqtt_when_bundle_has_none(tmp_path):
     cfg = tmp_path / "config.json"
     _write(cfg, {"hub_ip": "10.0.0.9", "mqtt": {"host": "10.0.0.5", "password": "p"}})
@@ -244,3 +277,32 @@ def test_snapshots_of_a_shared_file_are_left_as_they_are(tmp_path):
     os.chmod(old, 0o644)
     rotate_backup(str(src))
     assert stat.S_IMODE(os.stat(old).st_mode) == 0o644
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"mqtt": {"host": "10.0.0.5", "port": float("inf")}},
+        {"mqtt": {"host": "10.0.0.5", "port": float("nan")}},
+        {"mqtt": {"host": "10.0.0.5", "port": 70000}},
+        {"mqtt": {"host": "10.0.0.5", "port": "x"}},
+        {"hub_ip": "10.0.0.20", "hub_port": float("inf")},
+        {"hub_ip": "10.0.0.20", "hub_port": 0},
+    ],
+)
+def test_restore_bundle_rejects_an_unusable_port_without_writing(tmp_path, config):
+    # json accepts Infinity; int() of it raised OverflowError on every page.
+    cfg = tmp_path / "config.json"
+    _write(cfg, {"hub_ip": "old"})
+    with pytest.raises(ValueError):
+        restore_bundle({"hearthmage_backup": 1, "config": config},
+                       str(cfg), str(tmp_path / "schedules.json"))
+    assert json.loads(cfg.read_text()) == {"hub_ip": "old"}
+
+
+def test_restore_bundle_accepts_usual_port_forms(tmp_path):
+    cfg = tmp_path / "config.json"
+    for config in ({"hub_port": 6653, "mqtt": {"host": "h", "port": "1883"}},
+                   {"mqtt": {"host": "h"}}, {"mqtt": {"host": "h", "port": None}}):
+        restore_bundle({"hearthmage_backup": 1, "config": config},
+                       str(cfg), str(tmp_path / "schedules.json"))

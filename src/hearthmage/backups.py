@@ -174,6 +174,7 @@ def restore_bundle(bundle: Any, config_path: str, schedules_path: str) -> None:
         if not isinstance(section, dict):
             raise ValueError(f"backup section {key!r} is not an object")
         if key == "config":
+            _check_ports(section)  # an import is untrusted input
             section = _restore_secrets(section, _read_json(path))
         else:
             section = validate_data(section)  # an import is untrusted input
@@ -183,11 +184,29 @@ def restore_bundle(bundle: Any, config_path: str, schedules_path: str) -> None:
         write_json_atomic(path, section)
 
 
+def _check_ports(config: dict) -> None:
+    """Refuse a config whose hub or broker port is not a usable port number.
+    json accepts Infinity, which used to break every page that read it."""
+    # Imported here: settings imports this module for rotate_backup.
+    from hearthmage.settings import parse_port
+
+    mqtt = config.get("mqtt")
+    ports = [config.get("hub_port"), mqtt.get("port") if isinstance(mqtt, dict) else None]
+    for raw in ports:
+        if raw is not None and parse_port(raw) is None:
+            raise ValueError("backup has an unusable port number")
+
+
 def _restore_secrets(incoming: dict, existing: Any) -> dict:
     """Exports are redacted, so an imported config missing ``secret_key`` or
     ``mqtt.password`` keeps whatever the local file already stores. An import
     that explicitly carries those values wins; one with no ``mqtt`` object at
-    all disables MQTT and does not resurrect the old password."""
+    all disables MQTT and does not resurrect the old password. The stored
+    password is carried only to the same broker (host, port and username):
+    an import must not redirect it to another host."""
+    # Imported here: settings imports this module for rotate_backup.
+    from hearthmage.settings import mqtt_broker
+
     if not isinstance(existing, dict):
         return incoming
     incoming = dict(incoming)
@@ -199,6 +218,8 @@ def _restore_secrets(incoming: dict, existing: Any) -> dict:
         and "password" not in mqtt_in
         and isinstance(mqtt_old, dict)
         and mqtt_old.get("password")
+        and mqtt_broker(mqtt_in.get("host"), mqtt_in.get("port"), mqtt_in.get("username"))
+        == mqtt_broker(mqtt_old.get("host"), mqtt_old.get("port"), mqtt_old.get("username"))
     ):
         mqtt_in = dict(mqtt_in)
         mqtt_in["password"] = mqtt_old["password"]

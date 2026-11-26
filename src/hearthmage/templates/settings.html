@@ -55,7 +55,7 @@
             <label class="field-label" for="hub_ip">Hub IP address</label>
             <input class="field-input" id="hub_ip" name="hub_ip" value="{{ hub_ip or '' }}"
                    placeholder="10.0.0.20" inputmode="decimal" required
-                   {% if not hub_ip %}autofocus{% endif %}>
+                   {% if not hub_ip and not mqtt_error %}autofocus{% endif %}>
           </div>
           <div class="field">
             <label class="field-label" for="hub_port">Port</label>
@@ -122,7 +122,11 @@
             <label class="field-label" for="mqtt_password">Password</label>
             <input class="field-input" id="mqtt_password" name="password"
                    type="password" autocomplete="off"
-                   placeholder="{% if mqtt_password_set %}(set) leave blank to keep{% else %}Broker password{% endif %}">
+                   placeholder="{% if mqtt_error %}Enter the broker password{% elif mqtt_password_set %}(set) leave blank to keep{% else %}Broker password{% endif %}"
+                   {% if mqtt_error %}aria-invalid="true" aria-describedby="mqtt_password_error" autofocus{% endif %}>
+            {% if mqtt_error %}
+            <p class="error" id="mqtt_password_error" role="alert">{{ mqtt_error }}</p>
+            {% endif %}
           </div>
           <div class="field">
             <label class="field-label" for="mqtt_base_topic">Base topic</label>

@@ -1657,6 +1657,148 @@ def test_save_mqtt_blank_password_keeps_stored(tmp_path, monkeypatch):
     assert appmod.settings.mqtt_config()["password"] == "sekret"
 
 
+def test_save_mqtt_new_host_with_blank_password_is_rejected(tmp_path, monkeypatch):
+    # The stored password must not follow the settings to a new broker: the
+    # bridge would send it in a plaintext CONNECT to whatever host was typed.
+    appmod, restarts = _mqtt_env(tmp_path, monkeypatch)
+    appmod.settings.set_mqtt("10.0.0.5", 1883, "hearth", "set", "sekret")
+    resp = TestClient(app).post(
+        "/settings/mqtt",
+        data={"host": "10.6.6.6", "port": "1883", "username": "hearth",
+              "password": "", "base_topic": "elsewhere"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert 'id="mqtt_password_error" role="alert"' in resp.text
+    assert 'aria-describedby="mqtt_password_error"' in resp.text
+    assert 'aria-invalid="true"' in resp.text
+    assert 'value="10.6.6.6"' in resp.text  # what the user typed is kept
+    assert 'value="elsewhere"' in resp.text
+    assert "sekret" not in resp.text
+    assert "leave blank to keep" not in resp.text  # would contradict the error
+    assert 'placeholder="Enter the broker password"' in resp.text
+    assert not restarts
+    from hearthmage.settings import Settings
+    cfg = Settings(str(tmp_path / "c.json"), env={}).mqtt_config()
+    assert (cfg["host"], cfg["password"], cfg["base_topic"]) == ("10.0.0.5", "sekret", "hearthmage")
+
+
+def test_save_mqtt_changed_port_or_username_with_blank_password_is_rejected(tmp_path, monkeypatch):
+    appmod, restarts = _mqtt_env(tmp_path, monkeypatch)
+    appmod.settings.set_mqtt("10.0.0.5", 1883, "hearth", "set", "sekret")
+    for port, username in (("8883", "hearth"), ("1883", "intruder")):
+        resp = TestClient(app).post(
+            "/settings/mqtt",
+            data={"host": "10.0.0.5", "port": port, "username": username,
+                  "password": "", "base_topic": "hearthmage"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 400
+    assert not restarts
+    cfg = appmod.settings.mqtt_config()
+    assert (cfg["port"], cfg["username"]) == (1883, "hearth")
+
+
+def test_save_mqtt_refused_by_the_save_itself_gives_the_form_error(tmp_path, monkeypatch):
+    # A concurrent save can change the stored broker after any early check
+    # the route makes; the save's own refusal (taken under the settings lock)
+    # must give the form error, not a 500.
+    from hearthmage.settings import MqttPasswordReentry
+
+    appmod, restarts = _mqtt_env(tmp_path, monkeypatch)
+    appmod.settings.set_mqtt("10.0.0.5", 1883, "hearth", "set", "sekret")
+    monkeypatch.setattr(appmod.settings, "mqtt_password_needs_reentry", lambda *a: False)
+
+    def refuse(*args, **kwargs):
+        raise MqttPasswordReentry("broker changed under us")
+
+    monkeypatch.setattr(appmod.settings, "set_mqtt", refuse)
+    resp = TestClient(app).post(
+        "/settings/mqtt",
+        data={"host": "10.6.6.6", "port": "1883", "username": "hearth",
+              "password": "", "base_topic": "hearthmage"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert not restarts
+    assert appmod.settings.mqtt_config()["host"] == "10.0.0.5"
+
+
+def test_settings_page_survives_an_infinite_stored_port(tmp_path, monkeypatch):
+    (tmp_path / "c.json").write_text('{"mqtt": {"host": "10.0.0.5", "port": Infinity}}')
+    _mqtt_env(tmp_path, monkeypatch)
+    resp = TestClient(app).get("/settings")
+    assert resp.status_code == 200
+    assert 'value="1883"' in resp.text
+
+
+def test_import_with_an_infinite_port_is_rejected(tmp_path, monkeypatch):
+    _mqtt_env(tmp_path, monkeypatch)
+    raw = b'{"hearthmage_backup": 1, "config": {"mqtt": {"host": "10.0.0.5", "port": Infinity}}}'
+    resp = TestClient(app).post(
+        "/settings/import", files={"backup": ("b.json", raw, "application/json")},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert not (tmp_path / "c.json").exists()
+
+
+def test_save_mqtt_first_save_does_not_send_env_password_to_new_host(tmp_path, monkeypatch):
+    appmod, restarts = _mqtt_env(
+        tmp_path, monkeypatch,
+        env={"HEARTHMAGE_MQTT_HOST": "10.0.0.5", "HEARTHMAGE_MQTT_PASSWORD": "envpass"},
+    )
+    resp = TestClient(app).post(
+        "/settings/mqtt",
+        data={"host": "10.6.6.6", "port": "1883", "username": "",
+              "password": "", "base_topic": "hearthmage"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert not restarts
+    assert not (tmp_path / "c.json").exists()
+
+
+def test_save_mqtt_new_host_with_new_password_or_clear_is_saved(tmp_path, monkeypatch):
+    appmod, restarts = _mqtt_env(tmp_path, monkeypatch)
+    appmod.settings.set_mqtt("10.0.0.5", 1883, "hearth", "set", "sekret")
+    c = TestClient(app)
+    resp = c.post(
+        "/settings/mqtt",
+        data={"host": "10.0.0.6", "port": "1883", "username": "hearth",
+              "password": "fresh", "base_topic": "hearthmage"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert appmod.settings.mqtt_config()["password"] == "fresh"
+    resp = c.post(
+        "/settings/mqtt",
+        data={"host": "10.0.0.7", "port": "1883", "username": "hearth",
+              "password": "", "clear_password": "1", "base_topic": "hearthmage"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    cfg = appmod.settings.mqtt_config()
+    assert (cfg["host"], cfg["password"]) == ("10.0.0.7", None)
+    assert len(restarts) == 2
+
+
+def test_import_does_not_carry_stored_password_to_a_new_broker(tmp_path, monkeypatch):
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    appmod.settings.set_mqtt("10.0.0.5", 1883, "hearth", "set", "brokerpass")
+    bundle = {"hearthmage_backup": 1,
+              "config": {"mqtt": {"host": "10.6.6.6", "port": 1883, "username": "hearth"}}}
+    resp = TestClient(app).post(
+        "/settings/import",
+        files={"backup": ("b.json", json.dumps(bundle).encode(), "application/json")},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    from hearthmage.settings import Settings
+    restored = Settings(str(tmp_path / "c.json"), env={}).mqtt_config()
+    assert (restored["host"], restored["password"]) == ("10.6.6.6", None)
+
+
 def test_save_mqtt_clear_password(tmp_path, monkeypatch):
     appmod, _ = _mqtt_env(tmp_path, monkeypatch)
     appmod.settings.set_mqtt("10.0.0.5", 1883, "hearth", "set", "sekret")

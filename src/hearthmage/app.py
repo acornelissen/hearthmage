@@ -38,7 +38,7 @@ from hearthmage.schedule import (
     Block,
 )
 from hearthmage.schedule_store import ScheduleStore
-from hearthmage.settings import Settings, config_path
+from hearthmage.settings import MqttPasswordReentry, Settings, config_path, parse_port
 from hearthmage.sync_store import SyncStore
 from hearthmage.waste import WasteDetector, status_diff
 
@@ -514,6 +514,14 @@ def logout() -> RedirectResponse:
 
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request) -> HTMLResponse:
+    return _settings_response(request)
+
+
+def _settings_response(
+    request: Request, mqtt_form: dict | None = None, status_code: int = 200
+) -> HTMLResponse:
+    """The settings page. ``mqtt_form`` re-shows a rejected MQTT form: the
+    values the user typed (never the password) plus ``mqtt_error``."""
     rooms: list = []
     if settings.is_configured():
         try:
@@ -530,7 +538,9 @@ def settings_page(request: Request) -> HTMLResponse:
             "auth_enabled": settings.auth_enabled,
             "hub_ready": settings.is_configured(),
             **_mqtt_view(),
+            **(mqtt_form or {}),
         },
+        status_code=status_code,
     )
 
 
@@ -550,26 +560,39 @@ def _mqtt_view() -> dict:
 
 @app.post("/settings/mqtt")
 def save_mqtt(
+    request: Request,
     host: str = Form(...),
     port: str = Form("1883"),  # str, then parsed: a stray value must not 422
     username: str = Form(""),
     password: str = Form(""),
     clear_password: str = Form(None),
     base_topic: str = Form("hearthmage"),
-) -> RedirectResponse:
+) -> Response:
     host = host.strip()
     if not host:
         # Nothing to save; disabling is an explicit action (/settings/mqtt/disable).
         return RedirectResponse("/settings", status_code=303)
-    try:
-        port_num = int(port)
-    except (TypeError, ValueError):
-        port_num = 1883
-    if not 1 <= port_num <= 65535:
-        port_num = 1883  # same fall-back-to-default style as hub_port
+    port_num = parse_port(port) or 1883  # same fall-back-to-default style as hub_port
     # Blank password input keeps the stored one; the checkbox clears it.
     action = "clear" if clear_password is not None else ("set" if password else "keep")
-    settings.set_mqtt(host, port_num, username, action, password, base_topic=base_topic)
+    try:
+        settings.set_mqtt(host, port_num, username, action, password, base_topic=base_topic)
+    except MqttPasswordReentry:
+        # The stored password would go, in plaintext, to a broker it was not
+        # entered for. Nothing was saved; ask for it again.
+        return _settings_response(
+            request,
+            {
+                "mqtt_host": host,
+                "mqtt_port": port_num,
+                "mqtt_username": username.strip(),
+                "mqtt_base_topic": base_topic,
+                "mqtt_error": "The broker host, port or username changed. Enter the "
+                "broker password again, or tick “Remove the stored broker "
+                "password” to connect without one.",
+            },
+            status_code=400,
+        )
     _restart_mqtt()
     return RedirectResponse("/settings", status_code=303)
 
