@@ -616,6 +616,21 @@ def test_bad_trusted_proxy_entries_are_reported_at_startup(monkeypatch, caplog):
     assert any("*.startup-test" in m for m in messages)
 
 
+def test_startup_makes_the_apps_own_data_files_private(monkeypatch):
+    # A share's inherited ACL can leave existing files world-readable (seen on
+    # the Synology NAS); the next write would fix each one, but some are rarely
+    # written, so startup tightens them all.
+    import hearthmage.app as appmod
+
+    seen = []
+    monkeypatch.setattr(appmod, "tighten_data_files", lambda paths: seen.append(list(paths)))
+    with TestClient(app):
+        pass
+    s = appmod.settings
+    assert seen == [[s.config_file, s.schedules_path, s.sync_path, s.holiday_path,
+                     s.sessions_path, s.cache_path, s.energy_path]]
+
+
 def test_request_scheme_follows_forwarded_proto_only_from_a_trusted_proxy(monkeypatch):
     from starlette.requests import Request as StarletteRequest
 

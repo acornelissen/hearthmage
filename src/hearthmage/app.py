@@ -36,7 +36,7 @@ from hearthmage.auth import (
     password_fingerprint,
     throttle_key,
 )
-from hearthmage.backups import build_bundle, restore_bundle
+from hearthmage.backups import build_bundle, restore_bundle, tighten_data_files
 from hearthmage.domain import HearthClient, HearthError
 from hearthmage.energy import cost, daily_kwh
 from hearthmage.energy_store import EnergyStore
@@ -86,6 +86,13 @@ async def _lifespan(_app: FastAPI):
     # first request (the parsers cache, so it is logged once).
     _parse_allowed_hosts(settings.allowed_hosts)
     _parse_trusted_proxies(settings.trusted_proxies)
+    # A share's inherited ACL can have left the app's files readable by others
+    # (the Synology NAS did); every write makes its file private again, and
+    # this covers the ones that are rarely written. history.py does its own.
+    tighten_data_files([
+        settings.config_file, settings.schedules_path, settings.sync_path, settings.holiday_path,
+        settings.sessions_path, settings.cache_path, settings.energy_path,
+    ])
     if settings.auth_enabled:
         _sessions()  # load now: seeds the throttle's known addresses
     yield

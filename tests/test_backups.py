@@ -260,9 +260,10 @@ def test_older_snapshots_of_a_private_file_are_tightened(tmp_path):
         assert stat.S_IMODE(os.stat(snap).st_mode) & 0o077 == 0, snap
 
 
-def test_snapshots_of_a_shared_file_are_left_as_they_are(tmp_path):
-    # If the file itself is readable by others (a share that manages access its
-    # own way), that is the owner's choice; do not lock its old snapshots.
+def test_snapshots_of_a_readable_file_are_made_private_too(tmp_path):
+    # Changed 2026-11-26 (owner decision): a share whose inherited ACL opens
+    # the app's files up does not get to decide; the app's files are always
+    # owner-only, snapshots included.
     import os
     import stat
 
@@ -276,7 +277,53 @@ def test_snapshots_of_a_shared_file_are_left_as_they_are(tmp_path):
     old.write_text("{}")
     os.chmod(old, 0o644)
     rotate_backup(str(src))
-    assert stat.S_IMODE(os.stat(old).st_mode) == 0o644
+    assert stat.S_IMODE(os.stat(old).st_mode) == 0o600
+
+
+def test_snapshot_and_backups_folder_are_private_on_a_share_that_opens_them_up(tmp_path, monkeypatch):
+    import os
+    import stat
+    import tempfile
+
+    from hearthmage.backups import rotate_backup
+
+    real = tempfile.mkstemp
+
+    def mkstemp(*a, **k):  # the share's inherited ACL, as on the Synology NAS
+        fd, path = real(*a, **k)
+        os.chmod(path, 0o777)
+        return fd, path
+
+    monkeypatch.setattr(tempfile, "mkstemp", mkstemp)
+    src = tmp_path / "config.json"
+    src.write_text("{}")
+    (tmp_path / "backups").mkdir(mode=0o777)
+    os.chmod(tmp_path / "backups", 0o777)
+    snapshot = rotate_backup(str(src))
+    assert stat.S_IMODE(os.stat(snapshot).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(tmp_path / "backups").st_mode) == 0o700
+
+
+def test_tighten_data_files_covers_the_files_their_snapshots_and_folder_only(tmp_path):
+    import os
+    import stat
+
+    from hearthmage.backups import tighten_data_files
+
+    mine = tmp_path / "config.json"
+    mine.write_text("{}")
+    other = tmp_path / "notes.txt"  # someone else's file in the same folder
+    other.write_text("x")
+    snaps = tmp_path / "backups"
+    snaps.mkdir()
+    snap = snaps / "config.json.20260101T000000_000000.bak.json"
+    snap.write_text("{}")
+    for p in (mine, other, snap, snaps):
+        os.chmod(p, 0o777)
+    tighten_data_files([str(mine), str(tmp_path / "absent.json")])
+    mode = lambda p: stat.S_IMODE(os.stat(p).st_mode)  # noqa: E731
+    assert (mode(mine), mode(snap), mode(snaps)) == (0o600, 0o600, 0o700)
+    assert mode(other) == 0o777
 
 
 @pytest.mark.parametrize(
