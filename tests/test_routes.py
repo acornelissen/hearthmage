@@ -318,6 +318,16 @@ def test_protected_get_redirects_to_login(tmp_path, monkeypatch):
     assert resp.headers["location"] == "/login"
 
 
+def test_an_htmx_poll_without_a_session_sends_the_tab_to_login(tmp_path, monkeypatch):
+    # A session that expires under a polling page: htmx would follow a 303,
+    # get the login page as a partial and keep polling /login.
+    _with_auth(monkeypatch, tmp_path)
+    resp = TestClient(app).get("/rooms/1/status", headers={"HX-Request": "true"},
+                               follow_redirects=False)
+    assert resp.status_code == 204
+    assert resp.headers["HX-Redirect"] == "/login"
+
+
 def test_login_sets_session_and_grants_access(tmp_path, monkeypatch):
     appmod = _with_auth(monkeypatch, tmp_path)
     appmod.app.dependency_overrides[get_client] = lambda: FakeHearthClient(
@@ -1516,6 +1526,85 @@ def test_index_shows_stale_banner():
         assert "hasn" in resp.text and "hub" in resp.text  # stale banner text present
     finally:
         app.dependency_overrides.clear()
+
+
+class _ColdClient:
+    """A hub client before (or after) the poller's first zone list."""
+
+    def __init__(self, connecting=True, rooms=(), stale=False):
+        self._connecting, self._rooms, self._stale = connecting, list(rooms), stale
+
+    def list_rooms(self):
+        return self._rooms
+
+    def hub_stale(self):
+        return self._stale
+
+    def connecting(self):
+        return self._connecting
+
+
+def _get(cold, path):
+    app.dependency_overrides[get_client] = lambda: cold
+    try:
+        return TestClient(app).get(path)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_index_says_it_is_connecting_until_the_hub_has_listed_its_zones():
+    # heatapp-local-88h: before the poller's first zone list there are no
+    # rooms yet; that is not "no rooms on the hub". The live region sits
+    # outside the room list, and the poll swaps nothing until rooms exist
+    # (so focus stays put and a login or setup page is never swapped in).
+    html = _get(_ColdClient(stale=True), "/").text
+    status = html.index('<p id="rooms-status"')
+    assert 'role="status">Connecting to the hub' in html[status:]
+    assert status < html.index('<section id="rooms"')
+    assert 'hx-get="/rooms?stale=1" hx-trigger="every 3s" hx-swap="none"' in html
+    assert 'id="connecting-settings"' in html  # focus can be restored by id
+    assert "No rooms found on the hub yet" not in html
+
+
+def test_index_with_an_empty_hub_says_no_rooms():
+    html = _get(_ColdClient(connecting=False), "/").text
+    assert "No rooms found on the hub yet" in html
+    assert 'hx-get="/rooms' not in html
+    assert 'role="status"></p>' in html  # the live region is there, empty
+
+
+def test_the_rooms_poll_swaps_nothing_while_still_connecting():
+    resp = _get(_ColdClient(), "/rooms?stale=0")
+    assert resp.status_code == 204 and resp.text == ""
+
+
+def test_the_rooms_poll_carries_what_the_page_last_saw():
+    html = _get(_ColdClient(), "/").text
+    assert 'hx-get="/rooms?stale=0"' in html
+    assert '<div id="hub-stale">' in html  # the banner's slot, filled out of band
+
+
+def test_the_rooms_poll_shows_the_stale_banner_once_the_hub_goes_quiet():
+    # Loaded while connecting; then the hub never answers. The poll must bring
+    # in the banner and the settings link, and swap nothing once it has.
+    resp = _get(_ColdClient(stale=True), "/rooms?stale=0")
+    assert resp.status_code == 200
+    assert '<div id="hub-stale" hx-swap-oob="true">' in resp.text
+    assert 'role="alert">HearthMage hasn' in resp.text
+    assert 'id="connecting-settings"' in resp.text
+    assert 'hx-get="/rooms?stale=1"' in resp.text  # the next poll says it has seen it
+    assert "rooms-status" not in resp.text  # the live region keeps its text
+    again = _get(_ColdClient(stale=True), "/rooms?stale=1")
+    assert again.status_code == 204
+
+
+def test_the_rooms_poll_delivers_the_rooms_once_known():
+    room = Room("1", "Living Room", 19.5, 21.0, is_off=False, min_temp=5.0, max_temp=30.0)
+    resp = _get(_ColdClient(connecting=False, rooms=[room]), "/rooms")
+    assert resp.status_code == 200
+    assert '<section id="rooms" class="rooms" hx-swap-oob="true">' in resp.text
+    assert "Living Room" in resp.text
+    assert '<p id="rooms-status" hx-swap-oob="innerHTML">Connected to the hub.</p>' in resp.text
 
 
 # ---- backup / restore ---------------------------------------------------
@@ -2868,3 +2957,120 @@ def test_a_password_reentry_error_keeps_the_warning_about_the_stored_broker(tmp_
     assert 'id="mqtt_password_error" role="alert"' in resp.text
     assert 'id="mqtt_host_error" role="alert"' in resp.text
     assert "100.64.0.9" in resp.text.split('id="mqtt_host_error"', 1)[1].split("</p>", 1)[0]
+
+
+# ---- hub client lifecycle (review of heatapp-local-6vg, 2026-11-26) -------
+
+
+def _hub_configured(tmp_path, monkeypatch):
+    import hearthmage.app as appmod
+    from hearthmage.settings import Settings
+
+    s = Settings(str(tmp_path / "c.json"), env={})
+    s.set_hub("10.0.0.20", 6653)
+    monkeypatch.setattr(appmod, "settings", s)
+    monkeypatch.setattr(appmod, "_start_retry_loop", lambda: None)
+    monkeypatch.setattr(appmod, "mqtt_bridge", None)
+    return appmod
+
+
+def test_a_new_hub_client_is_not_built_while_the_old_one_is_stopping(tmp_path, monkeypatch):
+    import threading
+
+    import hearthmage.nexho_client as nc
+
+    appmod = _hub_configured(tmp_path, monkeypatch)
+    events: list[str] = []
+    stopping, finish = threading.Event(), threading.Event()
+
+    class Old:
+        def stop(self):
+            stopping.set()
+            finish.wait(2)
+            events.append("old stopped")
+
+    class New:
+        def __init__(self, *a, **k):
+            events.append("new built")
+
+        def start(self):
+            pass
+
+        def list_rooms(self):
+            return []
+
+    monkeypatch.setattr(nc, "NexhoLocalClient", New)
+    monkeypatch.setattr(appmod, "_client", Old())
+    monkeypatch.setattr(appmod, "_client_hub", ("10.0.0.20", 6653))
+    dropper = threading.Thread(target=appmod._drop_client)
+    dropper.start()
+    assert stopping.wait(2)
+    builder = threading.Thread(target=appmod.get_client)
+    builder.start()
+    builder.join(0.2)  # time enough to build, if it could
+    finish.set()
+    dropper.join(2)
+    builder.join(2)
+    assert events == ["old stopped", "new built"]
+
+
+def test_mqtt_discovery_follows_the_pollers_zone_list(tmp_path, monkeypatch):
+    # A first run has no readings cache: the rooms are unknown when the client
+    # is built, so discovery must go out when the poller finds them.
+    import hearthmage.nexho_client as nc
+
+    appmod = _hub_configured(tmp_path, monkeypatch)
+    built: dict = {}
+
+    class New:
+        def __init__(self, *a, **k):
+            built.update(k)
+
+        def start(self):
+            pass
+
+        def list_rooms(self):
+            return []
+
+    class Bridge:
+        def __init__(self):
+            self.published: list = []
+
+        def publish_discovery(self, zones):
+            self.published.append(zones)
+
+        def has_zones(self):
+            return any(self.published)
+
+    bridge = Bridge()
+    monkeypatch.setattr(nc, "NexhoLocalClient", New)
+    monkeypatch.setattr(appmod, "_client", None)
+    monkeypatch.setattr(appmod, "_client_hub", None)
+    monkeypatch.setattr(appmod, "mqtt_bridge", bridge)
+    appmod.get_client()
+    built["on_zones"]([("1", "Lounge"), ("2", "Zone 2")])  # the poller's first zone list
+    assert bridge.published[-1] == [("1", "Lounge"), ("2", "Zone 2")]
+
+
+def test_a_schedule_push_cut_off_by_a_client_swap_goes_to_the_new_client(tmp_path, monkeypatch):
+    # A backup import swaps clients while a push runs on the old one: that is
+    # not the hub refusing the schedule, so no "failed" and no retry backoff.
+    appmod = _with_store(tmp_path, monkeypatch)
+    from hearthmage.schedule import Block
+
+    appmod.schedules.set_pattern("1", [Block(20, 0, 60)], [0])
+
+    class Stopped(FakeHearthClient):
+        def stopped(self):
+            return True
+
+        def set_day_pattern(self, *a, **k):
+            raise HearthError("The hub connection was restarted. Try again.")
+
+    current = _room_fake()
+    monkeypatch.setattr(appmod, "get_client", lambda: current)
+    appmod.sync.set("1", "pending")
+    appmod._sync_running.add("1")
+    appmod._sync_until_settled(Stopped(_room_fake().list_rooms()), "1")
+    assert current.applied and appmod.sync.get("1") == "synced"
+    assert "1" not in appmod._sync_backoff

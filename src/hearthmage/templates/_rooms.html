@@ -1,4 +1,4 @@
-<section id="rooms" class="rooms">
+<section id="rooms" class="rooms"{% if oob %} hx-swap-oob="true"{% endif %}>
   {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
   {% for room in rooms %}
   <article class="zone">
@@ -54,7 +54,17 @@
     </form>
   </article>
   {% else %}
-  {% if not error %}
+  {% if connecting %}
+  {# Swaps nothing while nothing changed (204). It sends what this page last
+     saw; once the hub goes quiet, or rooms exist, the reply replaces the
+     banner and #rooms out of band. A login or setup page has nothing out of band. #}
+  <div hidden hx-get="/rooms?stale={{ 1 if hub_stale else 0 }}" hx-trigger="every 3s" hx-swap="none"></div>
+  {% if hub_stale %}
+  <div class="empty-state">
+    <a class="btn" id="connecting-settings" href="/settings">Check hub settings</a>
+  </div>
+  {% endif %}
+  {% elif not error %}
   <div class="empty-state">
     <p>No rooms found on the hub yet.</p>
     <a class="btn" href="/settings">Check hub settings</a>

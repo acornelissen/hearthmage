@@ -1,0 +1,5 @@
+{# Reply to the poll in _rooms.html: everything here is swapped out of band. #}
+{% set oob = true %}
+{% if not connecting %}<p id="rooms-status" hx-swap-oob="innerHTML">Connected to the hub.</p>{% endif %}
+{% include "_hub_stale.html" %}
+{% include "_rooms.html" %}

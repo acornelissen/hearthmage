@@ -782,6 +782,11 @@ a.link-btn:hover { text-decoration: underline; }
 /* Which program mode is currently set (see also the text in .panel-note). */
 .prog-toggle-actions .is-current { box-shadow: inset 0 0 0 2px var(--ink); }
 
+/* "Connecting to the hub..." above the room list; takes no room when empty,
+   but stays rendered so screen readers keep it as a live region. */
+.rooms-status { margin: 0 0 1rem; color: var(--muted); }
+.rooms-status:empty { margin: 0; }
+
 .empty-state {
   display: grid;
   justify-items: center;

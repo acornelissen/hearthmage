@@ -16,6 +16,25 @@ def _no_resend_gap(monkeypatch):
     monkeypatch.setattr("hearthmage.nexho_client._HUB_QUIET_GAP", 0.0)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_hub_wires(monkeypatch):
+    """Clients of one hub address share its wire; each test starts with none."""
+    monkeypatch.setattr("hearthmage.nexho_client._wires", {}, raising=False)
+
+
+class _NoNetwork:
+    """Stands in for socket.socket: a test that reaches the real UDP layer
+    without its own fake fails instead of sending to a LAN address."""
+
+    def __init__(self, *a, **k):
+        raise AssertionError("a test reached the real network; use _fake_hub or stub _ask")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_network(monkeypatch):
+    monkeypatch.setattr("hearthmage.nexho_client.socket.socket", _NoNetwork)
+
+
 def make_client(responses: dict[str, str], names=None) -> NexhoLocalClient:
     """A client whose UDP layer is replaced by a canned-response lookup."""
     client = NexhoLocalClient("10.0.0.99", zone_names=names or {})
@@ -154,11 +173,42 @@ def test_poll_then_list_rooms_serves_cache():
     assert rooms[1].status == "unreachable"
 
 
-def test_list_rooms_cold_start_seeds_loading():
+def test_the_first_zone_list_seeds_loading_rooms():
     client = make_client({"OPS2/": "OPOK,OPS2,1,2"})
-    rooms = client.list_rooms()  # no poll has run yet
-    assert [r.id for r in rooms] == ["1", "2"]
-    assert all(r.status == "loading" for r in rooms)
+    seen: list[list[str]] = []
+
+    def read(zone):
+        if not seen:
+            seen.append([r.status for r in client.list_rooms()])
+        return None, None, False
+
+    client._read_zone_raw = read  # type: ignore[method-assign]
+    client._poll_once()
+    assert seen == [["loading", "loading"]]  # shown while the first reads run
+
+
+def test_list_rooms_never_talks_to_the_hub():
+    # heatapp-local-88h. Cold start, no readings cache, hub down: list_rooms
+    # runs on page requests and htmx polls, so it must not wait on the wire
+    # (up to 12 s each). It serves what the poller knows, here nothing yet.
+    asked: list[str] = []
+
+    def down(cmd, *a, **k):
+        asked.append(cmd)
+        raise HearthError("hub down")
+
+    client = NexhoLocalClient("10.0.0.99")
+    client._ask = down  # type: ignore[method-assign]
+    assert client.list_rooms() == []
+    assert asked == []
+    assert client.connecting() is True  # the UI says so instead of "no rooms"
+
+
+def test_connecting_ends_with_the_first_zone_list():
+    client = make_client({"OPS2/": "OPOK,OPS2,1,2", "R#": "ER,1"})
+    client._poll_once()
+    assert client.connecting() is False
+    assert [r.id for r in client.list_rooms()] == ["1", "2"]
 
 
 def test_zone_list_cached_and_resilient():
@@ -910,6 +960,7 @@ def _multi_heater_client():
 def test_zones_with_no_heaters_are_hidden():
     client, _ = _multi_heater_client()
     assert client._zone_ids() == [1, 3]
+    client._poll_once()  # the poller puts the rooms on screen
     assert [r.id for r in client.list_rooms()] == ["1", "3"]
 
 
@@ -1085,7 +1136,7 @@ def test_a_zone_the_hub_does_not_have_is_refused_before_anything_is_sent():
         return {"OPS2/": "OPOK,OPS2,1,2", "OPS3/": "OPOK,OPS3,1,1"}.get(cmd, "OK")
 
     client._ask = ask  # type: ignore[method-assign]
-    client._zone_ids()
+    client._poll_once()
     sent.clear()
     with pytest.raises(HearthError, match="Unknown zone"):
         client.set_temperature("999", 30)
@@ -1460,9 +1511,11 @@ def test_a_newer_mode_command_during_the_first_send_stops_the_old_setpoint(
             client.set_program_active("2", True)
     other = threading.Thread(target=newer)
     other.start()
-    _wait_until(lambda: client._writes_pending == 2, "the newer command to queue for the wire")
-    hub_answers.set()
-    other.join(2)
+    try:
+        _wait_until(lambda: client._wire.writes_pending == 2, "the newer command to queue for the wire")
+    finally:
+        hub_answers.set()  # never leave a thread blocked past the fake hub's life
+        other.join(2)
     try:
         _wait_for_writer(client, 2)  # nothing is left to retry
     finally:
@@ -1882,3 +1935,389 @@ def test_an_empty_heater_count_is_unknown_for_that_zone_only(caplog):
         assert client._zone_ids() == [1, 2]  # zone 2 unknown stays visible, 3 hidden
     assert (client._modules(1), client._modules(2)) == (2, 1)  # unknown: one heater
     assert _warnings(caplog) == []
+
+
+# ---- the poller survives anything (heatapp-local-97w) ---------------------
+
+
+def test_the_poller_survives_a_failure_while_working_out_its_sleep():
+    import threading
+
+    client = NexhoLocalClient("10.0.0.99", poll_interval=0.01)
+    second_poll = threading.Event()
+    polls: list[int] = []
+
+    def poll_once():
+        polls.append(1)
+        if len(polls) == 2:
+            second_poll.set()
+
+    sleeps: list[int] = []
+
+    def sleep_until_due():
+        sleeps.append(1)
+        if len(sleeps) == 1:
+            raise RuntimeError("dictionary changed size during iteration")
+        return 0.0
+
+    client._poll_once = poll_once  # type: ignore[method-assign]
+    client._sleep_until_due = sleep_until_due  # type: ignore[method-assign]
+    client.start()
+    try:
+        assert second_poll.wait(2), "the poller died"
+    finally:
+        client.stop()
+        client._thread.join(2)
+
+
+# ---- one conversation with a hub across a client swap (heatapp-local-6vg) --
+
+
+def test_a_stopped_poller_sends_nothing_after_the_read_on_the_air(monkeypatch):
+    # The app swaps clients (settings save, backup import) while the old
+    # poller is reading zone 1. Zones 2 and 3 must not be read after that.
+    client = NexhoLocalClient("10.0.0.99")
+
+    def reply(cmd):
+        if cmd == "OPS2/":
+            return "OPOK,OPS2,1,2,3"
+        if cmd.startswith("R#1#"):
+            client.stop()
+        return "ER,1"
+
+    sent = _fake_hub(monkeypatch, reply)
+    client._poll_once()
+    assert [cmd for cmd in sent if cmd.startswith("R#")] == ["R#1#1#0#0*?T/"]
+
+
+def test_a_stopped_client_puts_nothing_on_the_wire(monkeypatch):
+    sent = _fake_hub(monkeypatch, lambda cmd: "OK")
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    client.stop()
+    with pytest.raises(HearthError):
+        client.set_config("2", window_sensor=True)  # a request thread still holding it
+    with pytest.raises(HearthError):
+        client.set_temperature("2", 22.0)  # refused, not silently lost
+    assert sent == []
+
+
+def test_a_new_client_leaves_the_quiet_gap_after_the_old_ones_reply(monkeypatch):
+    # The hub answers a query sent straight after its last reply with that
+    # reply's value, whichever client sent it.
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc, "_HUB_QUIET_GAP", 0.1)
+    monkeypatch.setattr(nc.time, "monotonic", lambda: 100.0)
+    slept: list[float] = []
+    monkeypatch.setattr(nc.time, "sleep", slept.append)
+    _fake_hub(monkeypatch, lambda cmd: "OPOK")
+    old = NexhoLocalClient("10.0.0.99")
+    old._ask("OPS2/", 1, 1.0)
+    old.stop()
+    NexhoLocalClient("10.0.0.99")._ask("OPS2/", 1, 1.0)
+    assert slept == [pytest.approx(0.1)]
+
+
+def test_a_new_client_waits_for_the_old_ones_exchange_to_finish(monkeypatch):
+    import threading
+
+    on_air = threading.Event()
+    answer = threading.Event()
+
+    def reply(cmd):
+        if cmd == "OPS2/":
+            on_air.set()
+            answer.wait(2)  # the hub is still busy with the old client's query
+        return "OPOK"
+
+    sent = _fake_hub(monkeypatch, reply)
+    old = NexhoLocalClient("10.0.0.99")
+    new = NexhoLocalClient("10.0.0.99")
+    first = threading.Thread(target=lambda: old._ask("OPS2/", 1, 1.0))
+    second = threading.Thread(target=lambda: new._ask("OPMR3898/", 1, 1.0))
+    first.start()
+    try:
+        assert on_air.wait(2)
+        old.stop()
+        second.start()
+        second.join(0.2)  # time enough to send, if it could
+        early = list(sent)
+    finally:
+        answer.set()
+        first.join(2)
+        if second.is_alive() or second.ident is not None:
+            second.join(2)
+    assert early == ["OPS2/"]
+    assert sent == ["OPS2/", "OPMR3898/"]
+
+
+def test_another_hub_has_its_own_wire():
+    assert NexhoLocalClient("10.0.0.99")._wire is NexhoLocalClient("10.0.0.99")._wire
+    assert NexhoLocalClient("10.0.0.99")._wire is not NexhoLocalClient("10.0.0.98")._wire
+
+
+def _swap_while_waiting(new_ip="10.0.0.99"):
+    """An old client whose 22 C the radiator has not acknowledged is stopped
+    (the app swapped clients); a new one starts. Returns (old, new, new_sent)."""
+    old = NexhoLocalClient("10.0.0.99")
+    _zone_ready(old)
+    old_sent = _scripted_sends(old, {22.0: [False]})
+    old.set_temperature("2", 22.0)
+    _wait_until(lambda: old.list_rooms()[0].unconfirmed, "the not-confirmed mark")
+    old.stop()
+    _wait_for_writer(old, 2)
+    assert old_sent == [22.0]  # the old worker sent nothing more
+    new = NexhoLocalClient(new_ip)
+    new._poll_once = lambda: None  # type: ignore[method-assign]
+    _zone_ready(new)
+    new_sent = _scripted_sends(new, {22.0: [False]})
+    return old, new, new_sent
+
+
+def test_a_setpoint_waiting_in_the_old_client_is_carried_to_the_new_one():
+    old, new, new_sent = _swap_while_waiting()
+    new.start()
+    try:
+        _wait_until(lambda: new_sent, "the new client to send it")
+        room = new.list_rooms()[0]
+        assert (room.target_temp, room.unconfirmed) == (22.0, True)
+        assert new._pending[2] == 22.0  # the poller keeps it
+        assert new._requested_at[2] == old._requested_at[2]  # the give-up clock runs on
+    finally:
+        new.stop()
+        new._thread.join(2)
+        _wait_for_writer(new, 2)
+    assert new_sent == [22.0]
+
+
+def test_a_setpoint_is_not_carried_to_another_hub():
+    _old, new, new_sent = _swap_while_waiting(new_ip="10.0.0.98")
+    new.start()
+    new.stop()
+    new._thread.join(2)
+    assert new_sent == [] and 2 not in new._desired
+
+
+# ---- review of the swap (2026-11-26): acks, overlapping stops, cancels ----
+
+
+def _idle_client(ip="10.0.0.99", **kw):
+    client = NexhoLocalClient(ip, **kw)
+    client._poll_once = lambda: None  # type: ignore[method-assign]
+    _zone_ready(client)
+    return client
+
+
+def test_a_setpoint_acked_after_stop_is_not_sent_again(monkeypatch):
+    # The old worker's D# is on the air when the app stops the client; the
+    # hub acks it. The new client must not send it a second time.
+    import threading
+
+    on_air, answer = threading.Event(), threading.Event()
+
+    def reply(cmd):
+        if cmd.startswith("D#2") and not on_air.is_set():
+            on_air.set()
+            answer.wait(2)
+        return "OK"
+
+    sent = _fake_hub(monkeypatch, reply)
+    old = _idle_client()
+    old.set_temperature("2", 22.0)
+    assert on_air.wait(2)
+    old.stop()
+    new = _idle_client()
+    new.start()
+    answer.set()
+    _wait_for_writer(old, 2)
+    _wait_for_writer(new, 2)
+    new.stop()
+    assert [c for c in sent if c.startswith("D#2")] == ["D#2#1#0#0*T22/"]
+    room = new.list_rooms()[0]
+    assert (room.target_temp, room.unconfirmed, new._last[2][1]) == (22.0, False, 22.0)
+
+
+def test_an_acked_setpoint_parked_on_the_wire_is_not_replayed(monkeypatch):
+    # Hub A -> hub B -> hub A: the old A client's setpoint was acked after it
+    # stopped, while nobody owned A's wire. The next A client must not send it.
+    import threading
+
+    on_air, answer = threading.Event(), threading.Event()
+
+    def reply(cmd):
+        if cmd.startswith("D#2") and not on_air.is_set():
+            on_air.set()
+            answer.wait(2)
+        return "OK"
+
+    sent = _fake_hub(monkeypatch, reply)
+    old = _idle_client()
+    old.set_temperature("2", 22.0)
+    assert on_air.wait(2)
+    old.stop()  # nobody owns the wire: the setpoint is parked
+    answer.set()
+    _wait_for_writer(old, 2)
+    again = _idle_client()
+    again.start()
+    again.stop()
+    assert [c for c in sent if c.startswith("D#2")] == ["D#2#1#0#0*T22/"]
+    assert 2 not in again._desired
+
+
+def test_a_setpoint_acked_just_before_stop_is_not_carried(monkeypatch):
+    # The ack is in, but the worker has not recorded it yet when stop() runs.
+    sent = _fake_hub(monkeypatch, lambda cmd: "OK")
+    old = _idle_client()
+    real_send = old._send_once
+
+    def send_then_swap(zone, target):
+        result = real_send(zone, target)
+        old.stop()
+        return result
+
+    old._send_once = send_then_swap  # type: ignore[method-assign]
+    old.set_temperature("2", 22.0)
+    _wait_for_writer(old, 2)
+    new = _idle_client()
+    new.start()
+    new.stop()
+    assert [c for c in sent if c.startswith("D#2")] == ["D#2#1#0#0*T22/"]
+    assert 2 not in new._desired
+
+
+def test_a_setpoint_is_kept_when_two_stops_overlap(monkeypatch):
+    # c1 is stopped while the owner c2 is itself stopping (its snapshot taken,
+    # its hand-over not yet). c1's setpoint must reach c3.
+    import threading
+
+    import hearthmage.nexho_client as nc
+
+    c1 = NexhoLocalClient("10.0.0.99")
+    _zone_ready(c1)
+    _scripted_sends(c1, {22.0: [False]})
+    c1.set_temperature("2", 22.0)
+    _wait_until(lambda: c1.list_rooms()[0].unconfirmed, "the not-confirmed mark")
+    c2 = _idle_client()
+    c2.start()
+    real_hand_over = nc._Wire.hand_over
+    in_c2, go = threading.Event(), threading.Event()
+
+    def gated(self, client, waiting):
+        if client is c2:
+            in_c2.set()
+            go.wait(2)
+        return real_hand_over(self, client, waiting)
+
+    monkeypatch.setattr(nc._Wire, "hand_over", gated)
+    stopping = threading.Thread(target=c2.stop)
+    stopping.start()
+    assert in_c2.wait(2)
+    c1.stop()
+    go.set()
+    stopping.join(2)
+    _wait_for_writer(c1, 2)
+    c3 = _idle_client()
+    c3_sent = _scripted_sends(c3, {22.0: [True]})
+    c3.start()
+    try:
+        _wait_until(lambda: c3_sent, "c3 to send the carried setpoint")
+    finally:
+        c3.stop()
+        _wait_for_writer(c3, 2)
+    assert c3_sent == [22.0]
+
+
+def test_a_cancel_on_the_new_client_beats_the_old_clients_hand_over():
+    # The program is switched on through the new client (cancel_waiting_setpoint),
+    # then the old client is stopped: its stale 22 must not be sent after that.
+    old = NexhoLocalClient("10.0.0.99")
+    _zone_ready(old)
+    _scripted_sends(old, {22.0: [False]})
+    old.set_temperature("2", 22.0)
+    _wait_until(lambda: old.list_rooms()[0].unconfirmed, "the not-confirmed mark")
+    new = _idle_client()
+    new_sent = _scripted_sends(new, {22.0: [True]})
+    new.start()
+    new.cancel_waiting_setpoint("2")
+    old.stop()
+    _wait_for_writer(old, 2)
+    new.stop()
+    assert new_sent == [] and 2 not in new._desired
+
+
+def test_the_poller_announces_the_zone_list_when_it_appears_or_changes():
+    announced: list[list[tuple[str, str]]] = []
+    replies = {"OPS2/": "OPOK,OPS2,1,2", "R#": "ER,1"}
+    client = make_client(replies, names={"1": "Lounge"})
+    client._on_zones = announced.append
+    client._poll_once()
+    client._poll_once()  # same list: nothing new to announce
+    assert announced == [[("1", "Lounge"), ("2", "Zone 2")]]
+    replies["OPS2/"] = "OPOK,OPS2,1"
+    client._poll_once()
+    client._poll_once()  # a changed list is believed the second time
+    assert announced[-1] == [("1", "Lounge")] and len(announced) == 2
+
+
+def test_a_stopped_client_raises_client_stopped(monkeypatch):
+    from hearthmage.nexho_client import ClientStopped
+
+    _fake_hub(monkeypatch, lambda cmd: "OK")
+    client = NexhoLocalClient("10.0.0.99")
+    client.stop()
+    assert client.stopped() is True
+    with pytest.raises(ClientStopped):
+        client._ask("OPS2/", 1, 1.0)
+
+
+def test_an_ack_between_the_stop_snapshot_and_the_hand_over_is_not_resent(monkeypatch):
+    # stop() has taken its snapshot (22 still unacked) but not yet handed it
+    # over when the ack comes in. The next client must not send 22 again.
+    import threading
+
+    import hearthmage.nexho_client as nc
+
+    on_air, answer = threading.Event(), threading.Event()
+
+    def reply(cmd):
+        if cmd.startswith("D#2") and not on_air.is_set():
+            on_air.set()
+            answer.wait(2)
+        return "OK"
+
+    sent = _fake_hub(monkeypatch, reply)
+    old = _idle_client()
+    old.start()  # owner of the wire
+    real_hand_over = nc._Wire.hand_over
+    handing, go = threading.Event(), threading.Event()
+
+    def gated(self, client, waiting):
+        handing.set()
+        go.wait(2)
+        return real_hand_over(self, client, waiting)
+
+    monkeypatch.setattr(nc._Wire, "hand_over", gated)
+    stopping = threading.Thread(target=old.stop)
+    try:
+        old.set_temperature("2", 22.0)
+        assert on_air.wait(2)
+        stopping.start()
+        assert handing.wait(2)
+        answer.set()  # the ack lands now
+        _wait_for_writer(old, 2)
+    finally:
+        answer.set()
+        go.set()
+        if stopping.is_alive():
+            stopping.join(2)
+        old.stop()
+    monkeypatch.setattr(nc._Wire, "hand_over", real_hand_over)
+    new = _idle_client()
+    new.start()
+    try:
+        _wait_for_writer(new, 2)
+    finally:
+        new.stop()
+    assert [c for c in sent if c.startswith("D#2")] == ["D#2#1#0#0*T22/"]
+    assert 2 not in new._desired

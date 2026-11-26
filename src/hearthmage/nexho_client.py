@@ -94,6 +94,89 @@ class _Withdrawn(Exception):
     """A command stopped before it went out again, because it is no longer wanted."""
 
 
+class ClientStopped(HearthError):
+    """The client was stopped (the app swapped it for a new one), so it sends
+    nothing more. Not a hub failure: the same request can go to the new client."""
+
+
+class _Wire:
+    """One hub's wire, shared by every client of that hub address. The app
+    swaps clients (a hub settings save, a backup import) while the old one may
+    be mid-exchange; sharing the lock, the write priority and the time of the
+    last reply keeps one conversation with the hub at a time across the swap,
+    quiet gap included. It also passes setpoints a stopped client was still
+    sending on to the hub's next client."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()  # held for a whole exchange
+        self.cond = threading.Condition()  # guards writes_pending
+        self.writes_pending = 0
+        self.replied_at: float | None = None  # guarded by lock
+        self.clients = threading.Lock()  # guards owner and handed_over
+        self.owner: NexhoLocalClient | None = None  # the started, not stopped, client
+        # zone -> (target, requested_at, unconfirmed) from a stopped client
+        self.handed_over: dict[int, tuple[float, float, bool]] = {}
+
+    # Lock order: lock (an exchange) -> clients -> a client's _lock. Nothing
+    # here takes ``lock``; a client never takes ``clients`` under its _lock.
+
+    def take_over(self, client: NexhoLocalClient) -> None:
+        """``client`` starts: it is the owner now, and gets what was handed over."""
+        with self.clients:
+            self.owner = client
+            waiting, self.handed_over = self.handed_over, {}
+            self._park(client._adopt_setpoints(waiting))
+
+    def hand_over(self, client: NexhoLocalClient, waiting: dict[int, tuple[float, float, bool]]) -> None:
+        """``client`` has stopped: its waiting setpoints go to the running
+        client, or wait for the next one to start. An owner that is itself
+        stopping takes none (they would die with it): they wait too."""
+        with self.clients:
+            # An ack that landed after stop()'s snapshot found nothing here to
+            # drop (_Wire.confirmed): drop it now. Any later ack still waits
+            # for ``clients`` and drops what is parked or adopted below.
+            with client._lock:
+                waiting = {
+                    zone: entry for zone, entry in waiting.items()
+                    if client._acked.get(zone) != entry[:2]
+                }
+            if self.owner is client:
+                self.owner = None
+            if self.owner is not None:
+                waiting = self.owner._adopt_setpoints(waiting)  # what it could not take
+            self._park(waiting)
+
+    def confirmed(self, zone: int, target: float, requested_at: float | None) -> None:
+        """A stopped client's setpoint was acknowledged after it handed it
+        over. Called with ``lock`` held, so before anyone can send it again:
+        it is dropped from the parked ones, or settled in the owner."""
+        with self.clients:
+            held = self.handed_over.get(zone)
+            if held is not None and held[:2] == (target, requested_at):
+                del self.handed_over[zone]
+            if self.owner is not None:
+                self.owner._settle_carried(zone, target, requested_at)
+
+    def _park(self, waiting: dict[int, tuple[float, float, bool]]) -> None:
+        """Keep setpoints for the next client; called with ``clients`` held."""
+        for zone, entry in waiting.items():
+            held = self.handed_over.get(zone)
+            if held is None or held[1] < entry[1]:  # the later request wins
+                self.handed_over[zone] = entry
+
+
+_wires: dict[tuple[str, int], _Wire] = {}
+_wires_lock = threading.Lock()
+
+
+def _wire_for(addr: tuple[str, int]) -> _Wire:
+    with _wires_lock:
+        wire = _wires.get(addr)
+        if wire is None:
+            wire = _wires[addr] = _Wire()
+        return wire
+
+
 class NexhoLocalClient:
     """Local UDP adapter for the Farho "Nexho NT" hub, backed by a poller.
 
@@ -114,6 +197,7 @@ class NexhoLocalClient:
         on_reading=None,
         on_energy=None,
         energy_interval: float = 3600.0,
+        on_zones=None,
     ) -> None:
         self._addr = (hub_ip, port)
         self._names = zone_names or {}
@@ -126,6 +210,10 @@ class NexhoLocalClient:
         # that reads one zone per poll tick so it never stalls temperature polling.
         self._on_energy = on_energy
         self._energy_interval = energy_interval
+        # Optional callback([(zone id, name), ...]) fired by the poller when the
+        # accepted zone list first appears or changes (MQTT discovery).
+        self._on_zones = on_zones
+        self._announced: list[int] | None = None  # the zone list last announced
         self._next_energy = 0.0  # monotonic; 0 = due on the first poll cycle
         self._energy_queue: list[int] = []
         self._lock = threading.Lock()
@@ -139,6 +227,12 @@ class NexhoLocalClient:
         self._requested_at: dict[int, float] = {}  # zone -> when its latest target was asked for
         self._gave_up: dict[int, float] = {}  # zone -> target dropped after _SETPOINT_GIVE_UP_AFTER
         self._write_kick: set[int] = set()  # zones whose waiting retry should go now
+        # zone -> (target, requested_at) the hub last acked, noted with the wire
+        # held so stop() never hands over a setpoint that has already landed.
+        self._acked: dict[int, tuple[float, float | None]] = {}
+        # zone -> when a newer command dropped its waiting setpoint (see
+        # cancel_waiting_setpoint); a carried-over older setpoint is not sent.
+        self._cancelled_at: dict[int, float] = {}
         # Wakes write workers that are waiting to retry (new target, kick, stop).
         self._write_wake = threading.Condition()
         self._zones: list[int] | None = None  # the accepted zone list
@@ -157,13 +251,11 @@ class NexhoLocalClient:
         self._last_fresh: dict[int, float] = {}  # zone -> last time it answered
         self._stale_after = _STALE_INTERVALS * poll_interval
         # Wire arbitration: the hub handles one conversation at a time, so all
-        # I/O is serialised through _io_lock. Writes take priority - reads yield
+        # I/O is serialised through the hub's wire, shared with any other
+        # client of the same hub (see _Wire). Writes take priority - reads yield
         # while any write is pending so a user setpoint never waits behind the
         # poller (at most behind the single read already in flight).
-        self._io_lock = threading.Lock()
-        self._io_cond = threading.Condition()
-        self._writes_pending = 0
-        self._hub_replied_at: float | None = None  # guarded by _io_lock
+        self._wire = _wire_for(self._addr)
         # Per-zone poll scheduling (monotonic clock). Unreachable zones back off.
         self._next_poll: dict[int, float] = {}
         self._backoff: dict[int, float] = {}
@@ -216,37 +308,44 @@ class NexhoLocalClient:
     def _wire_acquire(self, priority: bool) -> None:
         """Take the wire. Writes (priority) preempt reads: a read waits while any
         write is pending, so a setpoint never queues behind the poller."""
+        wire = self._wire
         if priority:
-            with self._io_cond:
-                self._writes_pending += 1
+            with wire.cond:
+                wire.writes_pending += 1
         else:
-            with self._io_cond:
-                while self._writes_pending > 0:
-                    self._io_cond.wait()
-        self._io_lock.acquire()
+            with wire.cond:
+                while wire.writes_pending > 0:
+                    wire.cond.wait()
+        wire.lock.acquire()
 
     def _wire_release(self, priority: bool) -> None:
-        self._io_lock.release()
+        wire = self._wire
+        wire.lock.release()
         if priority:
-            with self._io_cond:
-                self._writes_pending -= 1
-                if self._writes_pending == 0:
-                    self._io_cond.notify_all()
+            with wire.cond:
+                wire.writes_pending -= 1
+                if wire.writes_pending == 0:
+                    wire.cond.notify_all()
 
     def _ask(
-        self, cmd: str, retries: int, timeout: float, priority: bool = False, still_wanted=None
+        self, cmd: str, retries: int, timeout: float, priority: bool = False, still_wanted=None,
+        on_reply=None,
     ) -> str:
         """Send ``cmd`` and return the hub's reply. ``still_wanted``, if given, is
         asked with the wire held before every send; once it says no, nothing more
         goes out and _Withdrawn is raised. Checking with the wire held matters: a
         command that withdraws this one and then takes the wire is never followed
-        by it."""
+        by it. ``on_reply``, if given, is called with the reply while the wire
+        is still held. A stopped client sends nothing (ClientStopped): its
+        successor may be talking to the hub."""
         self._wire_acquire(priority)
         try:
             last_exc: Exception | None = None
             for _ in range(retries):
                 sock = None
                 self._let_hub_settle()
+                if self._stop.is_set():
+                    raise ClientStopped("The hub connection was restarted. Try again.")
                 if still_wanted is not None and not still_wanted():  # last check before sending
                     raise _Withdrawn(cmd)
                 started = time.monotonic()
@@ -261,9 +360,11 @@ class NexhoLocalClient:
                     sock.connect(self._addr)
                     sock.send(cmd.encode("ascii"))
                     data = sock.recv(1024)
-                    self._hub_replied_at = time.monotonic()
+                    self._wire.replied_at = time.monotonic()
                     reply = data.rstrip(_NULL).decode("ascii", errors="replace")
                     _log.debug("hub %s -> %s (%.0fms)", cmd, reply, (time.monotonic() - started) * 1000)
+                    if on_reply is not None:
+                        on_reply(reply)
                     return reply
                 except socket.timeout:
                     _log.debug("hub %s timed out after %.1fs", cmd, timeout)
@@ -282,27 +383,32 @@ class NexhoLocalClient:
 
     def _let_hub_settle(self) -> None:
         """Wait out the quiet gap after the hub's last reply (see
-        ``_HUB_QUIET_GAP``). Called with the wire held."""
-        if self._hub_replied_at is None:
+        ``_HUB_QUIET_GAP``), whichever client it replied to. Called with the
+        wire held."""
+        replied_at = self._wire.replied_at
+        if replied_at is None:
             return
-        wait = self._hub_replied_at + _HUB_QUIET_GAP - time.monotonic()
+        wait = replied_at + _HUB_QUIET_GAP - time.monotonic()
         if wait > 0:
             time.sleep(wait)
 
     def _ask_until_answered(
         self, cmd: str, ok_prefix: str, priority: bool,
         retries: int | None = None, timeout: float | None = None, still_wanted=None,
+        on_reply=None,
     ) -> str:
         """Send ``cmd``, resending after a short gap while the hub answers ER
         (radiator missed the RF window). The wire is released between attempts
         so other traffic is not blocked. Returns the last reply. See ``_ask``
-        for ``still_wanted``."""
+        for ``still_wanted`` and ``on_reply``."""
         default = (_WRITE_RETRIES, _WRITE_TIMEOUT) if priority else (_READ_RETRIES, _READ_TIMEOUT)
         retries = retries if retries is not None else default[0]
         timeout = timeout if timeout is not None else default[1]
         resp = ""
         for attempt in range(_ER_ATTEMPTS):
-            resp = self._ask(cmd, retries, timeout, priority=priority, still_wanted=still_wanted)
+            resp = self._ask(
+                cmd, retries, timeout, priority=priority, still_wanted=still_wanted, on_reply=on_reply
+            )
             if resp.startswith(ok_prefix) or not resp.startswith("ER"):
                 return resp
             if still_wanted is not None and not still_wanted():
@@ -362,7 +468,8 @@ class NexhoLocalClient:
         with self._lock:
             for table in (self._state, self._last, self._pending, self._desired,
                           self._next_poll, self._backoff, self._last_fresh, self._write_seq,
-                          self._requested_at, self._gave_up, self._status_rejected_at):
+                          self._requested_at, self._gave_up, self._status_rejected_at,
+                          self._acked, self._cancelled_at):
                 for zone in [z for z in table if z not in keep]:
                     del table[zone]
             for key in [k for k in self._rejected_logged if isinstance(k[0], int) and k[0] not in keep]:
@@ -496,43 +603,121 @@ class NexhoLocalClient:
             return
         self._poller_started = True
         self._started_at = time.monotonic()
+        self._wire.take_over(self)  # setpoints a stopped client of this hub left
         self._thread = threading.Thread(target=self._poll_loop, name="nexho-poller", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop the poller (e.g. the app switched to a different hub). A poll
-        already talking to the hub finishes first; nothing new starts."""
-        self._stop.set()
+        """Stop this client for good (the app swapped to a new one). Nothing
+        more goes on the wire: an exchange already on the air finishes, the
+        poller ends before its next zone and write workers end. Setpoints still
+        waiting for the hub go to this hub's next client, which sends them."""
+        with self._lock:
+            if self._stop.is_set():
+                return
+            self._stop.set()  # under _lock: set_temperature and _note_ack check it there
+            now = time.monotonic()
+            waiting = {}
+            for zone, target in self._desired.items():
+                asked = self._requested_at.get(zone, now)
+                if self._acked.get(zone) == (target, asked):
+                    continue  # acked; the worker just has not recorded it yet
+                waiting[zone] = (target, asked, zone in self._unconfirmed)
         with self._write_wake:
             self._write_wake.notify_all()  # end any write worker waiting to retry
+        self._wire.hand_over(self, waiting)
+
+    def stopped(self) -> bool:
+        """True once stop() has run: this client sends nothing more."""
+        return self._stop.is_set()
+
+    def _adopt_setpoints(
+        self, waiting: dict[int, tuple[float, float, bool]]
+    ) -> dict[int, tuple[float, float, bool]]:
+        """Send setpoints a stopped client of this hub had not got acknowledged.
+        The swap is not the user's doing, so their target is kept, with its
+        give-up clock and its "Not confirmed" mark. One past the give-up time,
+        or older than this client's own request or cancel for the zone, is
+        dropped. Returns those not taken because this client has stopped too."""
+        now = time.monotonic()
+        refused = {}
+        for zone, entry in waiting.items():
+            target, requested_at, unconfirmed = entry
+            if now - requested_at >= _SETPOINT_GIVE_UP_AFTER:
+                continue
+            with self._lock:
+                if self._stop.is_set():
+                    refused[zone] = entry
+                    continue
+                newer = max(self._requested_at.get(zone, -math.inf),
+                            self._cancelled_at.get(zone, -math.inf))
+                if newer >= requested_at:
+                    continue
+                if unconfirmed:
+                    self._unconfirmed.add(zone)
+                start = self._want_setpoint(zone, target, requested_at)
+            self._run_writer(zone, start)
+            _log.info("zone %s setpoint %s carried over from the previous hub client", zone, target)
+        return refused
+
+    def _settle_carried(self, zone: int, target: float, requested_at: float | None) -> None:
+        """The previous client's ack for a setpoint this one carried over came
+        in: it has landed, so this client has nothing to send for it."""
+        with self._lock:
+            if self._desired.get(zone) != target or self._requested_at.get(zone) != requested_at:
+                return  # replaced since: the newer target still goes out
+            self._record_ack(zone, target)
+        with self._write_wake:
+            self._write_wake.notify_all()  # the worker sees nothing left and ends
 
     def _poll_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 self._poll_once()
             except Exception:  # noqa: BLE001 - a bad poll must not kill the poller
+                if self._stop.is_set():
+                    break  # stopped mid-poll: its next query was refused
                 _log.exception("poll cycle failed; poller continues")
-            self._stop.wait(self._sleep_until_due())
+            try:
+                wait = self._sleep_until_due()
+            except Exception:  # noqa: BLE001 - nor may working out the next one
+                _log.exception("poll scheduling failed; poller continues")
+                wait = self._poll_interval
+            self._stop.wait(wait)
 
     def _sleep_until_due(self) -> float:
         """Sleep until the soonest zone is due, so the hub sits idle in between
         and a user write meets a free hub. Capped at the poll interval."""
-        if not self._next_poll:
+        with self._lock:
+            soonest = min(self._next_poll.values(), default=None)
+        if soonest is None:
             return 1.0
-        soonest = min(self._next_poll.values())
         return max(1.0, min(self._poll_interval, soonest - time.monotonic()))
 
     def _poll_once(self) -> None:
         zones = self._zone_ids()
         now = time.monotonic()
+        announce = None
         with self._lock:
             for zone in zones:
                 self._state.setdefault(zone, self._room(zone, None, None, "loading"))
+            if self._on_zones is not None and zones != self._announced:
+                self._announced = list(zones)
+                announce = [(str(z), self._state[z].name) for z in zones]
+        if announce is not None and not self._stop.is_set():
+            try:
+                self._on_zones(announce)  # after seeding, so list_rooms agrees
+            except Exception:  # noqa: BLE001 - announcing must not break polling
+                _log.exception("on_zones hook failed")
         # Poll sequentially - the hub serialises anyway, and concurrent reads
         # only pile contention onto it. Zones that are backing off are skipped so
         # an asleep radiator does not keep blocking the hub every cycle.
         for zone in zones:
-            if self._next_poll.get(zone, 0.0) > now:
+            if self._stop.is_set():
+                return  # swapped out: the next client has the hub now
+            with self._lock:
+                due = self._next_poll.get(zone, 0.0)
+            if due > now:
                 continue
             fresh = self._poll_zone(zone)
             self._schedule_next(zone, fresh)
@@ -558,12 +743,13 @@ class NexhoLocalClient:
                 _log.exception("on_energy hook failed for zone %s", zone)
 
     def _schedule_next(self, zone: int, fresh: bool) -> None:
-        if fresh:
-            self._backoff[zone] = self._poll_interval  # reachable: steady cadence
-        else:
-            prev = self._backoff.get(zone, self._poll_interval)
-            self._backoff[zone] = min(prev * 2, _BACKOFF_MAX)  # unreachable: back off
-        self._next_poll[zone] = time.monotonic() + self._backoff[zone]
+        with self._lock:
+            if fresh:
+                self._backoff[zone] = self._poll_interval  # reachable: steady cadence
+            else:
+                prev = self._backoff.get(zone, self._poll_interval)
+                self._backoff[zone] = min(prev * 2, _BACKOFF_MAX)  # unreachable: back off
+            self._next_poll[zone] = time.monotonic() + self._backoff[zone]
 
     def _poll_zone(self, zone: int) -> bool:
         """Read one zone into the cache; return True if the radiator answered."""
@@ -574,10 +760,9 @@ class NexhoLocalClient:
         with self._lock:
             seq_before = self._write_seq.get(zone, 0)
             writing_before = zone in self._writers
-        was_silent = self._backoff.get(zone, 0.0) > self._poll_interval  # backing off
+            was_silent = self._backoff.get(zone, 0.0) > self._poll_interval  # backing off
         current, target, fresh = self._read_zone_raw(zone)
         if fresh:
-            self._last_fresh[zone] = time.monotonic()
             _log.debug("zone %s fresh: current=%s target=%s", zone, current, target)
         else:
             _log.debug("zone %s did not answer (RF asleep)", zone)
@@ -585,6 +770,7 @@ class NexhoLocalClient:
         settled_by_read = False
         with self._lock:
             if fresh:
+                self._last_fresh[zone] = time.monotonic()
                 self._gave_up.pop(zone, None)  # it is back: the card shows the truth again
             pending = self._pending.get(zone)
             undisturbed = (
@@ -656,16 +842,17 @@ class NexhoLocalClient:
     # ---- HearthClient interface (non-blocking; serves the cache) --------
 
     def list_rooms(self) -> list[Room]:
+        """The rooms as the poller last left them. Never talks to the hub: page
+        requests and htmx polls call this. On a cold start with no readings
+        cache it is empty until the poller's first zone list (``connecting``)."""
         with self._lock:
-            if self._state:
-                return [self._state[zone] for zone in sorted(self._state)]
-        # Cold start (poller has not filled anything yet): seed loading
-        # placeholders so the page renders instantly.
-        zones = self._zone_ids()
-        with self._lock:
-            for zone in zones:
-                self._state.setdefault(zone, self._room(zone, None, None, "loading"))
             return [self._state[zone] for zone in sorted(self._state)]
+
+    def connecting(self) -> bool:
+        """True until the hub has answered a zone list, so an empty room list
+        means "not known yet" rather than "the hub has no rooms"."""
+        with self._lock:
+            return self._zones is None
 
     def hub_stale(self) -> bool:
         """True if the hub has not answered a zone-list recently enough to trust
@@ -710,6 +897,7 @@ class NexhoLocalClient:
         (one conversation on the wire at a time)."""
         zone = _zone_int(room_id)
         with self._lock:
+            self._cancelled_at[zone] = time.monotonic()  # nor one carried over later
             if zone not in self._desired:
                 return  # no setpoint waiting to be sent or re-sent
             target = self._desired.pop(zone, None)
@@ -759,21 +947,32 @@ class NexhoLocalClient:
             temperature = max(_MIN_TEMP, min(_MAX_TEMP, temperature))
             target = round(temperature * 2) / 2
         with self._lock:
-            prev = self._state.get(zone)
-            current = prev.current_temp if prev else None
-            self._gave_up.pop(zone, None)  # a new request replaces an undelivered one
-            self._requested_at[zone] = time.monotonic()  # the give-up clock starts here
-            self._pending[zone] = target  # poll must not revert this
-            self._desired[zone] = target  # latest wins
-            self._write_seq[zone] = self._write_seq.get(zone, 0) + 1  # see _poll_zone
-            self._state[zone] = self._room(zone, current, target, "ok")
-            if zone in self._writers:
-                running = True  # the running worker will pick up the new desired target
-                self._write_kick.add(zone)  # ...now, even if it is the same target again
-            else:
-                running = False
-                self._writers.add(zone)
-        if running:
+            if self._stop.is_set():  # swapped out: refuse rather than lose it
+                raise HearthError("The hub connection was restarted. Set the target again.")
+            start = self._want_setpoint(zone, target, time.monotonic())  # give-up clock starts
+        self._run_writer(zone, start)
+
+    def _want_setpoint(self, zone: int, target: float, requested_at: float) -> bool:
+        """Make ``target`` the zone's wanted setpoint and show it. Called with
+        _lock held. True if no worker is running and the caller must start one."""
+        prev = self._state.get(zone)
+        current = prev.current_temp if prev else None
+        self._gave_up.pop(zone, None)  # a new request replaces an undelivered one
+        self._requested_at[zone] = requested_at  # the give-up clock
+        self._pending[zone] = target  # poll must not revert this
+        self._desired[zone] = target  # latest wins
+        self._write_seq[zone] = self._write_seq.get(zone, 0) + 1  # see _poll_zone
+        self._state[zone] = self._room(zone, current, target, "ok")
+        if zone in self._writers:
+            # The running worker will pick up the new desired target...
+            self._write_kick.add(zone)  # ...now, even if it is the same target again
+            return False
+        self._writers.add(zone)
+        return True
+
+    def _run_writer(self, zone: int, start: bool) -> None:
+        """Start the zone's write worker, or wake the running one."""
+        if not start:
             with self._write_wake:
                 self._write_wake.notify_all()  # it may be waiting to retry the old one
             return
@@ -803,6 +1002,8 @@ class NexhoLocalClient:
                         return
                     self._write_kick.discard(zone)
                 ok = self._send_once(zone, target)
+                if self._stop.is_set():
+                    return  # swapped out: the hub's next client has this setpoint
                 with self._lock:
                     if ok is None or self._desired.get(zone) != target:
                         # Superseded by a newer tap, or withdrawn and then asked
@@ -812,12 +1013,7 @@ class NexhoLocalClient:
                     prev = self._state.get(zone)
                     current = prev.current_temp if prev else None
                     if ok:
-                        self._desired.pop(zone, None)
-                        self._unconfirmed.discard(zone)
-                        self._write_kick.discard(zone)
-                        self._last[zone] = (current, float(target))
-                        self._pending.pop(zone, None)  # confirmed - release poll guard
-                        self._state[zone] = self._room(zone, current, float(target), "ok")
+                        self._record_ack(zone, target)
                         self._writers.discard(zone)
                         registered = False
                         return
@@ -860,6 +1056,34 @@ class NexhoLocalClient:
                 if registered:
                     self._writers.discard(zone)
 
+    def _record_ack(self, zone: int, target: float) -> None:
+        """The hub acknowledged ``target``: it is the confirmed one now and
+        nothing is left to send. Called with _lock held."""
+        prev = self._state.get(zone)
+        current = prev.current_temp if prev else None
+        self._desired.pop(zone, None)
+        self._unconfirmed.discard(zone)
+        self._write_kick.discard(zone)
+        self._last[zone] = (current, float(target))
+        self._pending.pop(zone, None)  # confirmed - release poll guard
+        self._state[zone] = self._room(zone, current, float(target), "ok")
+
+    def _note_ack(self, zone: int, target: float, reply: str) -> None:
+        """Called with the wire held when a setpoint reply comes in. An ack is
+        noted at once, so a stop() that follows does not hand the setpoint on;
+        one that arrives after stop() tells the wire, so the next client does
+        not send it again (see _Wire.confirmed)."""
+        if reply != "OK":
+            return
+        with self._lock:
+            if self._desired.get(zone) != target:
+                return  # replaced while on the air: the newer one still goes out
+            asked = self._requested_at.get(zone)
+            self._acked[zone] = (target, asked)
+            stopped = self._stop.is_set()
+        if stopped:
+            self._wire.confirmed(zone, target, asked)
+
     def _wait_to_retry(self, zone: int, target: float, wait: float) -> None:
         """Sleep before re-sending ``target``, but wake at once if a newer
         target arrives, the radiator answers a poll, the zone is dropped, or the
@@ -891,7 +1115,7 @@ class NexhoLocalClient:
         try:
             resp = self._ask_until_answered(
                 f"D#{zone}#{self._modules(zone)}#0#0*T{wire}/", "OK", priority=True,
-                still_wanted=still_wanted,
+                still_wanted=still_wanted, on_reply=lambda reply: self._note_ack(zone, target, reply),
             )
             acked = resp == "OK"  # the vendor treats "OK,<...>" as a command error
             if acked:

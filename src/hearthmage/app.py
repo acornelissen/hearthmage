@@ -526,6 +526,8 @@ async def _security(request: Request, call_next):
     if session is None:
         if mutating:
             return PlainTextResponse("Forbidden", status_code=403)
+        if request.headers.get("HX-Request") == "true":  # a poll: move the tab, not the partial
+            return Response(status_code=204, headers={"HX-Redirect": "/login"})
         return RedirectResponse("/login", status_code=303)
     response = await call_next(request)
     if session.renewed:  # keep the cookie's 90 days in step with the server's
@@ -598,6 +600,7 @@ def get_client() -> HearthClient:
                 cache_file=settings.cache_path,
                 on_reading=_record_reading,
                 on_energy=_record_energy,
+                on_zones=_announce_zones,
             )
             client.start()  # begin background polling
             _client = client
@@ -635,9 +638,17 @@ def _drop_client() -> None:
     global _client, _client_hub
     with _client_lock:
         old, _client, _client_hub = _client, None, None
-    _stop_client(old)
+        _stop_client(old)  # under the lock: no new client starts while it runs
     with _sync_lock:
         _sync_backoff.clear()  # waits earned against the old hub mean nothing now
+
+
+def _announce_zones(zones: list[tuple[str, str]]) -> None:
+    """The poller's hook for a new or changed zone list: tell Home Assistant.
+    On a first run nothing is known when the client is built."""
+    with _mqtt_lock:
+        if mqtt_bridge is not None:
+            mqtt_bridge.publish_discovery(zones)
 
 
 def _safe_rooms(client: HearthClient) -> tuple[list, str | None]:
@@ -673,6 +684,7 @@ def index(request: Request, client: HearthClient = Depends(get_client)) -> HTMLR
             "rooms": rooms,
             "error": error,
             "hub_stale": hub_stale,
+            "connecting": getattr(client, "connecting", lambda: False)(),
             "wasting": [r for r in rooms if r.id in wasting],
         },
     )
@@ -759,6 +771,24 @@ def healthz(request: Request, client: HearthClient = Depends(get_client)) -> JSO
     if settings.auth_enabled and not _is_authenticated(request):
         data = {}  # a public probe learns only up or down, not zones or timings
     return JSONResponse({"configured": True, "ok": ok, **data}, status_code=200 if ok else 503)
+
+
+@app.get("/rooms", response_class=HTMLResponse)
+def rooms_ready(
+    request: Request, stale: str = "", client: HearthClient = Depends(get_client)
+) -> Response:
+    """Polled while the hub's first zone list is awaited. ``stale`` is what the
+    page last showed ("1" = the hub-quiet banner). 204 (nothing to swap) while
+    nothing changed; otherwise the banner and room list, out of band."""
+    rooms, error = _safe_rooms(client)
+    connecting = getattr(client, "connecting", lambda: False)()
+    hub_stale = getattr(client, "hub_stale", lambda: False)()
+    if connecting and not rooms and not error and stale == ("1" if hub_stale else "0"):
+        return Response(status_code=204)
+    return templates.TemplateResponse(
+        request, "_rooms_ready.html",
+        {"rooms": rooms, "error": error, "connecting": connecting, "hub_stale": hub_stale},
+    )
 
 
 @app.get("/rooms/{room_id}/status", response_class=HTMLResponse)
@@ -1591,6 +1621,16 @@ def _sync_until_settled(client: HearthClient, zone: str) -> None:
             with _sync_lock:
                 gen = _sync_gen.get(zone, 0)
             ok = _resync_zone(client, zone)
+            if not ok and getattr(client, "stopped", lambda: False)():
+                # Swapped for a new client mid-push (hub save, backup import):
+                # not a hub failure, so push again through the current one.
+                try:
+                    current = get_client()
+                except NotConfigured:
+                    current = client
+                if current is not client:
+                    client = current
+                    continue
             with _sync_lock:
                 if _sync_gen.get(zone, 0) == gen:  # nothing changed while pushing
                     _sync_running.discard(zone)

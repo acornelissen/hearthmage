@@ -1,0 +1,7 @@
+{# Always rendered, so the rooms poll can fill or clear it out of band. #}
+<div id="hub-stale"{% if oob %} hx-swap-oob="true"{% endif %}>
+  {%- if hub_stale %}
+  <p class="error" role="alert">HearthMage hasn&rsquo;t heard back from the hub for a while.
+    Readings below may be out of date. Check that the hub is powered and on the network.</p>
+  {% endif -%}
+</div>
