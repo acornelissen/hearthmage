@@ -134,6 +134,15 @@ class MqttBridge:
                 self._handler.set_temperature(zone, 0.0)
             # "heat" is driven by the temperature command; nothing to do here.
 
+    def handle_message(self, topic: str, payload: str, retain: bool) -> None:
+        """Entry point for broker messages. A retained command is stale (the
+        broker replays it on every reconnect) and must not override later
+        changes, so it is dropped."""
+        if retain:
+            _log.info("Ignoring retained MQTT command on %s", topic)
+            return
+        self.on_message(topic, payload)
+
     # ---- network (lazy paho; not covered by unit tests) -----------------
 
     def connect(self, host: str, port: int, username: str | None, password: str | None):
@@ -152,7 +161,11 @@ class MqttBridge:
 
         def _on_message(_cli, _userdata, msg):
             try:
-                self.on_message(msg.topic, msg.payload.decode("utf-8", errors="replace"))
+                self.handle_message(
+                    msg.topic,
+                    msg.payload.decode("utf-8", errors="replace"),
+                    bool(msg.retain),
+                )
             except Exception:  # noqa: BLE001 - a bad command must not kill the loop
                 _log.exception("MQTT command handling failed for %s", msg.topic)
 

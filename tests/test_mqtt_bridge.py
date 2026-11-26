@@ -75,6 +75,21 @@ def test_mode_heat_command_is_ignored_without_temperature():
     assert handler.calls == []  # temperature command drives the value, not mode
 
 
+def test_retained_commands_are_ignored():
+    handler = _Handler()
+    bridge, _ = _bridge(handler)
+    bridge.handle_message("hearthmage/1/temperature/set", "25", retain=True)
+    bridge.handle_message("hearthmage/1/mode/set", "off", retain=True)
+    assert handler.calls == []
+
+
+def test_live_commands_still_apply_through_handle_message():
+    handler = _Handler()
+    bridge, _ = _bridge(handler)
+    bridge.handle_message("hearthmage/1/temperature/set", "25", retain=False)
+    assert handler.calls == [("1", 25.0)]
+
+
 def test_unknown_or_malformed_topic_is_ignored():
     handler = _Handler()
     bridge, _ = _bridge(handler)
@@ -136,3 +151,52 @@ def test_commands_work_when_the_base_topic_has_slashes():
     bridge.on_message("home/1/temperature/set", "30")
     bridge.on_message("home/hearthmage/1/extra/temperature/set", "30")
     assert handler.calls == [("1", 20.5), ("3", 0.0)]
+
+
+def test_connect_installs_a_callback_that_drops_retained_messages(monkeypatch):
+    import sys
+    import types
+
+    class _FakeClient:
+        def __init__(self, *args):
+            pass
+
+        def username_pw_set(self, *a):
+            pass
+
+        def will_set(self, *a, **k):
+            pass
+
+        def connect_async(self, *a):
+            pass
+
+        def loop_start(self):
+            pass
+
+        def publish(self, *a, **k):
+            pass
+
+    mqtt = types.ModuleType("paho.mqtt.client")
+    mqtt.Client = _FakeClient
+    mqtt.CallbackAPIVersion = types.SimpleNamespace(VERSION2=2)
+    paho = types.ModuleType("paho")
+    paho_mqtt = types.ModuleType("paho.mqtt")
+    paho.mqtt = paho_mqtt
+    paho_mqtt.client = mqtt
+    monkeypatch.setitem(sys.modules, "paho", paho)
+    monkeypatch.setitem(sys.modules, "paho.mqtt", paho_mqtt)
+    monkeypatch.setitem(sys.modules, "paho.mqtt.client", mqtt)
+
+    handler = _Handler()
+    bridge, _ = _bridge(handler)
+    client = bridge.connect("broker", 1883, None, None)
+
+    def msg(retain):
+        return types.SimpleNamespace(
+            topic="hearthmage/1/temperature/set", payload=b"25", retain=retain
+        )
+
+    client.on_message(client, None, msg(retain=True))
+    assert handler.calls == []
+    client.on_message(client, None, msg(retain=False))
+    assert handler.calls == [("1", 25.0)]
