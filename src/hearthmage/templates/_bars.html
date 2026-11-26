@@ -1,0 +1,20 @@
+{# Bars as inline SVG: presentation attributes are not governed by style-src, and
+   they render with scripts off. Values go through pct() (clamped to 0..100).
+   The first rect is a fixed-width nub: it keeps a visible minimum when the fill is ~0%. #}
+{% macro track(fill, target) -%}
+<svg class="track-svg" width="100%" height="100%" aria-hidden="true" focusable="false">
+  <rect class="track-fill" fill="url(#heat-grad) #ff6b4a" width="12" height="100%" rx="6"/>
+  <rect class="track-fill" fill="url(#heat-grad) #ff6b4a" width="{{ '%.1f'|format(pct(fill)) }}%" height="100%" rx="6"/>
+  <svg x="{{ '%.1f'|format(pct(target)) }}%" y="50%" overflow="visible">
+    <rect class="track-target-ring" x="-5" y="-14" width="10" height="28" rx="5"/>
+    <rect class="track-target" x="-2" y="-11" width="4" height="22" rx="3"/>
+  </svg>
+</svg>
+{%- endmacro %}
+
+{% macro bar(value) -%}
+<svg class="bar-svg" width="100%" height="100%" aria-hidden="true" focusable="false">
+  <rect class="bar-fill" fill="url(#heat-grad) #ff6b4a" width="2" height="100%" rx="6"/>
+  <rect class="bar-fill" fill="url(#heat-grad) #ff6b4a" width="{{ '%.0f'|format(pct(value)) }}%" height="100%" rx="6"/>
+</svg>
+{%- endmacro %}

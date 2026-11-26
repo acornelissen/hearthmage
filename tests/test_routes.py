@@ -92,7 +92,8 @@ def test_off_button_follows_the_hub_like_the_target_box(client: TestClient):
     page = client.get("/").text
     button = page.split('class="off"')[1].split(">")[0]
     assert "disabled" in button  # server-rendered state when off
-    script = page.split("Keep each target box and Off button")[1].split("</script>")[0]
+    assert '/static/target-box.js' in page
+    script = client.get("/static/target-box.js").text
     assert "'.setpoint-off button'" in script
     assert "off.disabled = hub === ''" in script
 
@@ -608,6 +609,59 @@ def test_healthz_stays_public_under_auth(tmp_path, monkeypatch):
     assert TestClient(app).get("/healthz").status_code in (200, 503)
 
 
+class _DetailedClient:
+    def list_rooms(self):
+        return []
+
+    def __init__(self, stale=False):
+        self.stale = stale
+
+    def health(self):
+        return {"poller_alive": True, "hub_stale": self.stale, "zones": {"1": {"age": 3.2}}}
+
+
+def test_healthz_without_session_reveals_only_ok_and_configured(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    app.dependency_overrides[get_client] = lambda: _DetailedClient()
+    try:
+        resp = TestClient(app).get("/healthz")
+        assert resp.status_code == 200
+        assert resp.json() == {"configured": True, "ok": True}
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_healthz_without_session_keeps_the_503_when_stale(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    app.dependency_overrides[get_client] = lambda: _DetailedClient(stale=True)
+    try:
+        resp = TestClient(app).get("/healthz")
+        assert resp.status_code == 503
+        assert resp.json() == {"configured": True, "ok": False}
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_healthz_with_session_shows_full_detail(tmp_path, monkeypatch):
+    _with_auth(monkeypatch, tmp_path)
+    app.dependency_overrides[get_client] = lambda: _DetailedClient()
+    try:
+        c = TestClient(app)
+        c.post("/login", data={"password": "swordfish"})
+        body = c.get("/healthz").json()
+        assert body["zones"] == {"1": {"age": 3.2}} and body["poller_alive"] is True
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_healthz_with_auth_off_shows_full_detail(tmp_path, monkeypatch):
+    app.dependency_overrides[get_client] = lambda: _DetailedClient()
+    try:
+        assert "zones" in TestClient(app).get("/healthz").json()
+    finally:
+        app.dependency_overrides.clear()
+
+
 # ---- PWA ------------------------------------------------------------------
 
 
@@ -658,7 +712,8 @@ def test_service_worker_offline_fallback_is_for_page_loads_only(client: TestClie
 def test_index_links_manifest_and_registers_sw(client: TestClient):
     resp = client.get("/")
     assert 'rel="manifest"' in resp.text
-    assert "serviceWorker" in resp.text
+    assert "/static/app.js" in resp.text
+    assert "serviceWorker.register('/sw.js')" in client.get("/static/app.js").text
 
 
 # ---- history -------------------------------------------------------------

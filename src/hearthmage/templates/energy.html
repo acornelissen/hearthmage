@@ -1,3 +1,4 @@
+{% import "_bars.html" as bars %}
 <!doctype html>
 <html lang="en">
 <head>
@@ -7,9 +8,11 @@
   <meta name="theme-color" content="#14110e" media="(prefers-color-scheme: dark)">
   <title>Energy · HearthMage</title>
   <link rel="stylesheet" href="/static/styles.css">
+  <meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false}'>
   <script src="/static/htmx.min.js" defer></script>
 </head>
 <body>
+  {% include "_heat_defs.html" %}
   <header class="topbar">
     <div class="topbar-inner">
       <div class="brand">
@@ -69,7 +72,7 @@
         <li class="bar-row">
           <span class="bar-label">{% if loop.first %}Today{% else %}-{{ loop.index0 }}d{% endif %}</span>
           <span class="bar-track" aria-hidden="true">
-            <span class="bar-fill" style="width: {{ '%.0f'|format(kwh / day_max * 100) }}%"></span>
+            {{ bars.bar(kwh / day_max * 100) }}
           </span>
           <span class="bar-value">{{ '%.1f'|format(kwh) }}</span>
         </li>
@@ -83,7 +86,7 @@
         <li class="bar-row">
           <span class="bar-label">{% if loop.first %}This{% else %}-{{ loop.index0 }}mo{% endif %}</span>
           <span class="bar-track" aria-hidden="true">
-            <span class="bar-fill" style="width: {{ '%.0f'|format(kwh / mon_max * 100) }}%"></span>
+            {{ bars.bar(kwh / mon_max * 100) }}
           </span>
           <span class="bar-value">{{ '%.1f'|format(kwh) }}</span>
         </li>

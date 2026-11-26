@@ -10,9 +10,11 @@
   <link rel="apple-touch-icon" href="/static/icon.svg">
   <link rel="icon" href="/static/icon.svg">
   <link rel="stylesheet" href="/static/styles.css">
+  <meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false}'>
   <script src="/static/htmx.min.js" defer></script>
 </head>
 <body>
+  {% include "_heat_defs.html" %}
   <header class="topbar">
     <div class="topbar-inner">
       <div class="brand">
@@ -54,91 +56,9 @@
     {% include "_rooms.html" %}
   </main>
 
-  <script>
-    // Register the service worker so the app can be installed to the home screen.
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', function () {
-        navigator.serviceWorker.register('/sw.js').catch(function () {});
-      });
-    }
-  </script>
+  <script src="/static/app.js" defer></script>
 
-  <script>
-    // Progressive enhancement: turn the +/- buttons into a target stepper.
-    // The number input works on its own if this never runs.
-    document.addEventListener('click', function (e) {
-      var btn = e.target.closest('[data-step]');
-      if (!btn) return;
-      var wrap = btn.closest('[data-stepper]');
-      var input = wrap && wrap.querySelector('input[name="temperature"]');
-      if (!input) return;
-      var step = parseFloat(btn.getAttribute('data-step')) || 0;
-      var min = input.min !== '' ? parseFloat(input.min) : -Infinity;
-      var max = input.max !== '' ? parseFloat(input.max) : Infinity;
-      var cur = parseFloat(input.value);
-      if (isNaN(cur)) cur = isFinite(min) ? min : 0;
-      input.value = String(Math.min(max, Math.max(min, cur + step)));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-  </script>
 
-  <script>
-    // Keep each target box and Off button showing the hub's state. The readout
-    // above them is re-fetched every few seconds and carries the hub's target
-    // in data-target (empty = off); copy that into the box unless the user is
-    // in the middle of changing it.
-    (function () {
-      function boxFor(el) {
-        var zone = el.closest('.zone');
-        return zone && zone.querySelector('.setpoint-input');
-      }
-      function syncOffButton(zone, hub) {
-        var off = zone.querySelector('.setpoint-off button');
-        if (!off) return;
-        off.disabled = hub === '';
-        if (hub === '') off.setAttribute('aria-disabled', 'true');
-        else off.removeAttribute('aria-disabled');
-      }
-      function syncTargets() {
-        document.querySelectorAll('.readout[data-target]').forEach(function (readout) {
-          var zone = readout.closest('.zone');
-          var input = zone && zone.querySelector('.setpoint-input');
-          if (!input) return;
-          var hub = readout.getAttribute('data-target');
-          syncOffButton(zone, hub);
-          var moved = input.dataset.hub !== undefined && input.dataset.hub !== hub;
-          input.dataset.hub = hub;
-          input.placeholder = hub === '' ? 'Off' : '';
-          // An unsent change stands while it is being typed, and until the hub's
-          // target moves. Focus alone must not protect the box: after Enter the
-          // cursor stays in it, and it would go stale again.
-          if (input.dataset.edited && (document.activeElement === input || !moved)) return;
-          delete input.dataset.edited;
-          input.value = hub;
-        });
-      }
-      function markEdited(e) {
-        if (e.target.matches && e.target.matches('.setpoint-input')) e.target.dataset.edited = '1';
-      }
-      document.addEventListener('input', markEdited);
-      document.addEventListener('change', markEdited);
-      // A sent request (Set target or Off) ends the edit; the reply's readout
-      // then carries the value the hub was given.
-      document.addEventListener('htmx:beforeRequest', function (e) {
-        var form = e.target.closest && e.target.closest('form.setpoint, form.setpoint-off');
-        var input = form && boxFor(form);
-        if (input) delete input.dataset.edited;
-      });
-      document.addEventListener('htmx:afterSettle', syncTargets);
-      // Leaving the page drops unsent changes, so coming back shows the truth.
-      document.addEventListener('visibilitychange', function () {
-        if (!document.hidden) return;
-        document.querySelectorAll('.setpoint-input').forEach(function (input) {
-          delete input.dataset.edited;
-        });
-      });
-      syncTargets();
-    })();
-  </script>
+  <script src="/static/target-box.js" defer></script>
 </body>
 </html>

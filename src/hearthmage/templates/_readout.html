@@ -1,3 +1,4 @@
+{% import "_bars.html" as bars %}
 <div id="readout-{{ room_id }}" class="readout"
      hx-get="/rooms/{{ room_id }}/status" hx-trigger="every 4s" hx-swap="outerHTML"
      {# The hub's target, copied into the target box by the page script; empty = off. -#}
@@ -22,8 +23,8 @@
     {% set span = (room.max_temp - room.min_temp) or 1 %}
     {% set cur_raw = ((room.current_temp - room.min_temp) / span * 100) if room.current_temp is not none else 0 %}
     {% set tgt_raw = ((room.target_temp - room.min_temp) / span * 100) if room.target_temp is not none else 0 %}
-    {% set cur_pct = [[cur_raw, 0]|max, 100]|min %}
-    {% set tgt_pct = [[tgt_raw, 0]|max, 100]|min %}
+    {% set cur_pct = cur_raw %}
+    {% set tgt_pct = tgt_raw %}
     {% set diff = (room.current_temp - room.target_temp)
                   if (room.current_temp is not none and room.target_temp is not none) else none %}
     <div class="reading">
@@ -48,8 +49,7 @@
       </div>
 
       <div class="track" aria-hidden="true">
-        <div class="track-fill" style="width: {{ '%.1f'|format(cur_pct) }}%"></div>
-        <span class="track-target" style="left: {{ '%.1f'|format(tgt_pct) }}%"></span>
+        {{ bars.track(cur_pct, tgt_pct) }}
       </div>
 
       <p class="summary">Now {{ '%.1f'|format(room.current_temp) if room.current_temp is not none else '--' }}&deg;C<span class="sep" aria-hidden="true">&middot;</span><span class="tgt">{% if room.is_off %}Off{% else %}Target {{ '%.1f'|format(room.target_temp) if room.target_temp is not none else '--' }}&deg;C{% endif %}</span></p>

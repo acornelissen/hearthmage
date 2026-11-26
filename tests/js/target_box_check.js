@@ -1,7 +1,6 @@
 // Runs the page's real "target box follows the hub" script against a stub DOM.
 const fs = require('fs');
-const html = fs.readFileSync(process.argv[2], 'utf8');
-const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]).find((s) => s.includes('syncTargets'));
+const script = fs.readFileSync(process.argv[2], 'utf8');
 
 function makePage(target) {
   const input = { value: target, placeholder: target === '' ? 'Off' : '', dataset: {}, matches: (s) => s === '.setpoint-input' };

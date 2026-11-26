@@ -48,6 +48,20 @@ from hearthmage.waste import WasteDetector, status_diff
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
+
+def _pct(value) -> float:
+    """A bar size as a percentage clamped to 0..100; non-numbers count as 0."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number:  # NaN
+        return 0.0
+    return min(100.0, max(0.0, number))
+
+
+templates.env.globals["pct"] = _pct
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     # Parse the host settings now so a typo is logged at startup, not at the
@@ -57,7 +71,8 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Heating", lifespan=_lifespan)
+# The generated API docs are switched off: nothing needs them on a LAN appliance.
+app = FastAPI(title="Heating", lifespan=_lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 settings = Settings(config_path())
@@ -473,6 +488,34 @@ async def _security(request: Request, call_next):
     return await call_next(request)
 
 
+_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        "connect-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; "
+        "form-action 'self'; frame-ancestors 'none'; object-src 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+}
+
+
+# Registered after _security so it wraps it: refusals and redirects get the
+# headers too. The templates carry no inline script or style (a test enforces it).
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Answer here, not in Starlette's outer handler, so a 500 carries the headers.
+        logging.getLogger("hearthmage.app").exception("unhandled error on %s %s", request.method, request.url.path)
+        response = PlainTextResponse("Internal Server Error", status_code=500)
+    for name, value in _SECURITY_HEADERS.items():
+        response.headers[name] = value
+    return response
+
+
 class NotConfigured(Exception):
     """Raised when no hub is configured yet; handled by redirecting to setup."""
 
@@ -607,11 +650,13 @@ _MANIFEST = {
 # is LAN-only, so this is about install ergonomics and fast loads, not full
 # offline use. The cache name carries a hash of the static files, so changing
 # any of them changes sw.js and browsers drop the old cache.
-_STATIC_SHELL_FILES = ("styles.css", "htmx.min.js", "icon.svg")
+_STATIC_SHELL_FILES = ("styles.css", "htmx.min.js", "icon.svg", "app.js", "target-box.js",
+                       "schedule.js")
 _SERVICE_WORKER = """
 const CACHE = 'hearth-%(version)s';
 const STATIC = ['/static/styles.css', '/static/htmx.min.js', '/static/icon.svg',
-                '/manifest.webmanifest'];
+                '/static/app.js', '/static/target-box.js',
+                '/static/schedule.js', '/manifest.webmanifest'];
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(STATIC.concat(['/'])))
     .then(() => self.skipWaiting()));
@@ -653,14 +698,17 @@ def service_worker() -> Response:
 
 
 @app.get("/healthz")
-def healthz(client: HearthClient = Depends(get_client)) -> JSONResponse:
+def healthz(request: Request, client: HearthClient = Depends(get_client)) -> JSONResponse:
     """Liveness/health for monitoring: poller alive and hub answering recently.
-    An unconfigured app is reported as 503 by the NotConfigured handler above."""
+    An unconfigured app is reported as 503 by the NotConfigured handler above.
+    With a password set, callers without a session get only configured/ok."""
     report = getattr(client, "health", None)
     if report is None:  # a client without health data is assumed fine
         return JSONResponse({"configured": True, "ok": True})
     data = report()
     ok = bool(data.get("poller_alive", True)) and not data.get("hub_stale", False)
+    if settings.auth_enabled and not _is_authenticated(request):
+        data = {}  # a public probe learns only up or down, not zones or timings
     return JSONResponse({"configured": True, "ok": ok, **data}, status_code=200 if ok else 503)
 
 

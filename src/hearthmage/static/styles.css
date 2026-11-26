@@ -248,24 +248,15 @@ body {
   background: var(--paper-2);
   overflow: visible;
 }
-.track-fill {
-  position: absolute;
-  inset: 0 auto 0 0;
-  border-radius: 999px;
-  background: var(--grad-heat);
-  transition: width .5s cubic-bezier(.3, .8, .3, 1);
-  min-width: 12px;
-}
-.track-target {
-  position: absolute;
-  top: 50%;
-  width: 4px; height: 22px;
-  border-radius: 3px;
-  background: var(--ink);
-  transform: translate(-50%, -50%);
-  box-shadow: 0 0 0 3px var(--surface);
-  transition: left .5s cubic-bezier(.3, .8, .3, 1);
-}
+/* The bars are inline SVG (see _bars.html); fills are presentation attributes
+   pointing at the shared gradient in _heat_defs.html. */
+.track-svg { position: absolute; inset: 0; overflow: visible; }
+.track-target-ring { fill: var(--surface); }
+.track-target { fill: var(--ink); }
+.heat-stop-a { stop-color: var(--heat-a); }
+.heat-stop-b { stop-color: var(--heat-b); }
+.heat-stop-c { stop-color: var(--heat-c); }
+.svg-defs { position: absolute; width: 0; height: 0; overflow: hidden; }
 
 .summary {
   margin: 0;
@@ -821,7 +812,7 @@ a.link-btn:hover { text-decoration: underline; }
 .bar-row { display: grid; grid-template-columns: 3.5rem 1fr 3rem; align-items: center; gap: .6rem; }
 .bar-label { color: var(--muted); font-size: .85rem; font-weight: 600; }
 .bar-track { position: relative; height: .75rem; background: var(--off-bg); border-radius: 999px; overflow: hidden; }
-.bar-fill { position: absolute; inset: 0 auto 0 0; background: var(--grad-heat); border-radius: 999px; min-width: 2px; }
+.bar-svg { display: block; }
 .bar-value { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); font-size: .85rem; }
 
 /* Off button next to the setpoint stepper */
