@@ -182,6 +182,15 @@ class _MqttCommandHandler:
         except (HearthError, NotConfigured):
             pass
 
+    def turn_on(self, zone_id: str) -> None:
+        _setpoint_log.info("zone %r turned on requested by mqtt", zone_id)
+        try:
+            turn_on = getattr(get_client(), "turn_on", None)
+            if turn_on is not None:
+                turn_on(zone_id)
+        except (HearthError, NotConfigured):
+            pass
+
 
 def _restart_mqtt() -> None:
     """(Re)start the MQTT bridge from current settings: stop any running paho
@@ -692,6 +701,7 @@ def get_client() -> HearthClient:
                 on_reading=_record_reading,
                 on_energy=_record_energy,
                 on_zones=_announce_zones,
+                is_held=_zone_held,
             )
             client.start()  # begin background polling
             _client = client
@@ -905,6 +915,7 @@ def set_temperature(
         "zone %r target %s requested by %s",
         room_id, temperature, request.client.host if request.client else "unknown",
     )
+    _check_zone(room_id)
     error: str | None = None
     try:
         client.set_temperature(room_id, temperature)
@@ -1629,6 +1640,37 @@ def _refresh_energy(client: HearthClient, room_ids: list[str]) -> None:
             _record_energy(room_id, data)
 
 
+_ENERGY_REFRESH_EVERY = 300.0  # an /energy visit refreshes at most this often
+_energy_refresh = {"running": False, "started_at": None}  # guarded by the lock below
+_energy_refresh_lock = threading.Lock()
+
+
+def _start_energy_refresh(client: HearthClient, room_ids: list[str]) -> None:
+    """Start a background energy refresh, unless one is running or one started
+    in the last _ENERGY_REFRESH_EVERY: each one queues radio reads on the hub."""
+    with _energy_refresh_lock:
+        last = _energy_refresh["started_at"]
+        if _energy_refresh["running"] or (
+            last is not None and _monotonic() - last < _ENERGY_REFRESH_EVERY
+        ):
+            return
+        _energy_refresh.update(running=True, started_at=_monotonic())
+
+    def run() -> None:
+        try:
+            _refresh_energy(client, room_ids)
+        finally:
+            with _energy_refresh_lock:
+                _energy_refresh["running"] = False
+
+    try:
+        threading.Thread(target=run, name="energy-refresh", daemon=True).start()
+    except BaseException:
+        with _energy_refresh_lock:
+            _energy_refresh["running"] = False
+        raise
+
+
 def _zone_energy_view(room, price: float) -> dict:
     """Cached energy for one zone, decoded to kWh and cost."""
     cached = energy.get_zone(room.id)
@@ -1676,12 +1718,7 @@ def _energy_response(
     home_week = sum(z["week_kwh"] for z in zones if z["has_data"])
     # Kick off a background refresh so the next visit reflects awake radiators.
     if rooms and client is not None:
-        threading.Thread(
-            target=_refresh_energy,
-            args=(client, [r.id for r in rooms]),
-            name="energy-refresh",
-            daemon=True,
-        ).start()
+        _start_energy_refresh(client, [r.id for r in rooms])
     return templates.TemplateResponse(
         request,
         "energy.html",
@@ -2211,15 +2248,21 @@ def _current_holiday(zone_id: str) -> dict | None:
     try:
         until = datetime.fromisoformat(record["until"])
     except (KeyError, TypeError, ValueError):
-        holidays.clear(zone_id)
+        holidays.clear_if(zone_id, record)  # not one saved since the read
         return None
     if until <= datetime.now():
-        holidays.clear(zone_id)
+        holidays.clear_if(zone_id, record)
         return None
     return {
         "until_label": f"{until:%a %d %b}, {until:%H:%M}",
         "arrival_temp": record.get("arrival_temp"),
     }
+
+
+def _zone_held(zone: int) -> bool:
+    """For the hub client: a hold level read from the radiator is not the
+    target that MQTT "heat" restores."""
+    return _current_holiday(str(zone)) is not None
 
 
 def _parse_holiday_form(form) -> tuple[datetime, float | None]:

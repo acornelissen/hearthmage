@@ -12,6 +12,9 @@ class _Handler:
     def set_temperature(self, zone_id, temperature):
         self.calls.append((zone_id, temperature))
 
+    def turn_on(self, zone_id):
+        self.calls.append((zone_id, "on"))
+
 
 def _bridge(handler=None):
     published = []
@@ -70,11 +73,15 @@ def test_mode_off_command_sets_zero():
     assert handler.calls == [("3", 0.0)]
 
 
-def test_mode_heat_command_is_ignored_without_temperature():
+def test_mode_heat_command_turns_the_zone_back_on():
+    # heatapp-local-9cg: a zone switched off from Home Assistant must be able
+    # to come back on; the client picks the target (its last one above off).
     handler = _Handler()
     bridge, _ = _bridge(handler)
     bridge.on_message("hearthmage/3/mode/set", "heat")
-    assert handler.calls == []  # temperature command drives the value, not mode
+    bridge.on_message("hearthmage/4/mode/set", " HEAT ")
+    bridge.on_message("hearthmage/5/mode/set", "cool")  # not a mode we offer
+    assert handler.calls == [("3", "on"), ("4", "on")]
 
 
 def test_retained_commands_are_ignored():

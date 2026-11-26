@@ -54,6 +54,16 @@ class HolidayStore:
             }
             write_json_atomic(self._path, self._data)
 
+    def clear_if(self, zone_id: str, record: dict) -> bool:
+        """Clear the zone's record only if it is still ``record``: one saved
+        since it was read (a new hold) is kept. True if it was cleared."""
+        with self._lock:
+            if self._data.get(str(zone_id)) != record:
+                return False
+            del self._data[str(zone_id)]
+            write_json_atomic(self._path, self._data)
+            return True
+
     def clear(self, zone_id: str) -> None:
         with self._lock:
             if str(zone_id) in self._data:

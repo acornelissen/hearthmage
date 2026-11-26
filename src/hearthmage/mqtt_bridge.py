@@ -237,9 +237,13 @@ class MqttBridge:
                 return
             self._handler.set_temperature(zone, value)
         elif field == "mode":
-            if payload.strip().lower() == "off":
+            mode = payload.strip().lower()
+            if mode == "off":
                 self._handler.set_temperature(zone, 0.0)
-            # "heat" is driven by the temperature command; nothing to do here.
+            elif mode == "heat":
+                # Back on to the zone's last target above off; the client
+                # checks the zone is off and knows the target.
+                self._handler.turn_on(zone)
 
     def handle_message(self, topic: str, payload: str, retain: bool) -> None:
         """Entry point for broker messages. A retained command is stale (the

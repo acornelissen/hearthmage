@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -88,6 +89,31 @@ _MIN_TEMP = 5.0
 _MAX_TEMP = 30.0
 # "Off" is sent as a 1 degree setpoint: *T0 did not reliably turn radiators off.
 _OFF_TEMP = 1.0
+# Turning a zone back on (MQTT mode "heat") with no earlier target known.
+_DEFAULT_ON_TEMP = 20.0
+# Consecutive setpoint sends to one zone are at least this far apart, so a loop
+# of requests cannot keep the hub's radio busy; the latest target still wins
+# (writes coalesce). The first send after a quiet spell goes at once.
+_SETPOINT_MIN_GAP = 1.0
+# A second request for a slow radio read of a zone (radiator settings: up to 13
+# reads; holiday; energy) waits this long for the one already running and
+# shares its answer, rather than queuing the same reads behind it.
+_SHARED_READ_WAIT = 20.0
+# ...but only this many at once: each waiter holds a request thread, so past
+# this a caller gets "could not read" at once and the app stays responsive.
+_SHARED_READ_MAX_WAITERS = 4
+# Zone ids are 1..255 (the hub's slots are bytes; inferred, live ids 1..4).
+_MAX_ZONE = 255
+
+
+class _SharedRead:
+    """One running read that later callers wait for (see _read_once)."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result = None
+        self.error: HearthError | None = None
+        self.waiters = 0  # guarded by the client's _lock
 
 
 class _Withdrawn(Exception):
@@ -116,6 +142,13 @@ class _Wire:
         self.owner: NexhoLocalClient | None = None  # the started, not stopped, client
         # zone -> (target, requested_at, unconfirmed) from a stopped client
         self.handed_over: dict[int, tuple[float, float, bool]] = {}
+        # zone -> last target above off a stopped client knew (see turn_on)
+        self.last_on: dict[int, float] = {}
+        # zone -> when a setpoint datagram to it last went out, from any
+        # client of this hub (see _SETPOINT_MIN_GAP). A leaf lock: nothing is
+        # taken while it is held.
+        self.sent_lock = threading.Lock()
+        self.sent_at: dict[int, float] = {}
 
     # Lock order: lock (an exchange) -> clients -> a client's _lock. Nothing
     # here takes ``lock``; a client never takes ``clients`` under its _lock.
@@ -125,6 +158,8 @@ class _Wire:
         with self.clients:
             self.owner = client
             waiting, self.handed_over = self.handed_over, {}
+            last_on, self.last_on = self.last_on, {}
+            client._adopt_last_on(last_on)
             self._park(client._adopt_setpoints(waiting))
 
     def hand_over(self, client: NexhoLocalClient, waiting: dict[int, tuple[float, float, bool]]) -> None:
@@ -140,10 +175,16 @@ class _Wire:
                     zone: entry for zone, entry in waiting.items()
                     if client._acked.get(zone) != entry[:2]
                 }
+                last_on = dict(client._last_on)
             if self.owner is client:
                 self.owner = None
             if self.owner is not None:
                 waiting = self.owner._adopt_setpoints(waiting)  # what it could not take
+                # A stopping owner keeps these too: its own hand-over, still
+                # to come (owner is cleared there), passes them on.
+                self.owner._adopt_last_on(last_on)
+            else:
+                self.last_on.update(last_on)
             self._park(waiting)
 
     def confirmed(self, zone: int, target: float, requested_at: float | None) -> None:
@@ -156,6 +197,19 @@ class _Wire:
                 del self.handed_over[zone]
             if self.owner is not None:
                 self.owner._settle_carried(zone, target, requested_at)
+
+    def note_sent(self, zone: int, when: float) -> None:
+        with self.sent_lock:
+            self.sent_at[zone] = when
+
+    def last_sent(self, zone: int) -> float | None:
+        with self.sent_lock:
+            return self.sent_at.get(zone)
+
+    def forget_sent(self, keep: set[int]) -> None:
+        with self.sent_lock:
+            for zone in [z for z in self.sent_at if z not in keep]:
+                del self.sent_at[zone]
 
     def _park(self, waiting: dict[int, tuple[float, float, bool]]) -> None:
         """Keep setpoints for the next client; called with ``clients`` held."""
@@ -263,8 +317,13 @@ class NexhoLocalClient:
         on_energy=None,
         energy_interval: float = 3600.0,
         on_zones=None,
+        is_held=None,
     ) -> None:
         self._addr = (hub_ip, port)
+        # Optional callback(zone:int) -> bool: True while the app has a holiday
+        # hold recorded for the zone. Its readings (the hold level) are then
+        # not taken as the target turn_on restores; user setpoints still are.
+        self._is_held = is_held
         self._names = zone_names or {}
         self._poll_interval = poll_interval
         self._cache_file = cache_file
@@ -298,6 +357,14 @@ class NexhoLocalClient:
         # zone -> when a newer command dropped its waiting setpoint (see
         # cancel_waiting_setpoint); a carried-over older setpoint is not sent.
         self._cancelled_at: dict[int, float] = {}
+        # zone -> the last target above off it was set to or read at; turn_on
+        # switches an off zone back to it. Carried to the hub's next client.
+        self._last_on: dict[int, float] = {}
+        # Zones restored from the readings cache: they stand in for the hub's
+        # zone list until it first answers (see _require_zone).
+        self._cached_zones: list[int] | None = None
+        # (kind, zone) -> a slow read running now, shared by later callers
+        self._reads: dict[tuple[str, int], _SharedRead] = {}
         # Wakes write workers that are waiting to retry (new target, kick, stop).
         self._write_wake = threading.Condition()
         self._zones: list[int] | None = None  # the accepted zone list
@@ -342,12 +409,13 @@ class NexhoLocalClient:
             return
         for zid, pair in (data or {}).items():
             try:
-                zone = int(zid)
+                zone = _zone_int(zid)
                 current, target = pair[0], pair[1]
-            except (TypeError, ValueError, IndexError):
+            except (HearthError, TypeError, KeyError, IndexError):
                 continue
             self._last[zone] = (current, target)
             self._state[zone] = self._room(zone, current, target, "ok")
+        self._cached_zones = sorted(self._state) or None
 
     def _save_cache(self) -> None:
         if not self._cache_file:
@@ -494,8 +562,11 @@ class NexhoLocalClient:
             tok = tok.strip()
             if tok in ("", "0"):  # a 0 field marks the end of used slots
                 break
-            if tok.isdigit():
-                ids.append(int(tok))
+            zone = _digits(tok)
+            if zone is None or zone > _MAX_ZONE:  # every request would refuse it
+                self._log_rejected(("OPS2",), "zone list (OPS2)", resp)
+                continue
+            ids.append(zone)
         now = time.monotonic()
         self._last_ops2_ok = now  # hub answered: health clock resets
         if ids != self._heaters_for or now - self._heaters_read_at >= _HEATERS_REFRESH:
@@ -529,13 +600,14 @@ class NexhoLocalClient:
             for table in (self._state, self._last, self._pending, self._desired,
                           self._next_poll, self._backoff, self._last_fresh, self._write_seq,
                           self._requested_at, self._gave_up, self._status_rejected_at,
-                          self._acked, self._cancelled_at):
+                          self._acked, self._cancelled_at, self._last_on):
                 for zone in [z for z in table if z not in keep]:
                     del table[zone]
             for key in [k for k in self._rejected_logged if isinstance(k[0], int) and k[0] not in keep]:
                 del self._rejected_logged[key]  # a zone's energy rejections
             self._unconfirmed &= keep
             self._write_kick &= keep
+        self._wire.forget_sent(keep)
         with self._write_wake:
             self._write_wake.notify_all()  # a worker retrying for a dropped zone ends
 
@@ -565,12 +637,14 @@ class NexhoLocalClient:
         """Zone number for a request, refused if the hub has no such zone. The
         id comes from a URL or an MQTT topic, so without this any number would
         be put on the wire and leave a phantom card behind. Before the hub has
-        answered once, the zones restored from the readings cache stand in; with
-        neither there is nothing to check against yet."""
+        answered once, the zones restored from the readings cache stand in
+        (never zones a request created); with neither, nothing is accepted."""
         zone = _zone_int(room_id)
         with self._lock:
-            known = self._zones if self._zones is not None else (list(self._state) or None)
-        if known is not None and zone not in known:
+            known = self._zones if self._zones is not None else self._cached_zones
+        if known is None:
+            raise HearthError("Still connecting to the hub. Try again shortly.")
+        if zone not in known:
             raise HearthError(f"Unknown zone: {room_id}")
         return zone
 
@@ -822,6 +896,7 @@ class NexhoLocalClient:
             writing_before = zone in self._writers
             was_silent = self._backoff.get(zone, 0.0) > self._poll_interval  # backing off
         current, target, fresh = self._read_zone_raw(zone)
+        held = fresh and self._held(zone)  # outside _lock: the hook reads a store
         if fresh:
             _log.debug("zone %s fresh: current=%s target=%s", zone, current, target)
         else:
@@ -843,6 +918,8 @@ class NexhoLocalClient:
                 # write landed even if its ack was lost. That confirms it, and
                 # the worker (if any) has nothing left to send.
                 self._last[zone] = (current, target)
+                if not held:
+                    self._note_on(zone, target)
                 self._pending.pop(zone, None)
                 self._unconfirmed.discard(zone)
                 self._write_kick.discard(zone)
@@ -854,6 +931,8 @@ class NexhoLocalClient:
                 # No write anywhere near this read: the radiator's answer is
                 # ground truth and reconciles any now-settled pending write.
                 self._last[zone] = (current, target)
+                if not held:
+                    self._note_on(zone, target)
                 self._pending.pop(zone, None)
                 self._state[zone] = self._room(zone, current, target, "ok")
             elif pending is not None:
@@ -995,22 +1074,62 @@ class NexhoLocalClient:
         re-sent until it is, or until a newer target replaces it.
         """
         zone = self._require_zone(room_id)
-        if not math.isfinite(temperature):
-            raise HearthError(f"Invalid temperature: {temperature!r}")
-        # A non-positive request means OFF (sent as _OFF_TEMP). Otherwise clamp to
-        # the supported range and snap to the nearest half degree before it becomes
-        # a wire command - the min/max are otherwise only used for display, so a
-        # crafted request could send an out-of-range setpoint to the radiator.
-        if temperature <= 0:
-            target = _OFF_TEMP
-        else:
-            temperature = max(_MIN_TEMP, min(_MAX_TEMP, temperature))
-            target = round(temperature * 2) / 2
+        target = _setpoint_target(temperature)
         with self._lock:
-            if self._stop.is_set():  # swapped out: refuse rather than lose it
-                raise HearthError("The hub connection was restarted. Set the target again.")
-            start = self._want_setpoint(zone, target, time.monotonic())  # give-up clock starts
+            start = self._set_locked(zone, target)
         self._run_writer(zone, start)
+
+    def turn_on(self, room_id: str, default: float = _DEFAULT_ON_TEMP) -> bool:
+        """Switch a zone that is off back on, to the last target above off it
+        was set to or read at (``default`` if none is known); True if it was
+        off. A zone that is on (a holiday hold at 7 C counts) or not read yet
+        is left alone. The off check and the write share one hold of _lock, so
+        a target set in between (the web UI) lands after this one and wins.
+        With the weekly program on, this sets a manual target, as the web UI does."""
+        zone = self._require_zone(room_id)
+        fallback = _setpoint_target(default)
+        with self._lock:
+            room = self._state.get(zone)
+            if room is None or room.target_temp is None or not room.is_off:
+                return False
+            target = _setpoint_target(self._last_on.get(zone, fallback))
+            if target <= _OFF_TEMP:
+                target = _setpoint_target(_DEFAULT_ON_TEMP)
+            start = self._set_locked(zone, target)
+        self._run_writer(zone, start)
+        _log.info("zone %s turned back on to %s", zone, target)
+        return True
+
+    def _set_locked(self, zone: int, target: float) -> bool:
+        """set_temperature with _lock held and ``target`` validated. True if
+        the caller must start the zone's write worker."""
+        if self._stop.is_set():  # swapped out: refuse rather than lose it
+            raise HearthError("The hub connection was restarted. Set the target again.")
+        self._note_on(zone, target)
+        return self._want_setpoint(zone, target, time.monotonic())  # give-up clock starts
+
+    def _held(self, zone: int) -> bool:
+        """Whether the app has a holiday hold recorded for the zone. A failing
+        hook counts as held: skipping one reading's note costs nothing."""
+        if self._is_held is None:
+            return False
+        try:
+            return bool(self._is_held(zone))
+        except Exception:  # noqa: BLE001 - the hook must not break polling
+            _log.exception("is_held hook failed for zone %s", zone)
+            return True
+
+    def _note_on(self, zone: int, target: float | None) -> None:
+        """Remember a target above off for turn_on. Called with _lock held."""
+        if target is not None and target > _OFF_TEMP:
+            self._last_on[zone] = float(target)
+
+    def _adopt_last_on(self, last_on: dict[int, float]) -> None:
+        """Take the last on-targets a stopped client of this hub knew; what this
+        client has seen itself is newer and stays."""
+        with self._lock:
+            for zone, target in last_on.items():
+                self._last_on.setdefault(zone, target)
 
     def _want_setpoint(self, zone: int, target: float, requested_at: float) -> bool:
         """Make ``target`` the zone's wanted setpoint and show it. Called with
@@ -1060,7 +1179,13 @@ class NexhoLocalClient:
                         self._writers.discard(zone)  # atomic with the empty check
                         registered = False
                         return
-                    self._write_kick.discard(zone)
+                    last = self._wire.last_sent(zone)  # leaf lock
+                    gap = 0.0 if last is None else last + _SETPOINT_MIN_GAP - time.monotonic()
+                    if gap <= 0:
+                        self._write_kick.discard(zone)
+                if gap > 0:
+                    self._wait_send_gap(gap)
+                    continue  # then send whatever is wanted by now
                 ok = self._send_once(zone, target)
                 if self._stop.is_set():
                     return  # swapped out: the hub's next client has this setpoint
@@ -1144,6 +1269,10 @@ class NexhoLocalClient:
         if stopped:
             self._wire.confirmed(zone, target, asked)
 
+    def _wait_send_gap(self, wait: float) -> None:
+        """Sleep out the rest of the zone's send gap; stop() ends it early."""
+        self._stop.wait(wait)
+
     def _wait_to_retry(self, zone: int, target: float, wait: float) -> None:
         """Sleep before re-sending ``target``, but wake at once if a newer
         target arrives, the radiator answers a poll, the zone is dropped, or the
@@ -1167,11 +1296,22 @@ class NexhoLocalClient:
         (a newer target, or cancel_waiting_setpoint); that returns None, which
         is not a refusal by the hub."""
         wire = _encode_setpoint(target)
+        went_out = False
 
         def still_wanted() -> bool:
+            nonlocal went_out
             with self._lock:
-                return self._desired.get(zone) == target
+                wanted = self._desired.get(zone) == target
+            went_out = went_out or wanted  # _ask sends right after a yes
+            return wanted
 
+        try:
+            return self._send_setpoint(zone, target, wire, still_wanted)
+        finally:
+            if went_out:  # the gap runs from the end of a real exchange
+                self._wire.note_sent(zone, time.monotonic())
+
+    def _send_setpoint(self, zone: int, target: float, wire: int, still_wanted) -> bool | None:
         try:
             resp = self._ask_until_answered(
                 f"D#{zone}#{self._modules(zone)}#0#0*T{wire}/", "OK", priority=True,
@@ -1248,6 +1388,9 @@ class NexhoLocalClient:
         read failed is None (unknown), never a default: the settings form must
         not be able to write a guess back to the radiator."""
         zone = self._require_zone(room_id)
+        return self._read_once("config", zone, lambda: self._read_config(zone))
+
+    def _read_config(self, zone: int) -> dict | None:
         if self._read_element(zone, *self._EL_KEYPAD) is None:
             return None  # first read failed: radiator asleep, don't bother more
         keypad = self._read_element_agreed(zone, *self._EL_KEYPAD)
@@ -1279,6 +1422,12 @@ class NexhoLocalClient:
             math.isfinite(sensor_offset) and abs(sensor_offset) <= self.OFFSET_LIMIT + 1e-9
         ):
             raise HearthError(f"Sensor offset {sensor_offset} out of range +/-{self.OFFSET_LIMIT}")
+        try:
+            self._write_config(zone, keypad_lock, window_sensor, frost_temp, sensor_offset)
+        finally:
+            self._detach_read("config", zone)  # even a failed save may have written some
+
+    def _write_config(self, zone, keypad_lock, window_sensor, frost_temp, sensor_offset) -> None:
         if keypad_lock is not None:
             current = self._read_element_agreed(zone, *self._EL_KEYPAD)
             if current is None:
@@ -1320,24 +1469,33 @@ class NexhoLocalClient:
         else:
             raise HearthError(f"Arrival temperature {arrival_temp} out of range")
         self.cancel_waiting_setpoint(room_id)
-        resp = self._ask_until_answered(
-            f"D#{zone}#{self._modules(zone)}#0#0*RH#{int(days)}#{int(hour)}#{int(minute)}#{arrival}/", "OK", priority=True
-        )
+        try:
+            resp = self._ask_until_answered(
+                f"D#{zone}#{self._modules(zone)}#0#0*RH#{int(days)}#{int(hour)}#{int(minute)}#{arrival}/", "OK", priority=True
+            )
+        finally:
+            self._detach_read("holiday", zone)
         if resp != "OK":
             raise HearthError(f"Holiday set failed for zone {zone}: {resp!r}")
 
     def clear_holiday(self, room_id: str) -> None:
         """Cancel a zone's holiday hold (the vendor's clear: *RH#0#0#0#251)."""
         zone = self._require_zone(room_id)
-        resp = self._ask_until_answered(
-            f"D#{zone}#{self._modules(zone)}#0#0*RH#0#0#0#{self._RH_RESUME_PROGRAM}/", "OK", priority=True
-        )
+        try:
+            resp = self._ask_until_answered(
+                f"D#{zone}#{self._modules(zone)}#0#0*RH#0#0#0#{self._RH_RESUME_PROGRAM}/", "OK", priority=True
+            )
+        finally:
+            self._detach_read("holiday", zone)
         if resp != "OK":
             raise HearthError(f"Holiday clear failed for zone {zone}: {resp!r}")
 
     def read_holiday(self, room_id: str) -> dict | None:
         """Read a zone's holiday hold; None if the radiator did not answer."""
         zone = self._require_zone(room_id)
+        return self._read_once("holiday", zone, lambda: self._read_holiday(zone))
+
+    def _read_holiday(self, zone: int) -> dict | None:
         try:
             resp = self._ask(f"R#{zone}#1#0#0*?RH/", _READ_RETRIES, _READ_TIMEOUT)
         except HearthError:
@@ -1365,6 +1523,9 @@ class NexhoLocalClient:
         Never send ``*UDEL``: in the vendor app it is the consumption RESET,
         behind a "confirm reset" dialog (it was once used here as a probe)."""
         zone = self._require_zone(room_id)
+        return self._read_once("energy", zone, lambda: self._read_energy(zone))
+
+    def _read_energy(self, zone: int) -> dict | None:
         try:
             ud = self._ask(f"R#{zone}#1#0#0*?UD/", _READ_RETRIES, _READ_TIMEOUT)
             um = self._ask(f"R#{zone}#1#0#0*?UM/", _READ_RETRIES, _READ_TIMEOUT)
@@ -1383,6 +1544,50 @@ class NexhoLocalClient:
                 self._log_rejected((zone, "UM"), f"zone {zone} monthly energy (*?UM)", um)
             monthly = []  # not this radiator's monthly reply (or none)
         return {"rated_watts": watts, "daily": daily, "monthly": monthly}
+
+    def _read_once(self, kind: str, zone: int, read):
+        """Run ``read()`` unless the same kind of read of ``zone`` is running
+        already: then wait up to _SHARED_READ_WAIT for its answer and share it
+        (None if it does not come in time), putting nothing more on the wire.
+        ``zone`` must have passed _require_zone."""
+        key = (kind, zone)
+        with self._lock:
+            call = self._reads.get(key)
+            leader = call is None
+            if leader:
+                call = self._reads[key] = _SharedRead()
+            elif call.waiters >= _SHARED_READ_MAX_WAITERS:
+                full = True
+            else:
+                full = False
+                call.waiters += 1
+        if not leader and full:
+            _log.info("zone %s %s read: too many callers waiting already", zone, kind)
+            return None
+        if not leader:
+            if not call.done.wait(_SHARED_READ_WAIT):
+                _log.info("zone %s %s read still running; not waiting longer", zone, kind)
+                return None
+            if call.error is not None:
+                raise HearthError(str(call.error))
+            return copy.deepcopy(call.result)  # each caller gets its own
+        try:
+            call.result = read()
+            return call.result
+        except HearthError as exc:
+            call.error = exc
+            raise
+        finally:
+            with self._lock:
+                if self._reads.get(key) is call:  # not detached by a write
+                    del self._reads[key]
+            call.done.set()
+
+    def _detach_read(self, kind: str, zone: int) -> None:
+        """A write to the zone has gone out: a read still running may predate
+        it, so later callers start a fresh one instead of sharing it."""
+        with self._lock:
+            self._reads.pop((kind, zone), None)
 
     def set_scene_membership(self, room_id: str, scene: Scene, member: bool) -> None:
         # Nexho climate zones expose no on/off or scene-activate opcode on the
@@ -1479,6 +1684,20 @@ def _encode_setpoint(temp: float | None) -> int:
     return int(half + 127.5)
 
 
+def _setpoint_target(temperature: float) -> float:
+    """The setpoint to send for a requested temperature. A non-positive request
+    means OFF (sent as _OFF_TEMP). Otherwise clamp to the supported range and
+    snap to the nearest half degree before it becomes a wire command - the
+    min/max are otherwise only used for display, so a crafted request could
+    send an out-of-range setpoint to the radiator."""
+    if not math.isfinite(temperature):
+        raise HearthError(f"Invalid temperature: {temperature!r}")
+    if temperature <= 0:
+        return _OFF_TEMP
+    temperature = max(_MIN_TEMP, min(_MAX_TEMP, temperature))
+    return round(temperature * 2) / 2
+
+
 def _setpoint_retry_wait(failures: int) -> float:
     """Seconds to wait before re-sending a setpoint after ``failures`` tries in
     a row went unacknowledged: 30 s, doubling, capped at 15 minutes."""
@@ -1536,7 +1755,12 @@ def _as_int(value: str) -> int | None:
 
 
 def _zone_int(room_id: str) -> int:
-    try:
-        return int(room_id)
-    except (TypeError, ValueError) as exc:
-        raise HearthError(f"Invalid zone id: {room_id!r}") from exc
+    """A zone id from a URL, an MQTT topic or the readings cache: plain ASCII
+    digits, 1.._MAX_ZONE. int() alone takes signs, spaces, underscores and
+    non-ASCII digits ("-5", " 1", "1_000", Arabic-Indic three)."""
+    if not (isinstance(room_id, str) and room_id.isascii() and room_id.isdigit()):
+        raise HearthError(f"Invalid zone id: {room_id!r}")
+    zone = int(room_id)
+    if not 1 <= zone <= _MAX_ZONE:
+        raise HearthError(f"Invalid zone id: {room_id!r}")
+    return zone

@@ -1490,6 +1490,136 @@ def test_energy_page_without_reading_shows_placeholder(client: TestClient, tmp_p
     assert "No energy reading yet" in resp.text
 
 
+def _energy_refreshes(monkeypatch, appmod):
+    """Count background energy refreshes; each one blocks until released."""
+    import threading
+
+    started: list[list[str]] = []
+    release = threading.Event()
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(appmod, "_monotonic", lambda: clock["now"])
+    monkeypatch.setattr(appmod, "_energy_refresh", {"running": False, "started_at": None})
+
+    def refresh(client, room_ids):
+        started.append(list(room_ids))
+        release.wait(2)
+
+    monkeypatch.setattr(appmod, "_refresh_energy", refresh)
+    return started, release, clock
+
+
+def test_energy_page_runs_one_refresh_at_a_time(client: TestClient, tmp_path, monkeypatch):
+    # heatapp-local-1pj.6: every visit used to start a thread of radio reads.
+    appmod = _with_energy(tmp_path, monkeypatch)
+    started, release, clock = _energy_refreshes(monkeypatch, appmod)
+    try:
+        assert client.get("/energy").status_code == 200
+        _wait(lambda: started)
+        clock["now"] += 3600  # long past the interval, but the first is still running
+        for _ in range(5):
+            assert client.get("/energy").status_code == 200
+        assert started == [["1"]]
+    finally:
+        release.set()
+    _wait(lambda: not appmod._energy_refresh["running"])
+
+
+def test_energy_page_skips_a_refresh_that_ran_recently(client: TestClient, tmp_path, monkeypatch):
+    appmod = _with_energy(tmp_path, monkeypatch)
+    started, release, clock = _energy_refreshes(monkeypatch, appmod)
+    release.set()  # refreshes finish at once
+    client.get("/energy")
+    _wait(lambda: started and not appmod._energy_refresh["running"])
+    clock["now"] += appmod._ENERGY_REFRESH_EVERY - 1
+    client.get("/energy")
+    assert len(started) == 1
+    clock["now"] += 1
+    client.get("/energy")
+    _wait(lambda: len(started) == 2)
+
+
+def _wait(check):
+    import time as _time
+
+    deadline = _time.time() + 2
+    while _time.time() < deadline:
+        if check():
+            return
+        _time.sleep(0.005)
+    raise AssertionError("timed out")
+
+
+def test_mqtt_heat_turns_the_zone_on_through_the_app_client(monkeypatch):
+    import hearthmage.app as appmod
+
+    fake = FakeHearthClient(
+        [Room("1", "Living Room", 19.5, 21.0, is_off=False, min_temp=5.0, max_temp=30.0)]
+    )
+    monkeypatch.setattr(appmod, "get_client", lambda: fake)
+    handler = appmod._MqttCommandHandler()
+    handler.set_temperature("1", 0.0)
+    handler.turn_on("1")
+    assert fake.list_rooms()[0].target_temp == 21.0
+    handler.turn_on("99")  # unknown zone: dropped, not raised into the MQTT loop
+
+
+@pytest.mark.parametrize("bogus", ["-5", "+7", "1_000", "\u0663"])
+def test_set_temperature_refuses_a_zone_id_that_is_not_a_number(client: TestClient, bogus):
+    resp = client.post(f"/rooms/{bogus}/temperature", data={"temperature": "22"})
+    assert resp.status_code == 404
+
+
+def test_mqtt_commands_for_bogus_zones_reach_nothing(monkeypatch):
+    import hearthmage.app as appmod
+    from hearthmage.nexho_client import NexhoLocalClient
+
+    hub = NexhoLocalClient("10.0.0.99")
+    sent: list[str] = []
+    hub._ask = lambda cmd, *a, **k: sent.append(cmd) or "OK"  # type: ignore[method-assign]
+    hub._cached_zones = [1]
+    monkeypatch.setattr(appmod, "get_client", lambda: hub)
+    handler = appmod._MqttCommandHandler()
+    for bogus in ("-5", "0", "+1", "1_0", "\u0661", "2"):
+        handler.set_temperature(bogus, 20.0)
+        handler.turn_on(bogus)
+    assert sent == [] and hub._state == {} and hub._desired == {}
+
+
+def test_the_hub_client_is_told_which_zones_have_a_holiday_recorded(tmp_path, monkeypatch):
+    import hearthmage.app as appmod
+    from hearthmage.holiday_store import HolidayStore
+
+    monkeypatch.setattr(appmod, "holidays", HolidayStore(str(tmp_path / "holiday.json")))
+    appmod.holidays.set("2", until="2999-01-01T08:00", arrival_temp=None, prev_setpoint=21.0)
+    appmod.holidays.set("3", until="2020-01-01T08:00", arrival_temp=None, prev_setpoint=21.0)
+    assert [appmod._zone_held(z) for z in (1, 2, 3)] == [False, True, False]
+
+
+@pytest.mark.parametrize("stale", [
+    {"until": "2020-01-01T08:00", "arrival_temp": None, "prev_setpoint": 21.0},  # ended
+    {"day": 5, "month": 11, "temp": 7.0, "prev_setpoint": None},  # old encoding
+])
+def test_an_expired_holiday_is_dropped_without_deleting_a_newer_one(tmp_path, monkeypatch, stale):
+    # The poller checks holds every cycle. A hold the user saves between the
+    # check's read and its clear must survive.
+    import hearthmage.app as appmod
+    from hearthmage.holiday_store import HolidayStore
+
+    store = HolidayStore(str(tmp_path / "holiday.json"))
+    monkeypatch.setattr(appmod, "holidays", store)
+    store._data["1"] = dict(stale)
+    real_get = store.get
+
+    def get_then_user_saves(zone_id):
+        record = real_get(zone_id)
+        store.set("1", until="2999-01-01T08:00", arrival_temp=None, prev_setpoint=19.0)
+        return record
+
+    monkeypatch.setattr(store, "get", get_then_user_saves)
+    assert appmod._current_holiday("1") is None
+    assert real_get("1")["until"] == "2999-01-01T08:00"
+
+
 def test_save_price_persists_and_redirects(client: TestClient, tmp_path, monkeypatch):
     appmod = _with_energy(tmp_path, monkeypatch)
     resp = client.post("/settings/price", data={"price_per_kwh": "0.29"}, follow_redirects=False)

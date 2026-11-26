@@ -14,6 +14,7 @@ def _no_resend_gap(monkeypatch):
     """Resends after ER wait a few seconds on a real hub; not in tests."""
     monkeypatch.setattr("hearthmage.nexho_client._ER_GAP", 0.0)
     monkeypatch.setattr("hearthmage.nexho_client._HUB_QUIET_GAP", 0.0)
+    monkeypatch.setattr("hearthmage.nexho_client._SETPOINT_MIN_GAP", 0.0)  # its tests set it
 
 
 @pytest.fixture(autouse=True)
@@ -36,8 +37,10 @@ def _no_real_network(monkeypatch):
 
 
 def make_client(responses: dict[str, str], names=None) -> NexhoLocalClient:
-    """A client whose UDP layer is replaced by a canned-response lookup."""
+    """A client whose UDP layer is replaced by a canned-response lookup. Zones
+    1..16 stand in as if from a readings cache until the hub lists its own."""
     client = NexhoLocalClient("10.0.0.99", zone_names=names or {})
+    client._cached_zones = list(range(1, 17))
 
     def fake_ask(cmd: str, retries: int, timeout: float, priority: bool = False, **_) -> str:
         for prefix, resp in responses.items():
@@ -83,6 +86,7 @@ def test_parse_status_decodes_half_degree_setpoint():
 def test_set_temperature_off_marks_zone_off():
     sent: list[str] = []
     client = NexhoLocalClient("10.0.0.99")
+    client._cached_zones = list(range(1, 17))  # as if from a readings cache
     client._ask = lambda cmd, r, t, priority=False, **_: sent.append(cmd) or "OK"  # type: ignore[method-assign]
     client.set_temperature("2", 0)  # Off
     room = next(r for r in client.list_rooms() if r.id == "2")
@@ -460,6 +464,7 @@ def test_energy_poll_step_skips_when_no_callback():
 def _holiday_client(reply: str = "OK"):
     sent: list[str] = []
     client = NexhoLocalClient("10.0.0.99")
+    client._cached_zones = list(range(1, 17))  # as if from a readings cache
     client._ask = lambda cmd, *a, **k: sent.append(cmd) or reply  # type: ignore[method-assign]
     return client, sent
 
@@ -559,6 +564,7 @@ def _lagging_hub(truth: dict[str, int], stale: int = 5):
     it, as the real one does when a query follows its last reply too closely
     (live 2026-11-11). ``stale`` is what its buffer holds at the start."""
     client = NexhoLocalClient("10.0.0.99")
+    client._cached_zones = list(range(1, 17))  # as if from a readings cache
     sent: list[str] = []
     held = {"value": stale}
 
@@ -585,6 +591,7 @@ def test_read_config_is_not_fooled_by_a_reply_one_query_behind():
 
 def test_read_config_reports_a_setting_whose_reads_disagree_as_unknown():
     client = NexhoLocalClient("10.0.0.99")
+    client._cached_zones = list(range(1, 17))  # as if from a readings cache
     frost = iter([3, 9, 4, 8, 2, 6])
 
     def ask(cmd, *a, **k):
@@ -653,6 +660,7 @@ def test_ask_leaves_the_hub_a_quiet_gap_between_exchanges(monkeypatch):
 def _recording_client(keypad_raw: str = "OK,0"):
     sent: list[str] = []
     client = NexhoLocalClient("10.0.0.99")
+    client._cached_zones = list(range(1, 17))  # as if from a readings cache
 
     def ask(cmd, *a, **k):
         sent.append(cmd)
@@ -843,6 +851,7 @@ def test_program_commands_retry_a_transient_er(monkeypatch):
     monkeypatch.setattr(nc.time, "sleep", lambda s: None)
     replies = {"D#": ["ER,1", "OK"], "R#1#1#0#0*?P0/": ["ER,1", "OK,P0,11," + ",".join(["5,24,60,24,60"] * 6)]}
     client = NexhoLocalClient("10.0.0.99")
+    client._cached_zones = list(range(1, 17))  # as if from a readings cache
     client._ask = lambda cmd, *a, **k: replies["D#" if cmd.startswith("D#") else cmd].pop(0)  # type: ignore[method-assign]
     client.set_day_pattern("1", [Block(20, 0, 60)], [0])  # does not raise
     assert client.read_day_pattern("1", 0) == []
@@ -855,6 +864,7 @@ def test_program_write_gives_up_after_repeated_er(monkeypatch):
     monkeypatch.setattr(nc.time, "sleep", lambda s: None)
     calls: list[str] = []
     client = NexhoLocalClient("10.0.0.99")
+    client._cached_zones = list(range(1, 17))  # as if from a readings cache
     client._ask = lambda cmd, *a, **k: (calls.append(cmd), "ER,1")[1]  # type: ignore[method-assign]
     with pytest.raises(HearthError):
         client.set_program_active("1", True)
@@ -920,6 +930,7 @@ def test_program_write_waits_longer_and_needs_a_bare_ok():
 
     seen: list[float] = []
     client = NexhoLocalClient("10.0.0.99")
+    client._cached_zones = list(range(1, 17))  # as if from a readings cache
     client._ask = lambda cmd, retries, timeout, priority=False, **_: seen.append(timeout) or "OK"  # type: ignore[method-assign]
     client.set_day_pattern("1", [Block(20, 0, 60)], [0])
     assert seen == [_PROGRAM_WRITE_TIMEOUT] and _PROGRAM_WRITE_TIMEOUT >= 10
@@ -1139,11 +1150,11 @@ def test_a_zone_the_hub_does_not_have_is_refused_before_anything_is_sent():
     client._poll_once()
     sent.clear()
     with pytest.raises(HearthError, match="Unknown zone"):
-        client.set_temperature("999", 30)
+        client.set_temperature("99", 30)
     with pytest.raises(HearthError, match="Unknown zone"):
-        client.set_config("999", frost_temp=17)
+        client.set_config("99", frost_temp=17)
     with pytest.raises(HearthError, match="Unknown zone"):
-        client.set_holiday("999", days=1, hour=8, minute=0, arrival_temp=None)
+        client.set_holiday("99", days=1, hour=8, minute=0, arrival_temp=None)
     assert sent == []  # nothing reached the wire
     assert [r.id for r in client.list_rooms()] == ["1", "2"]  # and no phantom card
 
@@ -1291,9 +1302,11 @@ def _wait_until(check, what):
 
 
 def _zone_ready(client, zone=2, current=19.0, target=18.0):
+    """Seed a zone as if loaded from the readings cache."""
     with client._lock:
         client._last[zone] = (current, target)
         client._state[zone] = client._room(zone, current, target, "ok")
+        client._cached_zones = sorted(set(client._cached_zones or []) | {zone})
 
 
 def test_unacknowledged_setpoint_is_retried_until_the_hub_takes_it(monkeypatch):
@@ -2321,3 +2334,581 @@ def test_an_ack_between_the_stop_snapshot_and_the_hand_over_is_not_resent(monkey
         new.stop()
     assert [c for c in sent if c.startswith("D#2")] == ["D#2#1#0#0*T22/"]
     assert 2 not in new._desired
+
+
+# ---- MQTT mode=heat: back on to the last on-target (9cg) -----------------
+
+
+def _acked_client():
+    """An idle client whose sends are acknowledged at once, run in line."""
+    client = _idle_client()
+    sent = _scripted_sends(client, {t / 2: [True] for t in range(2, 61)})
+    return client, sent
+
+
+def test_turn_on_restores_the_last_target_set_before_off():
+    client, sent = _acked_client()
+    client.set_temperature("2", 21.5)
+    _wait_for_writer(client, 2)
+    client.set_temperature("2", 0)  # off from the web UI
+    _wait_for_writer(client, 2)
+    assert client.turn_on("2") is True
+    _wait_for_writer(client, 2)
+    assert sent == [21.5, 1.0, 21.5]
+    assert client.list_rooms()[0].target_temp == 21.5
+
+
+def test_turn_on_uses_the_last_fresh_reading_above_off():
+    client = make_client({"R#2#": "OK,19,00,019"})
+    client._poll_zone(2)  # the radiator holds 19 (set on its keypad, say)
+    sent = _scripted_sends(client, {1.0: [True], 19.0: [True]})
+    client.set_temperature("2", 0)
+    _wait_for_writer(client, 2)
+    client._ask = lambda cmd, *a, **k: "OK,19,00,000"  # type: ignore[method-assign]
+    client._poll_zone(2)  # a fresh read of off does not replace it
+    assert client.turn_on("2") is True
+    _wait_for_writer(client, 2)
+    assert sent == [1.0, 19.0]
+
+
+def test_turn_on_falls_back_to_the_default_when_nothing_is_known():
+    client, sent = _acked_client()
+    with client._lock:
+        client._state[2] = client._room(2, 19.0, 0.0, "ok")  # off, never seen on
+    assert client.turn_on("2") is True
+    _wait_for_writer(client, 2)
+    assert sent == [20.0]
+
+
+def test_turn_on_does_nothing_to_a_zone_that_is_on():
+    # A holiday hold at 7 C is not off; nor is a target just set in the web UI.
+    client, sent = _acked_client()
+    with client._lock:
+        client._state[2] = client._room(2, 15.0, 7.0, "ok")
+    assert client.turn_on("2") is False
+    with client._lock:
+        client._state[2] = client._room(2, 15.0, None, "loading")  # not known to be off
+    assert client.turn_on("2") is False
+    assert sent == [] and 2 not in client._desired
+
+
+def test_turn_on_stores_only_validated_clamped_targets():
+    client, sent = _acked_client()
+    client.set_temperature("2", 40.0)  # clamped to 30
+    _wait_for_writer(client, 2)
+    with pytest.raises(HearthError):
+        client.set_temperature("2", float("nan"))
+    client.set_temperature("2", 0)
+    _wait_for_writer(client, 2)
+    client.turn_on("2")
+    _wait_for_writer(client, 2)
+    assert sent == [30.0, 1.0, 30.0]
+
+
+def test_turn_on_refuses_an_unknown_zone_and_grows_nothing():
+    client = make_client({"OPS2/": "OPOK,OPS2,1,2", "OPS3/": "OPOK,OPS3,1,1"})
+    client._zone_ids()
+    before = {name: dict(value) if isinstance(value, dict) else set(value)
+              for name, value in vars(client).items() if isinstance(value, (dict, set))}
+    for bogus in ("99", "abc", "-1", ""):
+        with pytest.raises(HearthError):
+            client.turn_on(bogus)
+    after = {name: dict(value) if isinstance(value, dict) else set(value)
+             for name, value in vars(client).items() if isinstance(value, (dict, set))}
+    assert after == before
+
+
+def test_turn_on_does_not_grow_maps_before_the_hub_has_answered():
+    client = NexhoLocalClient("10.0.0.99")  # no zone list, no readings cache
+    with pytest.raises(HearthError, match="Still connecting"):
+        client.turn_on("42")
+    assert 42 not in client._state and 42 not in client._desired and 42 not in client._last_on
+
+
+def test_turn_on_checks_and_writes_under_one_lock_hold():
+    # A web-UI target that comes in while turn_on is deciding must land after
+    # turn_on's write, so it is the one kept, never overwritten by it. The
+    # lock below hands over to the waiting web write every time turn_on lets
+    # go of it, so a gap between the check and the write would let it in.
+    import threading
+
+    client, sent = _acked_client()
+    with client._lock:
+        client._state[2] = client._room(2, 19.0, 1.0, "ok")
+        client._last_on[2] = 21.0
+    me = threading.current_thread()
+    web_done = threading.Event()
+
+    class YieldingLock:
+        def __init__(self):
+            self.inner = threading.Lock()
+            self.armed = False
+
+        def __enter__(self):
+            self.inner.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self.inner.release()
+            if self.armed and threading.current_thread() is me:
+                self.armed = False
+                web_done.wait(2)  # the web write gets the lock now
+            return False
+
+    lock = YieldingLock()
+    client._lock = lock  # type: ignore[assignment]
+
+    class Probe(dict):
+        def get(self, key, default=None):  # turn_on's check, lock held
+            threading.Thread(
+                target=lambda: (client.set_temperature("2", 23.0), web_done.set())
+            ).start()
+            lock.armed = True
+            return super().get(key, default)
+
+    client._last_on = Probe(client._last_on)
+    assert client.turn_on("2") is True
+    assert web_done.wait(2)
+    _wait_for_writer(client, 2)
+    assert client.list_rooms()[0].target_temp == 23.0
+    assert sent[-1] == 23.0
+
+
+def test_the_last_on_target_is_carried_to_the_hubs_next_client():
+    old, _ = _acked_client()
+    old.start()
+    old.set_temperature("2", 22.5)
+    _wait_for_writer(old, 2)
+    old.stop()
+    new, sent = _acked_client()
+    with new._lock:
+        new._state[2] = new._room(2, 19.0, 1.0, "ok")
+    new.start()
+    try:
+        assert new.turn_on("2") is True
+        _wait_for_writer(new, 2)
+    finally:
+        new.stop()
+    assert sent == [22.5]
+
+
+def test_the_last_on_target_reaches_a_client_that_started_first():
+    old, _ = _acked_client()
+    old.start()
+    old.set_temperature("2", 22.5)
+    _wait_for_writer(old, 2)
+    new, sent = _acked_client()
+    new.start()  # the new owner is running before the old one stops
+    old.stop()
+    with new._lock:
+        new._state[2] = new._room(2, 19.0, 1.0, "ok")
+    try:
+        new.turn_on("2")
+        _wait_for_writer(new, 2)
+    finally:
+        new.stop()
+    assert sent == [22.5]
+
+
+def test_a_forgotten_zone_takes_its_last_on_target_with_it():
+    client = make_client({"OPS2/": "OPOK,OPS2,1", "OPS3/": "OPOK,OPS3,1"})
+    with client._lock:
+        client._last_on[2] = 21.0
+    client._wire.note_sent(2, 1.0)
+    client._zone_ids()
+    client._zone_ids()  # said twice: believed
+    assert 2 not in client._last_on and client._wire.last_sent(2) is None
+
+
+# ---- rate limits on hub traffic from web requests (1pj.6) ----------------
+
+
+def _gap_clock(monkeypatch, client, gap=1.0, clock=None):
+    """A fake monotonic clock; waiting out the send gap moves it on."""
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc, "_SETPOINT_MIN_GAP", gap)
+    clock = clock if clock is not None else {"now": 100.0}
+    monkeypatch.setattr(nc.time, "monotonic", lambda: clock["now"])
+    waits: list[float] = []
+
+    def wait(seconds):
+        waits.append(round(seconds, 6))
+        clock["now"] += seconds
+
+    client._wait_send_gap = wait  # type: ignore[method-assign]
+    return clock, waits
+
+
+def test_consecutive_setpoint_sends_to_a_zone_are_a_minimum_gap_apart(monkeypatch):
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    clock, waits = _gap_clock(monkeypatch, client)
+    sends: list[tuple[float, float]] = []
+
+    def send_once(zone, target):
+        sends.append((round(clock["now"], 6), target))
+        clock["now"] += 0.2  # the exchange itself
+        client._wire.note_sent(zone, clock["now"])  # a datagram went out
+        if len(sends) < 3:  # a loop of POSTs: a newer target while each is on the air
+            with client._lock:
+                client._want_setpoint(zone, target + 1, clock["now"])
+        return True
+
+    client._send_once = send_once  # type: ignore[method-assign]
+    _queue_write(client, 2, 21.0)
+    client._drain_writes(2)
+    assert sends == [(100.0, 21.0), (101.2, 22.0), (102.4, 23.0)]
+    assert waits == [1.0, 1.0]
+
+
+def test_the_send_gap_holds_across_workers(monkeypatch):
+    # Each POST is acked before the next: every worker ends, the next starts.
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    clock, waits = _gap_clock(monkeypatch, client)
+    sends: list[float] = []
+
+    def send_once(zone, target):
+        sends.append(round(clock["now"], 6))
+        client._wire.note_sent(zone, clock["now"])
+        return True
+
+    client._send_once = send_once  # type: ignore[method-assign]
+    _queue_write(client, 2, 21.0)
+    client._drain_writes(2)
+    clock["now"] += 0.3
+    _queue_write(client, 2, 22.0)
+    client._drain_writes(2)
+    assert sends == [100.0, 101.0] and waits == [0.7]
+
+
+def test_the_first_send_after_a_quiet_spell_is_not_delayed(monkeypatch):
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    clock, waits = _gap_clock(monkeypatch, client)
+    client._send_once = lambda zone, target: client._wire.note_sent(zone, clock["now"]) or True  # type: ignore[method-assign]
+    _queue_write(client, 2, 21.0)
+    client._drain_writes(2)
+    clock["now"] += 1.0
+    _queue_write(client, 2, 22.0)
+    client._drain_writes(2)
+    _queue_write(client, 3, 22.0)  # another zone has its own gap
+    client._drain_writes(3)
+    assert waits == []
+
+
+def test_a_cancel_during_the_send_gap_sends_nothing(monkeypatch):
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    clock, _ = _gap_clock(monkeypatch, client)
+    sends: list[float] = []
+    client._send_once = lambda zone, target: (  # type: ignore[method-assign]
+        sends.append(target) or client._wire.note_sent(zone, clock["now"]) or True
+    )
+    _queue_write(client, 2, 21.0)
+    client._drain_writes(2)
+    client._wait_send_gap = lambda seconds: client.cancel_waiting_setpoint("2")  # type: ignore[method-assign]
+    _queue_write(client, 2, 22.0)
+    client._drain_writes(2)
+    assert sends == [21.0] and 2 not in client._writers
+
+
+def _blocking_reads(client, reply):
+    """Replace _ask: the first command blocks until released. Returns
+    (sent, on_air, release)."""
+    import threading
+
+    sent: list[str] = []
+    on_air, release = threading.Event(), threading.Event()
+
+    def ask(cmd, *a, **k):
+        sent.append(cmd)
+        if not on_air.is_set():
+            on_air.set()
+            assert release.wait(2)
+        return reply(cmd)
+
+    client._ask = ask  # type: ignore[method-assign]
+    return sent, on_air, release
+
+
+_CONFIG_REPLIES = {"*?E#0#8/": "OK,1", "*?E#0#6/": "OK,0", "*?E#1#20/": "OK,7", "*?E#0#9/": "OK,0"}
+
+
+@pytest.mark.parametrize("method, reply, kind", [
+    ("read_config", lambda cmd: next(v for k, v in _CONFIG_REPLIES.items() if cmd.endswith(k)), "config"),
+    ("read_holiday", lambda cmd: "OK,RH,14,5,5,22,1,47,6,11,4,17,30,148,6,1,0", "holiday"),
+    ("read_energy", lambda cmd: "OK,1000,12,40,35,50,0,22,18,7", "energy"),
+])
+def test_a_second_slow_read_of_a_zone_shares_the_one_running(method, reply, kind):
+    import threading
+
+    client = _idle_client()
+    sent, on_air, release = _blocking_reads(client, reply)
+    results: dict[str, object] = {}
+    first = threading.Thread(target=lambda: results.__setitem__("first", getattr(client, method)("2")))
+    first.start()
+    assert on_air.wait(2)
+    second = threading.Thread(target=lambda: results.__setitem__("second", getattr(client, method)("2")))
+    second.start()
+    _wait_until(lambda: client._reads[(kind, 2)].waiters == 1, "the second caller to wait")
+    on_air_count = len(sent)
+    release.set()
+    first.join(2)
+    second.join(2)
+    assert results["first"] is not None and results["second"] == results["first"]
+    assert results["second"] is not results["first"]  # a copy: one caller cannot change the other's
+    one_read = len(sent)
+    assert on_air_count == 1
+    getattr(client, method)("2")  # once it is done, the next call reads again
+    assert len(sent) == 2 * one_read
+    assert client._reads == {}
+
+
+def test_a_shared_read_waits_only_so_long(monkeypatch):
+    import threading
+
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc, "_SHARED_READ_WAIT", 0.01)
+    client = _idle_client()
+    sent, on_air, release = _blocking_reads(client, lambda cmd: "ER,1")
+    first = threading.Thread(target=lambda: client.read_config("2"))
+    first.start()
+    try:
+        assert on_air.wait(2)
+        assert client.read_config("2") is None  # gave up waiting; sent nothing itself
+        assert sent == ["R#2#1#0#0*?E#0#8/"]
+    finally:
+        release.set()
+        first.join(2)
+
+
+def test_a_shared_read_failure_reaches_the_waiting_caller_too():
+    import threading
+
+    client = _idle_client()
+    on_air, release = threading.Event(), threading.Event()
+
+    def failing_read(zone):
+        on_air.set()
+        assert release.wait(2)
+        raise HearthError("radio failed")
+
+    errors: list[str] = []
+
+    def call():
+        try:
+            client._read_once("config", 2, lambda: failing_read(2))
+        except HearthError as exc:
+            errors.append(str(exc))
+
+    first, second = threading.Thread(target=call), threading.Thread(target=call)
+    first.start()
+    assert on_air.wait(2)
+    second.start()
+    _wait_until(lambda: client._reads[("config", 2)].waiters == 1, "the second caller to wait")
+    release.set()
+    first.join(2)
+    second.join(2)
+    assert errors == ["radio failed", "radio failed"]
+
+
+@pytest.mark.parametrize("write, method, reply", [
+    (lambda c: c.set_config("2", frost_temp=10), "read_config",
+     lambda cmd: "OK" if "*SEP" in cmd else next(v for k, v in _CONFIG_REPLIES.items() if cmd.endswith(k))),
+    (lambda c: c.set_holiday("2", days=3, hour=9, minute=0, arrival_temp=None), "read_holiday",
+     lambda cmd: "OK" if "*RH#" in cmd else "OK,RH,14,5,5,22,1,47,6,11,3,9,0,251,6,1,0"),
+    (lambda c: c.clear_holiday("2"), "read_holiday",
+     lambda cmd: "OK" if "*RH#" in cmd else "OK,RH,14,5,5,22,1,47,6,11,253,0,0,253,6,1,0"),
+])
+def test_a_read_after_a_write_does_not_share_one_from_before_it(monkeypatch, write, method, reply):
+    # The page shown after a save must read the radiator again, not take the
+    # answer of a read that was already running before the write went out.
+    import threading
+
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc, "_SHARED_READ_WAIT", 0.01)
+    client = _idle_client()
+    sent, on_air, release = _blocking_reads(client, reply)
+    before = threading.Thread(target=lambda: getattr(client, method)("2"))
+    before.start()
+    try:
+        assert on_air.wait(2)
+        write(client)
+        assert getattr(client, method)("2") is not None  # its own read, not a wait
+    finally:
+        release.set()
+        before.join(2)
+    assert client._reads == {}
+
+
+# ---- review 2026-11-26: zone ids, connecting, waiters, gap on the wire ----
+
+
+@pytest.mark.parametrize("bogus", ["-5", "0", "+7", "1_000", "\u0663", " 1", "1 ", "256", "", "1.0"])
+def test_a_zone_id_is_a_plain_number_from_1_to_255(bogus):
+    from hearthmage.nexho_client import _zone_int
+
+    with pytest.raises(HearthError, match="Invalid zone id"):
+        _zone_int(bogus)
+
+
+def test_zone_ids_at_the_ends_of_the_range_are_accepted():
+    from hearthmage.nexho_client import _zone_int
+
+    assert (_zone_int("1"), _zone_int("255")) == (1, 255)
+
+
+def test_nothing_is_sent_before_the_hub_has_listed_its_zones():
+    # A setpoint for "-5" (or any number) before the hub's first answer went on
+    # the wire and left a phantom zone that then stood in for the zone list.
+    import threading
+
+    client = NexhoLocalClient("10.0.0.99")  # no readings cache
+    sent: list[str] = []
+    client._ask = lambda cmd, *a, **k: sent.append(cmd) or "OK"  # type: ignore[method-assign]
+    threads = threading.active_count()
+    for zone in ("-5", "1"):
+        with pytest.raises(HearthError):
+            client.set_temperature(zone, 20)
+    with pytest.raises(HearthError, match="Still connecting"):
+        client.set_temperature("1", 20)
+    with pytest.raises(HearthError, match="Still connecting"):
+        client.read_config("1")
+    assert sent == [] and client._state == {} and client._desired == {}
+    assert threading.active_count() == threads
+
+
+def test_the_hubs_first_zone_list_is_used_at_once():
+    client = make_client({"OPS2/": "OPOK,OPS2,1,2", "OPS3/": "OPOK,OPS3,1,1", "D#": "OK"})
+    client._cached_zones = None  # a cold start: no readings cache
+    with pytest.raises(HearthError, match="Still connecting"):
+        client.set_temperature("2", 20)
+    client._zone_ids()  # one answer is enough the first time
+    client.set_temperature("2", 20)
+    with pytest.raises(HearthError, match="Unknown zone"):
+        client.set_temperature("3", 20)
+
+
+def test_zones_from_the_readings_cache_stand_in_until_the_hub_answers(tmp_path):
+    cache = tmp_path / "readings.json"
+    cache.write_text('{"1": [19.0, 21.0], "-5": [1, 2], "x": [1, 2]}')
+    client = NexhoLocalClient("10.0.0.99", cache_file=str(cache))
+    client._send_once = lambda zone, target: True  # type: ignore[method-assign]
+    client.set_temperature("1", 20)
+    with pytest.raises(HearthError, match="Unknown zone"):
+        client.set_temperature("2", 20)  # a write never makes a zone known
+    assert sorted(client._state) == [1]
+
+
+def test_a_shared_read_takes_only_so_many_waiters(monkeypatch):
+    # Each waiter holds a request thread; past the cap a caller gets None at
+    # once (the page shows that the settings could not be read).
+    import threading
+
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc, "_SHARED_READ_WAIT", 30.0)
+    client = _idle_client()
+    sent, on_air, release = _blocking_reads(
+        client, lambda cmd: next(v for k, v in _CONFIG_REPLIES.items() if cmd.endswith(k))
+    )
+    threads = [threading.Thread(target=lambda: client.read_config("2")) for _ in range(5)]
+    threads[0].start()
+    try:
+        assert on_air.wait(2)
+        for thread in threads[1:]:
+            thread.start()
+        _wait_until(lambda: client._reads[("config", 2)].waiters == nc._SHARED_READ_MAX_WAITERS,
+                    "the waiters to queue")
+        got: list[object] = []
+        extra = threading.Thread(target=lambda: got.append(client.read_config("2")))
+        extra.start()
+        extra.join(1)
+        assert not extra.is_alive() and got == [None]
+        assert len(sent) == 1  # it put nothing on the wire
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(2)
+
+
+def test_the_send_gap_holds_across_a_client_swap(monkeypatch):
+    old = NexhoLocalClient("10.0.0.99")
+    _zone_ready(old)
+    clock, _ = _gap_clock(monkeypatch, old)
+    old._send_once = lambda zone, target: old._wire.note_sent(zone, clock["now"]) or True  # type: ignore[method-assign]
+    _queue_write(old, 2, 21.0)
+    old._drain_writes(2)
+    old.stop()
+    new = NexhoLocalClient("10.0.0.99")
+    _zone_ready(new)
+    _, waits = _gap_clock(monkeypatch, new, clock=clock)
+    new._send_once = lambda zone, target: True  # type: ignore[method-assign]
+    clock["now"] += 0.3
+    _queue_write(new, 2, 22.0)
+    new._drain_writes(2)
+    assert waits == [0.7]
+
+
+def test_the_send_time_is_noted_only_when_a_datagram_went_out(monkeypatch):
+    import hearthmage.nexho_client as nc
+
+    clock = {"now": 100.0}
+    monkeypatch.setattr(nc.time, "monotonic", lambda: clock["now"])
+    sent = _fake_hub(monkeypatch, lambda cmd: "OK")
+    client = NexhoLocalClient("10.0.0.99")
+    _zone_ready(client)
+    _queue_write(client, 2, 22.0)
+    settle = client._let_hub_settle
+    client._let_hub_settle = lambda: client.cancel_waiting_setpoint("2")  # type: ignore[method-assign]
+    assert client._send_once(2, 22.0) is None  # withdrawn before it went out
+    assert sent == [] and client._wire.last_sent(2) is None
+    client._let_hub_settle = settle  # type: ignore[method-assign]
+    _queue_write(client, 2, 23.0)
+    clock["now"] = 105.0
+    assert client._send_once(2, 23.0) is True
+    assert client._wire.last_sent(2) == 105.0
+
+
+def test_a_reading_during_a_recorded_holiday_hold_is_not_the_last_on_target():
+    # Owner decision 2026-11-26: the 7 C hold level must not become the target
+    # that mode=heat restores; keypad changes outside a hold still count.
+    held = {"on": False}
+    client = make_client({"R#2#": "OK,15,00,007"})
+    client._is_held = lambda zone: held["on"] and zone == 2
+    _zone_ready(client)
+    sent = _scripted_sends(client, {21.0: [True], 1.0: [True]})
+    client.set_temperature("2", 21.0)
+    _wait_for_writer(client, 2)
+    held["on"] = True  # the app has a holiday recorded for zone 2
+    client._poll_zone(2)
+    client.set_temperature("2", 0)
+    _wait_for_writer(client, 2)
+    assert client.turn_on("2") is True
+    _wait_for_writer(client, 2)
+    assert sent == [21.0, 1.0, 21.0]
+
+
+def test_the_held_hook_is_a_constructor_option_and_a_failing_one_skips_the_note():
+    def broken(zone):
+        raise RuntimeError("store unreadable")
+
+    client = NexhoLocalClient("10.0.0.99", is_held=broken)
+    _zone_ready(client)
+    client._read_zone_raw = lambda zone: (15.0, 7.0, True)  # type: ignore[method-assign]
+    client._poll_zone(2)  # must not raise
+    assert 2 not in client._last_on
+
+
+def test_a_zone_list_id_out_of_range_is_dropped_and_logged_once(caplog):
+    client = make_client({"OPS2/": "OPOK,OPS2,1,300,٣,2", "OPS3/": "OPOK,OPS3,1,1"})
+    client._cached_zones = None
+    assert client._zone_ids() == [1, 2]
+    assert client._zone_ids() == [1, 2]
+    rejected = [r for r in _warnings(caplog) if "zone list" in r]
+    assert len(rejected) == 1 and "300" in rejected[0]
+    client.set_temperature("2", 20)  # the real zones still work

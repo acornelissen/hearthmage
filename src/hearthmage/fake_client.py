@@ -8,7 +8,8 @@ from hearthmage.domain import HearthError, Room, Scene
 class FakeHearthClient:
     """In-memory client for tests and offline UI work."""
 
-    def __init__(self, rooms: list[Room] | None = None) -> None:
+    def __init__(self, rooms: list[Room] | None = None, is_held=None) -> None:
+        self._is_held = is_held  # as NexhoLocalClient's; the fake has no readings
         self._rooms: dict[str, Room] = {}
         self._config: dict[str, dict] = {}  # room_id -> per-radiator element config
         self.holiday: dict[str, dict] = {}  # room_id -> holiday hold state
@@ -16,8 +17,11 @@ class FakeHearthClient:
         self.program_active: dict[str, bool] = {}  # room_id -> last set_program_active
         self.programs: dict[tuple[str, int], list] = {}  # (room_id, day) -> blocks held "on the hub"
         self.cloud_reporting = False
+        self._last_on: dict[str, float] = {}  # room_id -> last target above off
         for room in (_default_rooms() if rooms is None else rooms):
             self._rooms[room.id] = room
+            if not room.is_off and room.target_temp is not None and room.target_temp > 1.0:
+                self._last_on[room.id] = room.target_temp
 
     def list_rooms(self) -> list[Room]:
         return list(self._rooms.values())
@@ -32,7 +36,17 @@ class FakeHearthClient:
         room = self._get(room_id)
         off = temperature <= 0
         target = 1.0 if off else round(temperature * 2) / 2  # Off is a 1 degree setpoint
+        if not off:
+            self._last_on[room_id] = target
         self._rooms[room_id] = replace(room, target_temp=target, is_off=off)
+
+    def turn_on(self, room_id: str, default: float = 20.0) -> bool:
+        """Back on to the last target above off, if the zone is off."""
+        room = self._get(room_id)
+        if not room.is_off:
+            return False
+        self.set_temperature(room_id, self._last_on.get(room_id, default))
+        return True
 
     def set_scene_membership(self, room_id: str, scene: Scene, member: bool) -> None:
         room = self._get(room_id)

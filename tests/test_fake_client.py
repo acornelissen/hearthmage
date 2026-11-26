@@ -62,3 +62,28 @@ def test_set_temperature_off_holds_one_degree():
     room = next(r for r in client.list_rooms() if r.id == "1")
     assert room.is_off is True
     assert room.target_temp == 1.0
+
+
+def test_turn_on_restores_the_last_target_above_off():
+    client = make_client()
+    client.set_temperature("1", 22.5)
+    client.set_temperature("1", 0)
+    assert client.turn_on("1") is True
+    room = next(r for r in client.list_rooms() if r.id == "1")
+    assert (room.target_temp, room.is_off) == (22.5, False)
+
+
+def test_turn_on_leaves_a_zone_that_is_on_and_defaults_to_20():
+    client = FakeHearthClient(
+        [Room("1", "Living Room", 19.5, 1.0, is_off=True, min_temp=5.0, max_temp=30.0)]
+    )
+    assert client.turn_on("1") is True
+    assert client.list_rooms()[0].target_temp == 20.0
+    assert client.turn_on("1") is False  # on now: left alone
+    with pytest.raises(HearthError):
+        client.turn_on("99")
+
+
+def test_the_fake_accepts_the_held_hook():
+    client = FakeHearthClient([], is_held=lambda zone: False)
+    assert client.list_rooms() == []

@@ -30,3 +30,15 @@ def test_corrupt_file_is_ignored(tmp_path):
     path = tmp_path / "holiday.json"
     path.write_text("{ not json")
     assert HolidayStore(str(path)).get("1") is None
+
+
+def test_clear_if_clears_only_the_record_it_was_given(tmp_path):
+    store = HolidayStore(str(tmp_path / "holiday.json"))
+    store.set("1", until="2020-01-01T08:00", arrival_temp=None, prev_setpoint=21.0)
+    old = store.get("1")
+    store.set("1", until="2999-01-01T08:00", arrival_temp=None, prev_setpoint=21.0)  # a new hold
+    assert store.clear_if("1", old) is False
+    assert store.get("1")["until"] == "2999-01-01T08:00"
+    assert store.clear_if("1", store.get("1")) is True
+    assert store.get("1") is None
+    assert HolidayStore(str(tmp_path / "holiday.json")).get("1") is None  # persisted
