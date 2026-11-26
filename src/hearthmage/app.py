@@ -42,7 +42,7 @@ from hearthmage.energy import cost, daily_kwh
 from hearthmage.energy_store import EnergyStore
 from hearthmage.fake_client import FakeHearthClient
 from hearthmage.history import HistoryStore
-from hearthmage.lan import LAN_SUFFIXES, AddressRejected, host_name
+from hearthmage.lan import LAN_SUFFIXES, AddressRejected, host_name, is_ip_literal
 from hearthmage.holiday_store import HolidayStore
 from hearthmage.schedule import (
     DAY_MINUTES,
@@ -200,8 +200,8 @@ def _restart_mqtt_locked() -> None:
     log = logging.getLogger("hearthmage.mqtt")
     if _mqtt_client is not None:
         try:
+            _mqtt_client.disconnect()  # paho's order: the loop sends DISCONNECT and exits
             _mqtt_client.loop_stop()
-            _mqtt_client.disconnect()
         except Exception:  # noqa: BLE001 - a wedged old client must not block the new one
             log.exception("Stopping the old MQTT client failed")
         _mqtt_client = None
@@ -1044,7 +1044,7 @@ def settings_page(request: Request) -> HTMLResponse:
 
 
 def _off_lan_warning(address: str) -> str:
-    """The standing warning for a stored address off the LAN. It names the
+    """The standing warning for a stored hub address off the LAN. It names the
     address, so it still reads right after the user types a different one."""
     return (
         f"The saved address {address} is not on your local network. HearthMage "
@@ -1054,6 +1054,20 @@ def _off_lan_warning(address: str) -> str:
 
 
 _mqtt_default_topic = "hearthmage"
+
+
+def _off_lan_broker_warning(address: str) -> str:
+    """The broker's version: the bridge connects to a name only while it
+    resolves to a local address, and never to an IP address off the LAN (see
+    mqtt_bridge.vetted_broker_address)."""
+    if is_ip_literal(address):
+        use = "does not connect to it"
+    else:
+        use = "connects to it only while it resolves to a local address"
+    return (
+        f"The saved address {address} is not on your local network. HearthMage "
+        f"{use}, and will not save it again: enter an address on your home network."
+    )
 
 
 def _settings_response(
@@ -1093,7 +1107,7 @@ def _settings_response(
             "name_other_errors": other_name_errors,
             "mqtt_host_error": (
                 None if settings.mqtt_host_on_lan
-                else _off_lan_warning(settings.mqtt_config()["host"])
+                else _off_lan_broker_warning(settings.mqtt_config()["host"])
             ),
             **form,
         },

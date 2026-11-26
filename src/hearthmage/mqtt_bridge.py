@@ -19,13 +19,120 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
+import socket
+import string
+import threading
 from typing import Callable
+
+from hearthmage.lan import is_ip_literal, is_lan_broker_address
 
 _log = logging.getLogger("hearthmage.mqtt")
 
 _MIN_TEMP = 5
 _MAX_TEMP = 30
 _OFF_TEMP = 1  # the client sends Off as a 1 degree setpoint
+_LOOKUP_POLL = 0.1  # seconds between stop checks while a broker lookup runs
+_MAX_LOOKUPS = 4  # broker lookups waiting on DNS at once; past this, refuse
+_RECONNECT_MIN_DELAY = 1  # paho's reconnect backoff, seconds (its defaults)
+_RECONNECT_MAX_DELAY = 120
+_SUPERVISE_EVERY = 1.0  # seconds between checks that paho's network thread is alive
+_OFFLINE_WAIT = 1.0  # most seconds a stop waits for "offline" to go out
+# Client ids are "hm" + node_id + this: never empty (paho answers a rejected
+# empty id by reconnecting from inside its packet handler), and fixed for the
+# life of the process so a restart takes over the broker session.
+_CLIENT_SUFFIX = secrets.token_hex(4)
+_ID_CHARS = frozenset(string.ascii_letters + string.digits)
+_MAX_CLIENT_ID = 23  # the length every MQTT 3.1.1 broker must accept
+
+
+def client_id(node_id: str) -> str:
+    """A client id any broker accepts: at most 23 characters of [0-9A-Za-z]
+    (MQTT 3.1.1, 3.1.3.1), "hm" + the node id's letters and digits, cut so the
+    per-process suffix fits."""
+    node = "".join(c for c in node_id if c in _ID_CHARS)
+    room = _MAX_CLIENT_ID - len("hm") - len(_CLIENT_SUFFIX)
+    return "hm" + node[:room] + _CLIENT_SUFFIX
+
+
+class BrokerRefused(OSError):
+    """No LAN address to open the broker connection on. An OSError, so paho
+    counts the attempt as a failed connect and retries with its usual backoff
+    (any other exception type would end paho's network thread)."""
+
+
+def vetted_broker_address(host: str, port: int, stopping: threading.Event) -> str:
+    """The address to open the broker connection on, or BrokerRefused.
+
+    A name is resolved now, so a DNS or DHCP change is followed on every
+    reconnect, and it is used only if every address it resolves to is RFC 1918
+    IPv4 or loopback: one public A or AAAA record refuses the lot. An IP literal
+    skips the lookup; it passed the same check at save time, but is checked
+    again here."""
+    if is_ip_literal(host):
+        addresses = [host]
+    else:
+        addresses = _lookup(host, port, stopping)
+    if not addresses or not all(is_lan_broker_address(a) for a in addresses):
+        _log.warning(
+            "Not connecting to MQTT broker %r: it resolves to %r, which is not all "
+            "on the local network. Will retry.", host, addresses,
+        )
+        raise BrokerRefused(f"MQTT broker {host!r} is not on the local network")
+    return addresses[0]
+
+
+class _Lookup:
+    """One DNS query in flight; every attempt that needs the same name waits on it."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.addresses: list[str] = []
+        self.error: Exception | None = None
+
+
+_lookups: dict[tuple[str, int], _Lookup] = {}  # in flight only; guarded by _lookups_lock
+_lookups_lock = threading.Lock()
+
+
+def _lookup(name: str, port: int, stopping: threading.Event) -> list[str]:
+    """Every address ``name`` resolves to. The query runs on a helper thread
+    so that ``stopping`` (set by loop_stop) ends the wait at once instead of
+    holding a restart until a slow DNS server gives up. Attempts for a name
+    already being resolved share that query, and at most _MAX_LOOKUPS run at
+    once, so restarts against a hung DNS server cannot pile up threads."""
+    key = (name, port)
+    with _lookups_lock:
+        lookup = _lookups.get(key)
+        if lookup is None:
+            if len(_lookups) >= _MAX_LOOKUPS:
+                _log.warning("Not resolving MQTT broker %r: %d earlier lookups are still "
+                             "waiting on DNS. Will retry.", name, len(_lookups))
+                raise BrokerRefused("too many MQTT broker lookups in flight")
+            lookup = _lookups[key] = _Lookup()
+            threading.Thread(
+                target=_resolve, args=(key, lookup), name="mqtt-resolve", daemon=True
+            ).start()
+    while not lookup.done.wait(_LOOKUP_POLL):
+        if stopping.is_set():
+            raise BrokerRefused("MQTT bridge stopped while resolving the broker")
+    if lookup.error is not None:
+        _log.warning("Cannot resolve MQTT broker %r: %s. Will retry.", name, lookup.error)
+        raise BrokerRefused(f"cannot resolve MQTT broker {name!r}")
+    return lookup.addresses
+
+
+def _resolve(key: tuple[str, int], lookup: _Lookup) -> None:
+    name, port = key
+    try:
+        infos = socket.getaddrinfo(name, port, type=socket.SOCK_STREAM)
+        lookup.addresses = list(dict.fromkeys(str(info[4][0]) for info in infos))
+    except Exception as exc:  # noqa: BLE001 - gaierror, or UnicodeError for a long label
+        lookup.error = exc
+    finally:
+        with _lookups_lock:
+            del _lookups[key]  # the next attempt asks DNS afresh
+        lookup.done.set()
 
 
 class MqttBridge:
@@ -143,18 +250,35 @@ class MqttBridge:
             return
         self.on_message(topic, payload)
 
-    # ---- network (lazy paho; not covered by unit tests) -----------------
+    # ---- network (lazy paho; tests fake it) ------------------------------
 
     def connect(self, host: str, port: int, username: str | None, password: str | None):
-        """Connect to the broker and start the network loop. Returns the client."""
+        """Connect to the broker and start the network loop. Returns the client.
+
+        Nothing is resolved here (this runs on a request thread). Before every
+        connect and reconnect, paho's network thread calls ``on_pre_connect``,
+        which resolves and vets ``host`` and points the client at the vetted IP,
+        so the socket that carries the credentials only ever opens to a LAN
+        address."""
         import paho.mqtt.client as mqtt  # imported here so paho is optional
 
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2, client_id=client_id(self._node)
+        )
+        client.reconnect_delay_set(_RECONNECT_MIN_DELAY, _RECONNECT_MAX_DELAY)
+        # paho re-raises an on_pre_connect error only while this is False (its
+        # default). Pinned so a refusal always aborts the connect.
+        client.suppress_exceptions = False
         if username:
             client.username_pw_set(username, password or "")
         client.will_set(self.availability_topic(), "offline", retain=True)
 
-        def _on_connect(cli, _userdata, _flags, _reason_code, _properties):
+        def _on_connect(cli, _userdata, _flags, reason_code, _properties):
+            # paho calls this for a refused CONNACK too (bad password, ...).
+            if reason_code.is_failure:
+                _log.warning("MQTT broker %r refused the connection: %s. Will retry.",
+                             host, reason_code)
+                return
             cli.subscribe(self.command_topic_filter())
             self.publish_availability(True)
             self.republish_discovery()  # HA must re-learn the zones on every connect
@@ -169,15 +293,74 @@ class MqttBridge:
             except Exception:  # noqa: BLE001 - a bad command must not kill the loop
                 _log.exception("MQTT command handling failed for %s", msg.topic)
 
+        stopping = threading.Event()
+
+        def _on_pre_connect(cli, _userdata):
+            if stopping.is_set():
+                raise BrokerRefused("MQTT bridge stopped")
+            # The public ``host`` setter refuses mid-connect; paho opens the
+            # socket to ``_host`` right after this returns.
+            cli._host = vetted_broker_address(host, port, stopping)
+
+        stop_lock = threading.Lock()  # no loop_start once ``stopping`` is set
+
+        def _supervise():
+            # paho also reconnects from inside its packet handler (CONNACK
+            # asking for MQTT 3.1), outside its retry loop; a refusal or TCP
+            # error there ends paho's thread. loop_start() is a no-op while
+            # that thread is alive and starts a fresh one once it has died.
+            while not stopping.wait(_SUPERVISE_EVERY):
+                with stop_lock:
+                    if stopping.is_set():
+                        return
+                    if client.loop_start() == 0:  # MQTT_ERR_SUCCESS: it had died
+                        _log.warning("MQTT network thread for %r stopped; restarted it", host)
+
+        def _stop():
+            with stop_lock:
+                stopping.set()  # a lookup in progress gives up at once
+
+        supervisor = threading.Thread(target=_supervise, name="mqtt-supervisor", daemon=True)
+        paho_disconnect = client.disconnect
+        paho_loop_stop = client.loop_stop
+
+        def _disconnect(*args, **kwargs):
+            # Ends this client for good (a restart builds a new one): without
+            # the stop, the supervisor would see paho's thread end and restart it.
+            _stop()
+            if client.is_connected():
+                # A clean DISCONNECT suppresses the will, so say "offline"
+                # ourselves (retained, like the will), waiting a moment at most.
+                try:
+                    client.publish(self.availability_topic(), "offline", retain=True) \
+                        .wait_for_publish(timeout=_OFFLINE_WAIT)
+                except (RuntimeError, ValueError):  # not sent; disconnect anyway
+                    _log.warning("Could not publish MQTT offline status before disconnecting")
+            return paho_disconnect(*args, **kwargs)
+
+        def _loop_stop():
+            _stop()
+            if supervisor.is_alive() and supervisor is not threading.current_thread():
+                supervisor.join()
+            return paho_loop_stop()
+
         client.on_connect = _on_connect
         client.on_message = _on_message
+        client.on_pre_connect = _on_pre_connect
+        client.loop_stop = _loop_stop
+        client.disconnect = _disconnect
         # Rebind publish to the real client now that we have one.
         self._publish = lambda topic, payload, retain=False: client.publish(
             topic, payload, retain=retain
         )
-        # connect_async + loop_start: the TCP connect (and retries) happen on
-        # paho's daemon network thread, so a dead broker never blocks a request.
+        # connect_async + loop_start: the lookup, TCP connect and retries happen
+        # on paho's daemon network thread, so a dead broker never blocks a request.
         client.connect_async(host, port)
+        if getattr(client, "_host", None) != host:
+            # A paho that keeps the host elsewhere would ignore the vetted IP
+            # and connect to the raw name: refuse to start instead.
+            raise RuntimeError("paho-mqtt no longer keeps the broker in Client._host")
         client.loop_start()
+        supervisor.start()
         _log.info("MQTT bridge connecting to %s:%s", host, port)
         return client

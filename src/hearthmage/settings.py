@@ -12,7 +12,7 @@ from typing import Mapping
 
 from hearthmage.atomicio import write_json_atomic
 from hearthmage.backups import rotate_backup
-from hearthmage.lan import AddressRejected, is_lan_broker_host, is_lan_ipv4
+from hearthmage.lan import AddressRejected, is_ip_literal, is_lan_broker_host, is_lan_ipv4
 
 _DEFAULT_HUB_PORT = 6653
 _DEFAULT_CONFIG = os.path.expanduser("~/.config/hearthmage/config.json")
@@ -220,8 +220,9 @@ class Settings:
     def _warn_about_addresses(self) -> None:
         """Log, once at load, any hub or broker address off the LAN. A bad
         environment value is ignored. A stored one (saved before this check
-        existed) is still used so the app keeps working; the settings page
-        shows a warning next to it."""
+        existed) is still used so the app keeps working; a broker only while it
+        resolves to a local address, and never if it is an IP address off the
+        LAN. The settings page shows a warning next to it."""
         for suffix, on_lan in (("BASE_IP", is_lan_ipv4), ("MQTT_HOST", is_lan_broker_host)):
             value = self._clean(_env_lookup(self._env, suffix))
             if value and not on_lan(value):
@@ -244,8 +245,11 @@ class Settings:
             _log.warning("Stored hub address %r is not a private LAN IPv4 address; still "
                          "using it. Enter the hub's LAN address in Settings.", self.hub_ip)
         if not self.mqtt_host_on_lan:
-            _log.warning("Stored MQTT broker %r is not on the local network; still using "
-                         "it. Enter a LAN broker in Settings.", self.mqtt_config()["host"])
+            broker = self.mqtt_config()["host"]
+            use = ("not connecting to it" if is_ip_literal(broker)
+                   else "using it only while it resolves to a local address")
+            _log.warning("Stored MQTT broker %r is not on the local network; %s. Enter a "
+                         "LAN broker in Settings.", broker, use)
 
     # --- read ---------------------------------------------------------
 

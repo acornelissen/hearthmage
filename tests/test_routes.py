@@ -2820,6 +2820,34 @@ def test_save_mqtt_strips_host(tmp_path, monkeypatch):
     assert appmod.settings.mqtt_config()["host"] == "10.0.0.5"
 
 
+def test_restart_mqtt_disconnects_before_stopping_the_loop(tmp_path, monkeypatch):
+    # paho's documented order: disconnect() lets the network thread send
+    # DISCONNECT and leave its select at once; loop_stop() then joins it.
+    import hearthmage.app as appmod
+    from hearthmage.mqtt_bridge import MqttBridge
+    from hearthmage.settings import Settings
+
+    monkeypatch.setattr(appmod, "settings", Settings(str(tmp_path / "c.json"), env={}))
+    appmod.settings.set_mqtt("10.0.0.5", 1883, "", "keep", "")
+    monkeypatch.setattr(appmod, "_client", None)
+    monkeypatch.setattr(appmod, "mqtt_bridge", None)
+    calls = []
+
+    class FakeClient:
+        def disconnect(self):
+            calls.append("disconnect")
+
+        def loop_stop(self):
+            calls.append("loop_stop")
+
+    monkeypatch.setattr(appmod, "_mqtt_client", FakeClient())
+    monkeypatch.setattr(MqttBridge, "connect", lambda self, *a: FakeClient())
+    appmod._restart_mqtt()
+    assert calls == ["disconnect", "loop_stop"]
+    monkeypatch.setattr(appmod, "_mqtt_client", None)
+    monkeypatch.setattr(appmod, "mqtt_bridge", None)
+
+
 def test_restart_mqtt_stops_old_client_and_is_serialised(tmp_path, monkeypatch):
     import threading
     import time
@@ -2913,6 +2941,34 @@ def test_settings_page_warns_about_a_stored_broker_off_the_lan(tmp_path, monkeyp
     assert 'aria-describedby="mqtt_host_error"' in resp.text
     assert "not on your local network" in resp.text
     assert 'value="100.64.0.9"' in resp.text
+
+
+def test_stored_broker_ip_literal_off_the_lan_is_not_used_at_all(tmp_path, monkeypatch):
+    # A literal never resolves, so the bridge never connects to it.
+    (tmp_path / "c.json").write_text('{"mqtt": {"host": "100.64.0.9"}}')
+    _mqtt_env(tmp_path, monkeypatch)
+    resp = TestClient(app).get("/settings")
+    broker = resp.text.split('id="mqtt_host_error"', 1)[1].split("</", 1)[0]
+    assert "100.64.0.9" in broker
+    assert "does not connect to it" in broker
+    assert "resolves" not in broker
+    assert "still uses it" not in broker
+
+
+def test_stored_broker_warning_says_it_is_used_only_on_a_local_address(tmp_path, monkeypatch):
+    # The bridge refuses a broker that resolves off the LAN, so the page must
+    # not say it is still in use; the hub's warning keeps its own wording.
+    (tmp_path / "c.json").write_text('{"hub_ip": "nexho.example.com", "mqtt": {"host": "mqtt.example.com"}}')
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())  # no real hub
+    resp = TestClient(app).get("/settings")
+    assert resp.status_code == 200
+    broker = resp.text.split('id="mqtt_host_error"', 1)[1].split("</", 1)[0]
+    assert "mqtt.example.com" in broker
+    assert "only while it resolves to a local address" in broker
+    assert "still uses it" not in broker
+    hub = resp.text.split('id="hub_ip_error"', 1)[1].split("</", 1)[0]
+    assert "still uses it" in hub
 
 
 @pytest.mark.parametrize(

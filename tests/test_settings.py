@@ -553,6 +553,28 @@ def test_a_stored_address_off_the_lan_is_kept_but_warned_about(tmp_path, caplog)
     assert any("100.64.0.9" in m for m in warnings)
 
 
+def test_a_stored_broker_off_the_lan_is_logged_as_used_only_on_a_local_address(tmp_path, caplog):
+    # The bridge connects only while the broker resolves to a LAN address, so
+    # the log must not claim the broker is simply still in use.
+    path = tmp_path / "c.json"
+    path.write_text('{"mqtt": {"host": "mqtt.example.com"}}')
+    with caplog.at_level("WARNING", logger="hearthmage.settings"):
+        Settings(str(path), env={})
+    [message] = [m for m in _settings_warnings(caplog) if "mqtt.example.com" in m]
+    assert "only while it resolves to a local address" in message
+    assert "still using" not in message
+
+
+def test_a_stored_broker_ip_literal_off_the_lan_is_logged_as_not_used(tmp_path, caplog):
+    path = tmp_path / "c.json"
+    path.write_text('{"mqtt": {"host": "8.8.8.8"}}')
+    with caplog.at_level("WARNING", logger="hearthmage.settings"):
+        Settings(str(path), env={})
+    [message] = [m for m in _settings_warnings(caplog) if "8.8.8.8" in m]
+    assert "not connecting to it" in message
+    assert "resolves" not in message and "still using" not in message
+
+
 def test_lan_flags_are_true_when_nothing_or_a_lan_address_is_set(tmp_path):
     s = Settings(str(tmp_path / "c.json"), env={})
     assert (s.hub_ip_on_lan, s.mqtt_host_on_lan) == (True, True)

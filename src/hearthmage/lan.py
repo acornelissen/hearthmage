@@ -10,6 +10,9 @@ checks it here. Discovery uses the same RFC 1918 check before it sweeps.
   single-label (no trailing dot) or ending in .local/.lan/.home.arpa/.internal
   (a trailing dot is fine there, ``broker.lan.``, and is kept). Names are not
   resolved here: DNS can change later, and a request must not wait on it.
+  Instead the MQTT bridge resolves the name before every connect, on paho's
+  network thread, and connects only if every address passes
+  ``is_lan_broker_address``.
 
 100.64.0.0/10 (Tailscale and carrier NAT) is not the home LAN for either.
 """
@@ -62,18 +65,39 @@ def is_lan_ipv4(value) -> bool:
     return any(addr in net for net in LAN_NETS)
 
 
+def is_ip_literal(value) -> bool:
+    """Whether ``value`` is written as an IP address (so it never resolves)."""
+    try:
+        ipaddress.ip_address(value.strip())
+    except (AttributeError, ValueError):
+        return False
+    return True
+
+
+def is_lan_broker_address(value) -> bool:
+    """Whether ``value`` is an IP address literal the broker may be at: RFC 1918
+    IPv4 or loopback (127/8, ::1). The bridge checks every address a broker
+    name resolves to with this before it connects."""
+    if not isinstance(value, str):
+        return False
+    try:
+        addr = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return False
+    if addr.version == 6:
+        # Only ::1. Newer Pythons call ::ffff:127.0.0.1 loopback too; keep one rule.
+        return addr == ipaddress.IPv6Address("::1")
+    return addr.is_loopback or is_lan_ipv4(value)
+
+
 def is_lan_broker_host(value) -> bool:
     """Whether ``value`` is an acceptable MQTT broker host: an RFC 1918 IPv4
     address, loopback, or a LAN name (see the module docstring)."""
     if not isinstance(value, str):
         return False
     text = value.strip()
-    try:
-        addr = ipaddress.ip_address(text)
-    except ValueError:
-        addr = None
-    if addr is not None:
-        return addr.is_loopback or is_lan_ipv4(text)
+    if is_ip_literal(text):
+        return is_lan_broker_address(text)
     name = host_name(text)
     if name is None:
         return False

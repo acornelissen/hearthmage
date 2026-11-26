@@ -1,6 +1,6 @@
 import pytest
 
-from hearthmage.lan import is_lan_broker_host, is_lan_ipv4
+from hearthmage.lan import is_lan_broker_address, is_lan_broker_host, is_lan_ipv4
 
 
 @pytest.mark.parametrize(
@@ -54,3 +54,37 @@ def test_lan_broker_hosts_are_accepted(host):
 )
 def test_other_broker_hosts_are_refused(host):
     assert is_lan_broker_host(host) is False
+
+
+@pytest.mark.parametrize("addr", ["10.0.0.5", "172.20.1.1", "192.168.1.2", "127.0.0.1", "127.0.1.1", "::1"])
+def test_lan_broker_addresses_are_accepted(addr):
+    assert is_lan_broker_address(addr) is True
+
+
+@pytest.mark.parametrize(
+    "addr",
+    [
+        "8.8.8.8", "100.64.0.1", "169.254.0.5", "0.0.0.0", "192.0.2.1",
+        # IPv6: only ::1 is the local box; ULA, link-local and mapped forms are not.
+        "fd00::1", "fe80::1", "fe80::1%en0", "2a00:1450:4001::1", "::ffff:192.168.1.5",
+        "::ffff:127.0.0.1", "::",
+        # A resolved address is a literal; a name never counts.
+        "localhost", "mqtt.local", "10.1", "167772161", "", None,
+    ],
+)
+def test_other_broker_addresses_are_refused(addr):
+    assert is_lan_broker_address(addr) is False
+
+
+@pytest.mark.parametrize("value", ["10.0.0.5", " 8.8.8.8 ", "::1", "fe80::1%en0"])
+def test_ip_literals_are_recognised(value):
+    from hearthmage.lan import is_ip_literal
+
+    assert is_ip_literal(value) is True
+
+
+@pytest.mark.parametrize("value", ["mqtt.local", "10.1", "167772161", "", None, 42])
+def test_names_are_not_ip_literals(value):
+    from hearthmage.lan import is_ip_literal
+
+    assert is_ip_literal(value) is False
