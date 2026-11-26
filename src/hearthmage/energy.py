@@ -19,13 +19,16 @@ is simply "no reading". See docs/nexho-protocol.md.
 from __future__ import annotations
 
 COUNTER_HOURS = 6 / 60  # each counter unit is 6 minutes of element-on time
+DAILY_BUCKETS = 8  # *?UD: today and the seven days before (inferred)
+MONTHLY_BUCKETS_MAX = 7  # *?UM: up to seven months (inferred)
 
 
 def parse_energy(resp: str) -> tuple[int | None, list[int]]:
     """Parse an ``*?UD`` / ``*?UM`` reply into (rated_watts, counters).
 
-    A non-OK reply (``ER``/timeout) yields ``(None, [])``. Counters are read
-    until the first non-numeric field, so trailing empties are ignored.
+    A non-OK reply (``ER``/timeout) yields ``(None, [])``, and so does one
+    with a field that is not a number: that is the reply to another query.
+    Trailing empty fields are ignored.
     """
     if not resp.startswith(("OK,", "OPOK,")):
         return None, []
@@ -36,13 +39,12 @@ def parse_energy(resp: str) -> tuple[int | None, list[int]]:
         watts = int(parts[0])
     except ValueError:
         return None, []
-    counters: list[int] = []
-    for field in parts[1:]:
-        field = field.strip()
-        if not field or not field.lstrip("-").isdigit():
-            break
-        counters.append(int(field))
-    return watts, counters
+    fields = [field.strip() for field in parts[1:]]
+    while fields and not fields[-1]:
+        fields.pop()
+    if not all(field.lstrip("-").isdigit() for field in fields):
+        return None, []
+    return watts, [int(field) for field in fields]
 
 
 def counter_to_kwh(counter: int, watts: int | None) -> float:

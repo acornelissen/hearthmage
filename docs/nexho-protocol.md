@@ -160,7 +160,9 @@ returned a bare `OK` with no counters. So on this hub the radiators do not retur
 energy counters over the LAN (much like schedule block-detail). The app still
 decodes and displays whatever a real reply would contain, guarded so the `ER`
 case is simply "no reading". If a radiator ever does answer `*?UD`, capture the
-payload and confirm the field order here. See `src/hearthmage/energy.py`.
+payload and confirm the field order here. A payload that does not fit the shape
+above is logged at WARNING (logger `hearthmage.nexho`, once per zone per distinct
+payload), so it can be copied from the log. See `src/hearthmage/energy.py`.
 
 ## Holiday hold (`*RH`; fields from the vendor app)
 
@@ -267,6 +269,30 @@ This app therefore waits 0.1 s after every reply before it sends again
 and offset 0.7 for radiators set to 7 and 0, and one poll recorded 0.8 C /
 target 0 for a room at 11.3 C / 10. Anything else on the LAN that talks to the
 hub (the vendor app, a probe script) can still garble a reply.
+
+### Reply shapes this app accepts
+
+Because a reply can belong to another query, each read accepts only its own
+shape; anything else is treated as no answer (a status read then counts as a
+radiator that did not answer, so the zone backs off and keeps its last reading).
+A rejected reply is logged at WARNING with the raw reply (logger
+`hearthmage.nexho`): status replies at most every 10 minutes per zone, others
+once per distinct reply. An `ER` is a sleeping radiator, not a rejection, and is
+not logged that way.
+
+| Read | Accepted | Basis |
+|---|---|---|
+| `*?T` | exactly `OK,<whole>,<tenths>,<setpoint>`, plain digits, tenths 0..9, room <= 60 C, setpoint <= 35 C | confirmed live; `OPOK,` instead of `OK,` is also taken (inferred, never seen). A room below 0 C has no known encoding and is rejected (inferred). |
+| `*?E` | exactly `OK,<0..255>` | one byte per element (inferred from the offset's signed byte and units' 255) |
+| `*?P<day>` | `OK,P<day>,<x>` plus at least 30 block fields (extra fields are ignored; the `P<day>` already rules out other replies) | confirmed live |
+| `*?F` | exactly 21 fields, the last starting `v` | live on all four radiators; other firmware may differ (inferred) |
+| `*?UD` | `OK,<watts>` plus exactly 8 numeric counters | inferred, never answered live |
+| `*?UM` | same `<watts>` as `*?UD`, at most 7 counters; otherwise no monthly data | inferred, never answered live |
+| `OPS3` | the counts for the `OPS2` zones each 0..16 (an empty field is unknown: one heater, zone shown), else the whole reply is unread (one heater per zone); fields past those zones are padding and ignored | the cap of 16 is inferred: the vendor app states no maximum, live counts are 1 |
+| `OPMR3898` | exactly `OPOK,0` or `OPOK,1` | confirmed live |
+
+`OPS1`, `OPS2` and `*?RH` replies carry their own name (`OPOK,OPS1`,
+`OPOK,OPS2`, `OK,RH`), so a reply meant for another query cannot pass for them.
 
 Corrected 2026-11-01 from the decompiled vendor app (HeatApp 4.1.1): `1#20` was
 earlier documented, and exposed in this app, as "temperature offset 0..17". It

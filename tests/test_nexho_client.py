@@ -389,7 +389,7 @@ def test_energy_poll_step_invokes_callback_when_due():
         {
             "OPS2/": "OPOK,OPS2,1",
             "R#1#1#0#0*?T/": "OK,20,00,007",
-            "R#1#1#0#0*?UD/": "OK,1000,12,40",
+            "R#1#1#0#0*?UD/": "OK,1000,12,40,0,0,0,0,0,0",  # eight daily buckets
             "R#1#1#0#0*?UM/": "OK,1000,300",
         }
     )
@@ -397,7 +397,7 @@ def test_energy_poll_step_invokes_callback_when_due():
     client._energy_interval = 3600.0
     client._next_energy = 0.0  # due now
     client._poll_once()  # temperature sweep + one energy read
-    assert seen == [(1, {"rated_watts": 1000, "daily": [12, 40], "monthly": [300]})]
+    assert seen == [(1, {"rated_watts": 1000, "daily": [12, 40, 0, 0, 0, 0, 0, 0], "monthly": [300]})]
 
 
 def test_energy_poll_step_skips_when_no_callback():
@@ -1683,3 +1683,202 @@ def test_the_real_give_up_limit_is_two_hours():
     from hearthmage.nexho_client import _SETPOINT_GIVE_UP_AFTER
 
     assert _SETPOINT_GIVE_UP_AFTER == 2 * 3600
+
+
+# ---- a reply of the wrong shape is no answer (heatapp-local-q2t, -5fw) -----
+# A reply carries nothing that ties it to its query, and the vendor app on the
+# LAN can still shift replies by one. Each read accepts only its own shape.
+
+_LIVE_F = "OK,14,9,5,21,19,17,6,11,69,0,0,0,0,1,0,44,244,0,33,v200110"
+_EMPTY_DAY = ",".join(["5,24,60,24,60"] * 6)
+
+
+@pytest.mark.parametrize("reply", [
+    "OPOK,OPS3,1,1,1,1",  # heater counts: would read as target 1 (Off)
+    "OPOK,OPS2,1,2,3,4,0",  # zone list: would read as target 2
+    "OK,10",  # an *?E setting: would read as room 10 with no target
+    "OK,20,04",  # too short
+    "OK,20,04,007,1",  # too long
+    "OK,20,12,007",  # tenths above 9
+    "OK,20,-4,007",
+    "OK,20,04,abc",
+    "OK, 20,04,007",
+    "OK,,04,007",
+    _LIVE_F,  # an *?F status
+    f"OK,P0,11,{_EMPTY_DAY}",  # a day program
+    "OK,1000,12,40",  # energy counters (room 1000 C)
+])
+def test_status_replies_of_another_shape_are_no_reading(reply):
+    assert _parse_status(reply) == (None, None)
+
+
+def test_a_shifted_status_reply_is_not_a_fresh_reading():
+    client = make_client({"OPS2/": "OPOK,OPS2,2", "R#2#": "OPOK,OPS3,1,1,1,1"})
+    _zone_ready(client)
+    client._poll_once()  # same path as a radiator that did not answer
+    room = client.list_rooms()[0]
+    assert (room.current_temp, room.target_temp, room.is_off) == (19.0, 18.0, False)
+    assert 2 not in client._last_fresh
+    assert client._backoff[2] > client._poll_interval  # it backs off like a silent one
+
+
+@pytest.mark.parametrize("reply", ["OK,20,04,007", "OK,256", "OK,-1", "OK,", "OK,7,0", "OPOK,7"])
+def test_a_setting_read_accepts_only_ok_and_one_byte(reply):
+    assert make_client({"R#1#1#0#0*?E#0#6/": reply})._read_element(1, 0, 6) is None
+
+
+def test_a_setting_read_still_takes_a_byte():
+    assert make_client({"R#1#1#0#0*?E#0#9/": "OK,251"})._read_element(1, 0, 9) == 251
+
+
+def test_a_longer_genuine_day_program_is_still_read():
+    # The OK,P<day> prefix already rules out every other query's reply. A
+    # longer reply from other firmware must not break sync or Load from radiator.
+    client = make_client({"R#2#1#0#0*?P3/": f"OK,P3,11,{_EMPTY_DAY},5"})
+    assert client.read_day_pattern("2", 3) == []
+
+
+@pytest.mark.parametrize("reply", ["OK,20,04,007", "OK,10", _LIVE_F.rsplit(",", 1)[0]])
+def test_a_status_dump_must_look_like_one(monkeypatch, reply):
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc.time, "sleep", lambda s: None)
+    with pytest.raises(HearthError):
+        make_client({"R#1#1#0#0*?F/": reply}).read_status_raw("1")
+
+
+_UD = "OK,1000,12,40,35,50,0,22,18,7"
+
+
+@pytest.mark.parametrize("ud", [
+    "OK,20,04,007",  # a shifted *?T status
+    "OK,10",  # a shifted *?E setting
+    _LIVE_F,  # a shifted *?F status
+    "OK,1000,12,40",  # not the eight daily buckets
+    "OK,1000,12,40,35,50,0,22,18,x",
+])
+def test_energy_needs_eight_daily_counters(ud):
+    client = make_client({"R#1#1#0#0*?UD/": ud, "R#1#1#0#0*?UM/": "OK,1000,300"})
+    assert client.read_energy("1") is None
+
+
+@pytest.mark.parametrize("um", ["OK,20,04,007", _UD, "OK,999,300"])
+def test_monthly_counters_from_another_reply_are_dropped(um):
+    # Monthly buckets must carry the same rated watts as the daily read, and
+    # there are at most seven; a copy of the daily reply has eight.
+    client = make_client({"R#1#1#0#0*?UD/": _UD, "R#1#1#0#0*?UM/": um})
+    data = client.read_energy("1")
+    assert data["daily"] == [12, 40, 35, 50, 0, 22, 18, 7]
+    assert data["monthly"] == []
+
+
+def test_cloud_reporting_reply_must_be_exactly_one_flag():
+    with pytest.raises(HearthError):
+        make_client({"OPMR3898/": "OPOK,1,0"}).read_cloud_reporting()
+
+
+@pytest.mark.parametrize("ops3", ["OPOK,OPS3,100000,1", "OPOK,OPS3,17,1", "OPOK,OPS3,1,x", "OPOK,OPS3,-1,1"])
+def test_an_implausible_heater_count_reply_is_not_used(ops3):
+    # A sensor-offset save writes once per heater: 100000 would be 100000
+    # writes on a request thread. The reply is treated as unread (one heater).
+    sent: list[str] = []
+    client = NexhoLocalClient("10.0.0.99")
+
+    def ask(cmd, *a, **k):
+        sent.append(cmd)
+        return {"OPS2/": "OPOK,OPS2,1,2", "OPS3/": ops3}.get(cmd, "OK")
+
+    client._ask = ask  # type: ignore[method-assign]
+    assert client._zone_ids() == [1, 2]  # nothing hidden on a bad reply
+    client.set_config("1", sensor_offset=0.5)
+    assert [c for c in sent if "SEP#0#9" in c] == ["R#1#1#0#0*SEP#0#9#5/"]
+
+
+def test_sixteen_heaters_is_still_a_count():
+    client = NexhoLocalClient("10.0.0.99")
+    client._ask = lambda cmd, *a, **k: {"OPS2/": "OPOK,OPS2,1", "OPS3/": "OPOK,OPS3,16"}.get(cmd, "OK")  # type: ignore[method-assign]
+    client._zone_ids()
+    assert client._modules(1) == 16
+
+
+# ---- strict, but never stricter than the evidence, and never silent ------
+
+
+def _warnings(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.name == "hearthmage.nexho" and r.levelname == "WARNING"]
+
+
+def test_heater_counts_past_the_zone_list_are_padding(caplog):
+    # OPS2 ends its list with a 0 and may carry slots after it; OPS3 can be
+    # padded the same way. Only the counts for listed zones are checked.
+    client = make_client({"OPS2/": "OPOK,OPS2,1,2,3,4,0,9", "OPS3/": "OPOK,OPS3,1,0,1,1,255,255"})
+    with caplog.at_level("WARNING", logger="hearthmage.nexho"):
+        assert client._zone_ids() == [1, 3, 4]  # zone 2 (no heaters) stays hidden
+    assert _warnings(caplog) == []
+
+
+def test_a_rejected_heater_count_reply_is_logged_once(caplog):
+    client = make_client({"OPS2/": "OPOK,OPS2,1,2", "OPS3/": "OPOK,OPS3,100000,1"})
+    with caplog.at_level("WARNING", logger="hearthmage.nexho"):
+        for _ in range(3):
+            client._zone_ids()
+    assert len(_warnings(caplog)) == 1
+    assert "OPOK,OPS3,100000,1" in _warnings(caplog)[0]
+
+
+def test_a_rejected_status_reply_is_logged_per_zone_at_most_every_ten_minutes(monkeypatch, caplog):
+    import hearthmage.nexho_client as nc
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(nc.time, "monotonic", lambda: clock["now"])
+    replies = {"R#2#": "OPOK,OPS3,1,1,1,1", "R#3#": "ER,1"}
+    client = make_client(replies)
+    with caplog.at_level("WARNING", logger="hearthmage.nexho"):
+        client._read_zone_raw(2)
+        client._read_zone_raw(2)  # same zone soon after: not again
+        client._read_zone_raw(3)  # an ER is a sleeping radiator, not a bad reply
+        assert len(_warnings(caplog)) == 1
+        assert "zone 2" in _warnings(caplog)[0] and "OPOK,OPS3,1,1,1,1" in _warnings(caplog)[0]
+        clock["now"] += 601
+        client._read_zone_raw(2)
+    assert len(_warnings(caplog)) == 2
+
+
+def test_a_rejected_energy_payload_is_logged_for_capture(caplog):
+    # The protocol doc asks for exactly this payload if a radiator ever answers.
+    client = make_client({"R#1#1#0#0*?UD/": "OK,1000,12,40", "R#1#1#0#0*?UM/": "ER,1"})
+    with caplog.at_level("WARNING", logger="hearthmage.nexho"):
+        assert client.read_energy("1") is None
+        assert client.read_energy("1") is None  # the same payload again: logged once
+    assert len(_warnings(caplog)) == 1
+    assert "OK,1000,12,40" in _warnings(caplog)[0]
+
+
+def test_a_rejected_monthly_payload_is_logged_and_er_is_not(caplog):
+    ud = "OK,1000,12,40,35,50,0,22,18,7"
+    client = make_client({"R#1#1#0#0*?UD/": ud, "R#1#1#0#0*?UM/": "OK,999,300"})
+    with caplog.at_level("WARNING", logger="hearthmage.nexho"):
+        client.read_energy("1")
+        quiet = make_client({"R#1#1#0#0*?UD/": "ER,1", "R#1#1#0#0*?UM/": "ER,1"})
+        quiet.read_energy("1")
+    assert len(_warnings(caplog)) == 1
+    assert "OK,999,300" in _warnings(caplog)[0]
+
+
+def test_a_forgotten_zone_takes_its_rejection_log_state_with_it():
+    client = make_client({"R#2#": "OK,10", "R#1#1#0#0*?UD/": "OK,1", "R#1#1#0#0*?UM/": "ER,1"})
+    client._read_zone_raw(2)
+    client.read_energy("1")
+    client._rejected_logged[("OPS3",)] = "OPOK,OPS3,x"
+    client._forget_zones_except([3])
+    assert client._status_rejected_at == {}
+    assert client._rejected_logged == {("OPS3",): "OPOK,OPS3,x"}  # not a zone's
+
+
+def test_an_empty_heater_count_is_unknown_for_that_zone_only(caplog):
+    client = make_client({"OPS2/": "OPOK,OPS2,1,2,3", "OPS3/": "OPOK,OPS3,2,,0"})
+    with caplog.at_level("WARNING", logger="hearthmage.nexho"):
+        assert client._zone_ids() == [1, 2]  # zone 2 unknown stays visible, 3 hidden
+    assert (client._modules(1), client._modules(2)) == (2, 1)  # unknown: one heater
+    assert _warnings(caplog) == []

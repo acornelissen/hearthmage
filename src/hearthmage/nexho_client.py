@@ -10,7 +10,7 @@ import time
 
 from hearthmage.atomicio import write_json_atomic
 from hearthmage.domain import HearthError, Room, Scene
-from hearthmage.energy import parse_energy
+from hearthmage.energy import DAILY_BUCKETS, MONTHLY_BUCKETS_MAX, parse_energy
 from hearthmage.schedule import Block, build_program_command, parse_program_day
 
 _log = logging.getLogger("hearthmage.nexho")
@@ -74,6 +74,16 @@ _HEATERS_REFRESH = 600.0
 
 _MAX_PLAUSIBLE_ROOM = 60.0  # vendor app: a room reading above this is re-read
 _MAX_PLAUSIBLE_TARGET = 35.0  # ...and a setpoint above this
+# Heaters per zone accepted from OPS3. The protocol doc gives no maximum (live:
+# one per zone); 16 is a generous cap (inferred). A sensor-offset save writes
+# once per heater, so an unbounded count would be that many writes.
+_MAX_HEATERS = 16
+# Fields in an *?F status reply, the last one the firmware string (``v...``).
+# Live on all four radiators 2026-11-01; other firmware may differ (inferred).
+_STATUS_F_FIELDS = 21
+# A zone whose status replies keep being rejected for their shape is logged at
+# most this often, so it does not look like a radiator that is simply asleep.
+_REJECTED_STATUS_LOG_EVERY = 600.0
 _MIN_TEMP = 5.0
 _MAX_TEMP = 30.0
 # "Off" is sent as a 1 degree setpoint: *T0 did not reliably turn radiators off.
@@ -157,6 +167,11 @@ class NexhoLocalClient:
         # Per-zone poll scheduling (monotonic clock). Unreachable zones back off.
         self._next_poll: dict[int, float] = {}
         self._backoff: dict[int, float] = {}
+        # Replies rejected for their shape, logged so they can be captured
+        # without flooding the log: key -> last reply logged (once per distinct
+        # reply), and zone -> when a rejected status reply was last logged.
+        self._rejected_logged: dict[tuple, str] = {}
+        self._status_rejected_at: dict[int, float] = {}
         self._load_cache()  # show last-known readings immediately on start
 
     def _load_cache(self) -> None:
@@ -347,24 +362,33 @@ class NexhoLocalClient:
         with self._lock:
             for table in (self._state, self._last, self._pending, self._desired,
                           self._next_poll, self._backoff, self._last_fresh, self._write_seq,
-                          self._requested_at, self._gave_up):
+                          self._requested_at, self._gave_up, self._status_rejected_at):
                 for zone in [z for z in table if z not in keep]:
                     del table[zone]
+            for key in [k for k in self._rejected_logged if isinstance(k[0], int) and k[0] not in keep]:
+                del self._rejected_logged[key]  # a zone's energy rejections
             self._unconfirmed &= keep
             self._write_kick &= keep
         with self._write_wake:
             self._write_wake.notify_all()  # a worker retrying for a dropped zone ends
 
     def _read_heater_counts(self, ids: list[int]) -> None:
-        """Read OPS3/ (heaters per zone, in OPS2 order). On failure the counts
-        stay unknown and writes fall back to one heater; nothing is hidden."""
+        """Read OPS3/ (heaters per zone, in OPS2 order). On failure, or a reply
+        with a count that is not 0.._MAX_HEATERS, the counts stay unknown and
+        writes fall back to one heater; nothing is hidden."""
         try:
             resp = self._ask("OPS3/", _READ_RETRIES, _READ_TIMEOUT)
         except HearthError:
             return
         if not resp.startswith("OPOK,OPS3,"):
             return
-        counts = [_as_int(tok) for tok in resp.split(",")[2:]]
+        # Only the listed zones' counts: like OPS2, the reply may carry slots
+        # after them. An empty field is unknown for that zone (one heater).
+        tokens = resp.split(",")[2:][: len(ids)]
+        counts = [None if tok == "" else _digits(tok) for tok in tokens]
+        if any(tok != "" and (c is None or c > _MAX_HEATERS) for tok, c in zip(tokens, counts)):
+            self._log_rejected(("OPS3",), "heater counts (OPS3)", resp)
+            return
         with self._lock:
             self._heaters = {z: c for z, c in zip(ids, counts) if c is not None}
             self._heaters_for = ids
@@ -444,7 +468,26 @@ class NexhoLocalClient:
         except HearthError:
             resp = "ER"  # radiator did not answer over RF
         current, target = _parse_status(resp)
+        if current is None and resp.startswith(("OK,", "OPOK,")):
+            self._log_rejected_status(zone, resp)
         return current, target, current is not None or target is not None
+
+    def _log_rejected_status(self, zone: int, resp: str) -> None:
+        """The hub answered, but not with a status reply: say so (unlike a
+        radiator asleep over RF), at most every _REJECTED_STATUS_LOG_EVERY."""
+        now = time.monotonic()
+        last = self._status_rejected_at.get(zone)
+        if last is not None and now - last < _REJECTED_STATUS_LOG_EVERY:
+            return
+        self._status_rejected_at[zone] = now
+        _log.warning("zone %s status reply of an unexpected shape ignored: %r", zone, resp)
+
+    def _log_rejected(self, key: tuple, what: str, resp: str) -> None:
+        """Log a reply rejected for its shape, once per distinct reply per key."""
+        if self._rejected_logged.get(key) == resp:
+            return
+        self._rejected_logged[key] = resp
+        _log.warning("%s reply of an unexpected shape ignored: %r", what, resp)
 
     # ---- background poller ----------------------------------------------
 
@@ -881,9 +924,11 @@ class NexhoLocalClient:
             resp = self._ask(f"R#{zone}#1#0#0*?E#{group}#{index}/", _READ_RETRIES, _READ_TIMEOUT)
         except HearthError:
             return None
-        if not resp.startswith("OK,"):
+        parts = resp.split(",")  # exactly OK,<byte>: anything else is another reply
+        if len(parts) != 2 or parts[0] != "OK":
             return None
-        return _as_int(resp.split(",")[1]) if "," in resp else None
+        value = _digits(parts[1])
+        return value if value is not None and value <= 255 else None
 
     def _read_element_agreed(self, zone: int, group: int, index: int) -> int | None:
         """Read one setting until two reads in a row agree; None if the radiator
@@ -1042,10 +1087,17 @@ class NexhoLocalClient:
         except HearthError:
             return None
         watts, daily = parse_energy(ud)
-        _, monthly = parse_energy(um)
-        if watts is None:
-            _log.debug("zone %s energy read returned no data: %s", zone, ud)
+        monthly_watts, monthly = parse_energy(um)
+        # A payload that does not fit is logged so it can be captured: the
+        # framing is inferred and no radiator has answered these reads yet.
+        if watts is None or len(daily) != DAILY_BUCKETS:
+            if ud.startswith(("OK,", "OPOK,")):
+                self._log_rejected((zone, "UD"), f"zone {zone} daily energy (*?UD)", ud)
             return None
+        if monthly_watts != watts or len(monthly) > MONTHLY_BUCKETS_MAX:
+            if um.startswith(("OK,", "OPOK,")):
+                self._log_rejected((zone, "UM"), f"zone {zone} monthly energy (*?UM)", um)
+            monthly = []  # not this radiator's monthly reply (or none)
         return {"rated_watts": watts, "daily": daily, "monthly": monthly}
 
     def set_scene_membership(self, room_id: str, scene: Scene, member: bool) -> None:
@@ -1074,7 +1126,8 @@ class NexhoLocalClient:
         Stored verbatim when diagnosing heating nobody asked for."""
         zone = self._require_zone(room_id)
         resp = self._ask_until_answered(f"R#{zone}#1#0#0*?F/", "OK,", priority=False)
-        if not resp.startswith("OK,"):
+        fields = resp.split(",")
+        if fields[0] != "OK" or len(fields) != _STATUS_F_FIELDS or not fields[-1].startswith("v"):
             raise HearthError(f"Zone {zone} status read failed: {resp!r}")
         return resp
 
@@ -1111,7 +1164,7 @@ class NexhoLocalClient:
         """Whether the hub sends data to the vendor's external server."""
         resp = self._ask(f"OPMR{_CLOUD_REPORTING_ADDR}/", _READ_RETRIES, _READ_TIMEOUT)
         parts = resp.split(",")
-        if parts[0] != "OPOK" or len(parts) < 2 or parts[1] not in ("0", "1"):
+        if parts[0] != "OPOK" or len(parts) != 2 or parts[1] not in ("0", "1"):
             raise HearthError(f"Unexpected cloud reporting reply: {resp!r}")
         return parts[1] == "1"
 
@@ -1167,27 +1220,28 @@ def _parse_status(resp: str) -> tuple[float | None, float | None]:
     Success looks like ``OK,<tempWhole>,<tempTenths>,<setpoint>`` e.g.
     ``OK,20,04,007`` -> room 20.4 deg, setpoint 7 deg. A setpoint >=128 is a
     half-degree (``148`` -> 20.5) and ``0`` is OFF (target 0.0). ``ER`` means the
-    radiator was unreachable over RF, so both values are unknown.
+    radiator was unreachable over RF, so both values are unknown. So is any
+    reply not of exactly that shape (three plain numbers, tenths 0..9): the
+    hub can answer with the reply meant for another query.
     """
     if not resp.startswith(("OK,", "OPOK,")):
         return None, None
     parts = resp.split(",")
-    current: float | None = None
-    target: float | None = None
-    whole = _as_int(parts[1]) if len(parts) > 1 else None
-    tenths = _as_int(parts[2]) if len(parts) > 2 else None
-    if whole is not None:
-        current = whole + (tenths or 0) / 10.0
-    setpoint = _as_int(parts[3]) if len(parts) > 3 else None
-    if setpoint is not None:
-        target = _decode_setpoint(setpoint)
+    numbers = [_digits(p) for p in parts[1:]]
+    if len(numbers) != 3 or None in numbers or numbers[1] > 9:
+        return None, None  # logged by the caller, which knows the zone
+    whole, tenths, setpoint = numbers
+    current = whole + tenths / 10.0
+    target = _decode_setpoint(setpoint)
     # The vendor app re-reads such replies; treat them as no reading at all.
-    if (current is not None and current > _MAX_PLAUSIBLE_ROOM) or (
-        target is not None and target > _MAX_PLAUSIBLE_TARGET
-    ):
-        _log.debug("implausible status reply ignored: %r", resp)
+    if current > _MAX_PLAUSIBLE_ROOM or target > _MAX_PLAUSIBLE_TARGET:
         return None, None
     return current, target
+
+
+def _digits(value: str) -> int | None:
+    """``value`` as a number if it is plain ASCII digits (no sign, no spaces)."""
+    return int(value) if value.isascii() and value.isdigit() else None
 
 
 def _as_int(value: str) -> int | None:
