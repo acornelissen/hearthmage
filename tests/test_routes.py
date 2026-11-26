@@ -1508,11 +1508,26 @@ def test_energy_page_renders_cached_zone(client: TestClient, tmp_path, monkeypat
     assert "Whole home" in resp.text
 
 
-def test_energy_page_without_reading_shows_placeholder(client: TestClient, tmp_path, monkeypatch):
+def test_energy_page_without_any_reading_says_so_instead_of_zero(client: TestClient, tmp_path, monkeypatch):
+    # Changed 2026-11-26: "may be asleep, check back shortly" and a 0.0 kWh
+    # total misled; on this hub no radiator has ever answered an energy read.
     _with_energy(tmp_path, monkeypatch)
     resp = client.get("/energy")
     assert resp.status_code == 200
-    assert "No energy reading yet" in resp.text
+    assert "No radiator has reported energy use yet" in resp.text
+    assert "hasn&rsquo;t reported energy use" in resp.text
+    assert "0.0&nbsp;kWh" not in resp.text
+    assert "may be asleep" not in resp.text
+
+
+def test_energy_total_says_how_many_radiators_it_covers(client: TestClient, tmp_path, monkeypatch):
+    appmod = _with_energy(tmp_path, monkeypatch)
+    two_rooms = FakeHearthClient()  # Living Room and Bedroom
+    app.dependency_overrides[get_client] = lambda: two_rooms
+    appmod.energy.set_zone("1", 1000, [10, 0, 0, 0, 0, 0, 0, 0], [], "2026-07-19T10:00:00+00:00")
+    assert "1 of 2 radiators reporting" in client.get("/energy").text
+    appmod.energy.set_zone("2", 1000, [10, 0, 0, 0, 0, 0, 0, 0], [], "2026-07-19T10:00:00+00:00")
+    assert "radiators reporting" not in client.get("/energy").text
 
 
 def _energy_refreshes(monkeypatch, appmod):

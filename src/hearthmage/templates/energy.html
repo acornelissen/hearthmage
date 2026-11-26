@@ -43,19 +43,27 @@
 
     <section class="panel">
       <h2 class="panel-title">Whole home</h2>
+      {% if not reporting %}
+      <p class="panel-note muted">No radiator has reported energy use yet, so there is
+        nothing to total. The radiators on this hub have not answered energy
+        readings so far.</p>
+      {% else %}
       <p class="summary">Today {{ '%.1f'|format(home_today_kwh) }}&nbsp;kWh
         {% if price %}({{ '%.2f'|format(home_today_cost) }}){% endif %}
         <span class="sep" aria-hidden="true">&middot;</span>
         Last 7 days {{ '%.1f'|format(home_week_kwh) }}&nbsp;kWh
         {% if price %}({{ '%.2f'|format(home_week_cost) }}){% endif %}</p>
+      {% if reporting < zones|length %}
+      <p class="hint">{{ reporting }} of {{ zones|length }} radiators reporting.</p>
+      {% endif %}
+      {% endif %}
     </section>
 
     {% for z in zones %}
     <section class="panel">
       <h2 class="panel-title">{{ z.name }}</h2>
       {% if not z.has_data %}
-      <p class="panel-note muted">No energy reading yet. This radiator may be asleep;
-        check back shortly.</p>
+      <p class="panel-note muted">This radiator hasn&rsquo;t reported energy use.</p>
       {% else %}
       <p class="summary">Today {{ '%.1f'|format(z.today_kwh) }}&nbsp;kWh
         {% if price %}({{ '%.2f'|format(z.today_cost) }}){% endif %}

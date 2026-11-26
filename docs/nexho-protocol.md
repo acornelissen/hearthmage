@@ -167,6 +167,21 @@ payload and confirm the field order here. A payload that does not fit the shape
 above is logged at WARNING (logger `hearthmage.nexho`, once per zone per distinct
 payload), so it can be copied from the log. See `src/hearthmage/energy.py`.
 
+**Rechecked 2026-11-26 against the decompiled HeatApp 4.1.1** (`c0/a.java`,
+`UDPConnection.sendDataAndRcvResp`). For climate zones (`ModuleType` 199) the
+vendor sends exactly `R#<zone>#<module>#0#0*?UD/` (or `*?UM/`), once per
+module from `OPS3`; load zones (200) use `R#200#<zone>#<module>#0#0*?U…/`. It
+resends up to 25 times, 1 s for the first wait and 5 s after a timeout, while
+the reply is `ER`/`OPER`, and decodes `OK,<watts>,<8 daily>` /
+`OK,<watts>,<7 monthly>` with `kWh = n * 6/60 * watts/1000`, so the framing
+and unit above are confirmed as the vendor's. A live read-only retry the same
+way (25 sends per zone, 1.5 s waits, no `*UDEL`) got **no reply at all** on
+all four zones, while this app's 6 s wait gets `ER,1` after a few seconds:
+the hub does try the radiator over RF, and the radiator does not answer. The
+output power element (`1#124`) reads `0` on all four (meaning not checked).
+So these radiators do not report consumption to the hub (inferred from both
+attempts; the vendor app's own consumption screen would confirm it).
+
 ## Holiday hold (`*RH`; fields from the vendor app)
 
 The hub holds a zone until the occupants are back, then switches to an

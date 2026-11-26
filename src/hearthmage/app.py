@@ -1739,6 +1739,7 @@ def _energy_response(
         "energy.html",
         {
             "zones": zones,
+            "reporting": sum(1 for z in zones if z["has_data"]),
             "error": error,
             "price": price,
             "home_today_kwh": home_today,
