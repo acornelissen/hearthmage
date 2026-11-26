@@ -146,7 +146,9 @@ less often (up to every 30 minutes) while the radiator stays unreachable.
 HearthMage also checks once an hour that each radiator's program is still on
 or off the way you set it here. If something else changed it (the
 manufacturer's app, for example), HearthMage switches it back. The check is
-skipped while a holiday is set.
+skipped while a holiday is set. If a radiator still won't keep it after three
+tries in a day, the schedule page says so, and HearthMage tries again the next
+day or as soon as you change that schedule.
 
 **Why days can show "Not programmed":** the manufacturer's own app writes
 schedules in a way that can't be read back reliably over the local network. So a

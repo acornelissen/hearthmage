@@ -33,3 +33,13 @@ def test_pending_from_a_previous_run_loads_as_failed(tmp_path):
     reloaded = SyncStore(path)
     assert reloaded.get("1") == "failed"
     assert reloaded.failed_zones() == ["1"]  # so the retry loop picks it up
+
+
+def test_disagrees_is_settled_and_survives_a_restart(tmp_path):
+    from hearthmage.sync_store import SyncStore
+
+    path = str(tmp_path / "sync.json")
+    SyncStore(path).set("1", "disagrees")
+    store = SyncStore(path)
+    assert store.get("1") == "disagrees"
+    assert store.unsettled_zones() == []

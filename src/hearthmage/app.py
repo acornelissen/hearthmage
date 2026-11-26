@@ -1797,6 +1797,9 @@ _last_drift_check: float | None = None  # monotonic; None: check on the next cyc
 # changes the zone's schedule. Every push can send *OFF, which moves setpoints.
 _PROGRAM_CORRECTIONS_PER_DAY = 3
 _program_corrections: dict[str, list[float]] = {}  # zone -> monotonic times; under _sync_lock
+# Zones whose last push hit that cap: they settle as "disagrees", not "synced",
+# so the schedule page can say so. Under _sync_lock.
+_program_disagrees: set[str] = set()
 
 
 def _program_corrections_left(zone: str) -> bool:
@@ -1862,6 +1865,8 @@ def _resync_zone(client: HearthClient, zone: str) -> bool:
         # not during a holiday hold, whose level is not the user's target.
         held = holidays.get(zone) is not None
         before = None if (active or held) else _target_of(client, zone)
+        with _sync_lock:
+            _program_disagrees.discard(zone)  # this push decides it afresh
         try:
             toggle(zone, active)
         except HearthError as exc:
@@ -1925,6 +1930,8 @@ def _verify_program(client: HearthClient, zone: str, active: bool) -> bool:
             "zone %s program still reads %s after %d corrections today; giving up until the "
             "schedule is changed", zone, "on" if held else "off", _PROGRAM_CORRECTIONS_PER_DAY,
         )
+        with _sync_lock:
+            _program_disagrees.add(zone)
         return True
     _sched_log.warning("zone %s program read-back mismatch: hub has it %s", zone, "on" if held else "off")
     return False
@@ -1934,9 +1941,11 @@ def _check_program_drift(client: HearthClient) -> None:
     """At most every _DRIFT_CHECK_EVERY seconds, read each synced zone's
     program state from the hub and queue a push for any that no longer
     matches the app (live 2026-11-26 the hub had every program on while the
-    app had them all off). Zones being pushed, not synced, or with a holiday
-    hold recorded are left alone; a zone that cannot be read is tried next
-    time."""
+    app had them all off). A zone shown as "disagrees" (corrections given up
+    for the day) goes back to "synced" once the hub agrees, and is corrected
+    again once the daily cap allows. Zones being pushed, not settled, or with
+    a holiday hold recorded are left alone; a zone that cannot be read is
+    tried next time."""
     global _last_drift_check
     read = getattr(client, "read_program_active", None)
     if read is None:
@@ -1950,9 +1959,11 @@ def _check_program_drift(client: HearthClient) -> None:
         if active is None:
             continue
         with _sync_lock:
-            if (zone in _sync_running or sync.get(zone) != "synced"
-                    or not _program_corrections_left(zone)):
+            status = sync.get(zone)
+            if zone in _sync_running or status not in ("synced", "disagrees"):
                 continue
+            if status == "synced" and not _program_corrections_left(zone):
+                continue  # capped for today: nothing to do even if it drifted
             gen = _sync_gen.get(zone, 0)
         if holidays.get(zone) is not None:
             continue
@@ -1961,13 +1972,19 @@ def _check_program_drift(client: HearthClient) -> None:
         except HearthError as exc:
             _sched_log.info("zone %s program drift check skipped: %s", zone, exc)
             continue
-        if held is None or held == active:
+        if held is None:
             continue
         with _sync_lock:
             # A push that ran while we read (the user's change) has settled it.
             if (_sync_gen.get(zone, 0) != gen or zone in _sync_running
-                    or sync.get(zone) != "synced" or schedules.get_active(zone) != active
-                    or not _program_corrections_left(zone)):
+                    or sync.get(zone) != status or schedules.get_active(zone) != active):
+                continue
+            if held == active:
+                if status == "disagrees":  # the radiator has come round
+                    _program_disagrees.discard(zone)
+                    sync.set(zone, "synced")
+                continue
+            if not _program_corrections_left(zone):
                 continue
             _program_corrections[zone].append(_monotonic())
             sync.set(zone, "pending")  # the retry loop pushes pending zones at once
@@ -2017,7 +2034,10 @@ def _sync_until_settled(client: HearthClient, zone: str) -> None:
                 if _sync_gen.get(zone, 0) == gen:  # nothing changed while pushing
                     _sync_running.discard(zone)
                     _note_sync_result(zone, ok)
-                    sync.set(zone, "synced" if ok else "failed")
+                    if not ok:
+                        sync.set(zone, "failed")
+                    else:
+                        sync.set(zone, "disagrees" if zone in _program_disagrees else "synced")
                     return
     except Exception:  # noqa: BLE001 - never leave the zone stuck on "pending"
         _sched_log.exception("zone %s schedule sync crashed", zone)
@@ -2389,7 +2409,7 @@ def schedule_sync_status(request: Request, zone_id: str) -> HTMLResponse:
     return templates.TemplateResponse(
         request,
         "_sync_status.html",
-        {"zone_id": zone_id, "sync": sync.get(zone_id)},
+        {"zone_id": zone_id, "sync": sync.get(zone_id), "active": schedules.get_active(zone_id)},
     )
 
 

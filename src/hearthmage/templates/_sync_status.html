@@ -9,5 +9,8 @@
   {% elif sync == 'failed' %}
     <span class="sync-dot" aria-hidden="true"></span>
     Saved here, but the radiator didn&rsquo;t answer. The app keeps retrying, less often the longer it stays silent (at most every 30 minutes).
+  {% elif sync == 'disagrees' %}
+    <span class="sync-dot" aria-hidden="true"></span>
+    Saved here, but the radiator keeps its weekly program {{ 'off' if active else 'on' }}. The app has stopped switching it for today and tries again tomorrow, or as soon as you change this schedule.
   {% endif %}
 </div>

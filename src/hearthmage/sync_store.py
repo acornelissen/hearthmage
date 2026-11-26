@@ -3,7 +3,9 @@
 A schedule or program push to the hub can fail (the radiator is asleep on RF).
 That state used to live in an in-memory dict, so a failed push was forgotten on
 restart and never retried. This persists the per-zone status
-(``pending`` | ``synced`` | ``failed``) so the app can show it after a restart
+(``pending`` | ``synced`` | ``failed`` | ``disagrees``: pushed, but the
+radiator will not keep the program on/off and the app has stopped correcting
+it for the day; settled, not retried) so the app can show it after a restart
 and a background task can re-push the ``failed`` zones from the schedule store
 (the source of truth) once the radiator is reachable again.
 """

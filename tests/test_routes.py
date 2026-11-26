@@ -1860,6 +1860,7 @@ def _with_store(tmp_path, monkeypatch):
     # The sync checks holiday records: never the developer's real ones.
     monkeypatch.setattr(appmod, "holidays", HolidayStore(str(tmp_path / "holiday.json")))
     monkeypatch.setattr(appmod, "_program_corrections", {})
+    monkeypatch.setattr(appmod, "_program_disagrees", set())
     monkeypatch.setattr(appmod, "_last_drift_check", None)
     monkeypatch.setattr(appmod, "_PROGRAM_VERIFY_PAUSE", 0)
     return appmod
@@ -3942,3 +3943,57 @@ def test_names_that_normalise_to_the_same_zone_are_a_form_error(tmp_path, monkey
     assert resp.status_code == 400
     assert "twice" in resp.text
     assert appmod.settings.zone_names == {}
+
+
+# ---- a radiator that will not keep the program state (heatapp-local-dgp) ----
+
+
+def _give_up_on_zone_1(appmod, monkeypatch):
+    """Drive the retry loop until it stops correcting a stubborn zone 1."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(appmod, "_monotonic", lambda: clock["now"])
+    appmod.schedules.set_active("1", False)
+    appmod.sync.set("1", "failed")
+    stubborn = _one_room(_StubbornProgram)
+    for _ in range(appmod._PROGRAM_CORRECTIONS_PER_DAY + 1):
+        appmod._retry_failed_syncs(stubborn)
+        clock["now"] += appmod._RETRY_MAX_WAIT + 1
+    return clock, stubborn
+
+
+def test_a_zone_given_up_on_is_shown_as_disagreeing_not_synced(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    _give_up_on_zone_1(appmod, monkeypatch)
+    assert appmod.sync.get("1") == "disagrees"
+    assert "1" not in appmod.sync.unsettled_zones()  # the retry loop leaves it alone
+
+
+def test_the_drift_check_clears_disagreeing_once_the_hub_agrees(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    _give_up_on_zone_1(appmod, monkeypatch)
+    hub = _room_fake()
+    hub.program_active["1"] = False  # the radiator now keeps it off
+    appmod._check_program_drift(hub)
+    assert appmod.sync.get("1") == "synced"
+
+
+def test_a_disagreeing_zone_is_tried_again_the_next_day(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    clock, stubborn = _give_up_on_zone_1(appmod, monkeypatch)
+    appmod._check_program_drift(stubborn)  # still capped today
+    assert appmod.sync.get("1") == "disagrees"
+    clock["now"] += 86400 + appmod._DRIFT_CHECK_EVERY
+    appmod._check_program_drift(stubborn)
+    assert appmod.sync.get("1") == "pending"
+
+
+def test_the_schedule_page_says_which_way_the_radiator_disagrees(client, tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_active("1", False)
+    appmod.sync.set("1", "disagrees")
+    for url in ("/zones/1/schedule", "/zones/1/schedule/sync"):
+        text = client.get(url).text
+        assert "keeps its weekly program on" in text
+        assert "Sent to the hub" not in text
+    appmod.schedules.set_active("1", True)
+    assert "keeps its weekly program off" in client.get("/zones/1/schedule/sync").text
