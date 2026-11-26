@@ -198,9 +198,9 @@ R#<zone>#1#0#0*?F/  ->  OK,14,9,5,21,19,17,6,11,69,0,0,0,0,1,0,44,244,0,33,v2001
 
 Live on all four zones 2026-11-01. Fields after `OK`: `[1],[2]` room temperature
 whole/tenths and `[3]` setpoint (same as `*?T`), `[4..6]` the radiator's clock
-`HH,MM,SS`, `[7]` weekday (Mon=0; read 6 on a Sunday), `[8]` read `11` on all
-four (the app treats `> 11` as a feature/firmware threshold; also matches the
-month, so unconfirmed), last field a firmware string (`v200110`, `v200825`).
+`HH,MM,SS`, `[7]` weekday (Mon=0; read 6 on a Sunday, 3 on a Thursday), `[8]`
+the weekly program state (confirmed live 2026-11-26, see below), last field a
+firmware string (`v200110`, `v200825`).
 `[9]` and `[16..19]` vary per radiator and are unknown. The four clocks were
 within a minute of local time and already on GMT after the 2026-10-25 change.
 
@@ -263,6 +263,15 @@ zone's target). Two clients talking at once mix replies the same way (a probe's
 `*?E#0#9` got `OK,10` while the app polled that zone). Why the hub does this is
 not known (inferred: one shared reply buffer).
 
+An unread reply does the same (confirmed live 2026-11-26, zone 4, read-only):
+send `*?T`, drop it without reading, then send `*?E#1#20` (anti-ice, 7) on a
+fresh socket. Sent 0, 20 or 50 ms later it came back `OK,5` (the zone's
+setpoint, from the dropped `*?T`, in the `*?E` reply's shape) in 10 of 18
+tries; sent 100 ms, 250 ms or 1 s later it was right 18 of 18. A shifted reply
+can therefore have the right shape, which is why settings need two agreeing
+reads. A late reply can land just as a timeout fires, so this app restarts the
+quiet-gap clock on a timeout as well as on a reply.
+
 This app therefore waits 0.1 s after every reply before it sends again
 (`_HUB_QUIET_GAP`) and believes a setting only when two reads in a row agree
 (`_read_element_agreed`). Before that fix the settings page showed anti-ice 0
@@ -318,11 +327,14 @@ the `*RH` fields, and write handling. Other findings:
 - **Off.** The vendor sends `*T0` for off (`*T32` in Fahrenheit), and allows
   targets from 1 C. This app sends `*T1` (see "OFF and half degrees"). Either
   way the anti-ice temperature (`1#20`, 7 C) still applies.
-- **`*?F` field [8].** The vendor's resync treats `[8] > 11` as program off
-  and anything else as on. All four radiators read 11 while every program is
-  empty, and zone 1's program was switched off on 2026-10-28; `?RH` replies
-  carry the same `6,11` pair after the clock, which looks like weekday and
-  month. Unresolved; a supervised `*OFF`/`*ON` check would settle it.
+- **`*?F` field [8] is the program state (confirmed live 2026-11-26).** The
+  vendor's resync treats `[8] > 11` as program off and anything else as on.
+  Zone 4 (empty week) read `11`; after `*OFF` it read `253`, and after `*ON`
+  `11` again. `*OFF` also moved the setpoint from 5 to 7 (its old manual
+  value, inferred); `*ON` left it alone. Whether "on" is always `11` or is the
+  month (the test ran in November) is not settled, so read `253` as off and
+  anything else as on. All four radiators read `11` that day, so the hub had
+  every program on while this app recorded them all off.
 - **Hub identity.** The vendor accepts a hub only if `OPS1`'s idA/idB/IDU match
   the paired installation. This app connects its UDP socket to the hub's
   address, so replies from other hosts are dropped; it does not pin the IDU.

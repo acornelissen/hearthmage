@@ -112,6 +112,7 @@ STATUS_LABELS = {
     5: "Clock minute",
     6: "Clock second",
     7: "Weekday",
+    8: "Weekly program (253 = off, else on)",
 }
 _EXPECTED_TO_MOVE = {1, 2, 4, 5, 6}  # room temperature and the clock always change
 
