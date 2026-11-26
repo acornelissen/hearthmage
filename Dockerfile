@@ -2,9 +2,10 @@
 #
 # The app locates its templates and static files relative to the package
 # directory, so it must run from a real source tree. We install the package
-# editable from the copied source, which leaves those files in place while
-# still resolving the declared dependencies.
-FROM python:3.11-slim
+# editable from the copied source, which leaves those files in place. The
+# dependencies are installed separately from a hash-pinned lock.
+# Pinned by digest of the multi-arch index. Bump: docker buildx imagetools inspect python:3.11-slim
+FROM python:3.11-slim@sha256:61e01f72680f86a5279ad510818ab7b2ee9f049822589d4e34e33e044360356c
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -18,11 +19,17 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# Install first with just the metadata + source needed, for layer caching.
+# Dependencies come from the hash-pinned lock (regenerate with `mise run lock`),
+# so a build installs exactly the reviewed files or fails.
+COPY requirements.lock ./
+RUN pip install --no-cache-dir --require-hashes --only-binary :all: -r requirements.lock
+
+# Then the package itself, editable. No index and no build isolation: it builds
+# with the base image's setuptools and any network fetch fails the build.
 COPY pyproject.toml ./
 COPY src ./src
 COPY run.py ./
-RUN pip install --no-cache-dir -e ".[mqtt]"
+RUN PIP_NO_INDEX=1 pip install --no-cache-dir --no-deps --no-build-isolation -e .
 
 # Run as an unprivileged user; /data holds config, schedules, history, backups.
 RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin hearth \

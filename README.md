@@ -32,7 +32,10 @@ screenshots.
 2. Install dependencies: `pip install -e ".[dev]"` (add the `mqtt` extra —
    `pip install -e ".[dev,mqtt]"` — only if you want the Home Assistant bridge).
 3. Run the tests: `pytest`.
-4. Start it: `python run.py`, then open `http://<host>:8080/`.
+4. Dependency lock: `requirements.lock` pins every runtime and `mqtt` dependency
+   by hash and is what the Docker build installs. Regenerate it after changing
+   `pyproject.toml` with `mise run lock`; `mise run lock-check` fails if it has drifted.
+5. Start it: `python run.py`, then open `http://<host>:8080/`.
 
 ### First run
 

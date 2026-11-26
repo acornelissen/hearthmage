@@ -1,5 +1,20 @@
 [tools]
 python = "3.11"
+uv = "0.13.9"
 
 [env]
 _.python.venv = { path = ".venv", create = true }
+
+[tasks.lock]
+description = "Regenerate the hash-pinned requirements.lock (runtime deps + mqtt extra)"
+run = "uv pip compile pyproject.toml --extra mqtt --generate-hashes --python-version 3.11 --python-platform x86_64-manylinux_2_28 -o requirements.lock"
+
+[tasks.lock-check]
+description = "Fail if requirements.lock is out of date with pyproject.toml"
+shell = "bash -c"
+run = """
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+uv pip compile pyproject.toml --extra mqtt --generate-hashes --python-version 3.11 --python-platform x86_64-manylinux_2_28 -o "$tmp" -q
+diff <(grep -v '^#    uv pip compile' requirements.lock) <(grep -v '^#    uv pip compile' "$tmp")
+"""
