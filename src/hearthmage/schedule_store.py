@@ -116,9 +116,16 @@ def _clean_data(data: object) -> dict:
 class ScheduleStore:
     def __init__(self, path: str) -> None:
         self._path = path
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # reentrant: reload and callers that hold it
         self._data: dict[str, dict] = {}
         self._load()
+
+    def reload(self) -> None:
+        """Re-read the file into this same object, under its lock (after a
+        backup restore, so a racing save cannot write old data back)."""
+        with self._lock:
+            self._data = {}
+            self._load()
 
     def _load(self) -> None:
         if not os.path.exists(self._path):

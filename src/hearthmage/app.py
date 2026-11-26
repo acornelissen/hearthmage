@@ -23,6 +23,7 @@ from fastapi.responses import (
     Response,
 )
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
@@ -52,7 +53,13 @@ from hearthmage.schedule import (
     Block,
 )
 from hearthmage.schedule_store import ScheduleStore
-from hearthmage.settings import MqttPasswordReentry, Settings, config_path, parse_port
+from hearthmage.settings import (
+    InvalidSetting,
+    MqttPasswordReentry,
+    Settings,
+    config_path,
+    parse_port,
+)
 from hearthmage.sync_store import SyncStore
 from hearthmage.waste import WasteDetector, status_diff
 
@@ -485,6 +492,90 @@ def _same_origin(request: Request, host: str, port: int | None) -> bool:
         and origin_host[0] == host
         and (origin_host[1] or _DEFAULT_PORTS[origin_scheme]) == (port or _DEFAULT_PORTS[scheme])
     )
+
+
+_UPLOAD_PATH = "/settings/import"
+_MAX_IMPORT_BYTES = 1024 * 1024  # a real export is a few KB
+_MAX_IMPORT_BODY = _MAX_IMPORT_BYTES + 64 * 1024  # plus multipart framing
+_MAX_FORM_BODY = 64 * 1024  # the largest real form is a few KB
+_IMPORT_TOO_LARGE = "That file is too large to be a HearthMage backup."
+
+
+class _UploadCap:
+    """Pure ASGI guard on request body size. Starlette parses and spools a whole
+    body before a route runs, so a route cannot bound it. Every POST is capped
+    at 64 KiB, the backup upload at 1 MiB plus multipart framing. A Content-Length
+    over the cap is refused up front; the body bytes are also counted as they
+    arrive, for a chunked or understated length. When the count trips, the app is
+    fed a disconnect, anything it then tries to send is dropped (FastAPI would
+    answer with a JSON 400) and this answers 413 itself, unless the app had
+    already started a response. Added before ``_security`` so the host, origin
+    and session checks run first, and the security headers (added after, hence
+    outside) still reach the 413."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def _refuse(self, scope, send) -> None:
+        async def no_body():
+            return {"type": "http.disconnect"}
+
+        if scope["path"] == _UPLOAD_PATH:
+            # The settings page with the error, so the user sees what happened.
+            request = Request(scope, no_body)
+            response = await run_in_threadpool(
+                _settings_response, request, {"import_error": _IMPORT_TOO_LARGE}, 413
+            )
+        else:
+            response = PlainTextResponse("That request is too large.", status_code=413)
+        await response(scope, no_body, send)
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or scope["method"] != "POST":
+            await self.app(scope, receive, send)
+            return
+        limit = _MAX_IMPORT_BODY if scope["path"] == _UPLOAD_PATH else _MAX_FORM_BODY
+        for name, value in scope["headers"]:
+            if name == b"content-length":
+                try:
+                    too_big = int(value) > limit
+                except ValueError:
+                    too_big = True
+                if too_big:
+                    await self._refuse(scope, send)
+                    return
+        received = 0
+        tripped = False
+        started = False
+
+        async def counted():
+            nonlocal received, tripped
+            if tripped:
+                return {"type": "http.disconnect"}
+            message = await receive()
+            received += len(message.get("body", b""))
+            if received > limit:
+                tripped = True
+                return {"type": "http.disconnect"}
+            return message
+
+        async def tracked(message):
+            nonlocal started
+            if tripped:
+                return  # the app's answer to a body it never fully got
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        try:
+            await self.app(scope, counted, tracked)
+        except Exception:
+            if not tripped:
+                raise
+        if tripped and not started:
+            await self._refuse(scope, send)
+
+
+app.add_middleware(_UploadCap)
 
 
 @app.middleware("http")
@@ -962,6 +1053,9 @@ def _off_lan_warning(address: str) -> str:
     )
 
 
+_mqtt_default_topic = "hearthmage"
+
+
 def _settings_response(
     request: Request, form: dict | None = None, status_code: int = 200
 ) -> HTMLResponse:
@@ -969,12 +1063,16 @@ def _settings_response(
     values the user typed (never the password) plus the field's error
     (``hub_ip_error``, ``hub_port_error``, ``mqtt_host_error``, ``mqtt_error``).
     A stored address off the LAN gets a standing warning on its field."""
+    form = form or {}
     rooms: list = []
     if settings.is_configured():
         try:
             rooms, _ = _safe_rooms(get_client())
         except NotConfigured:
             rooms = []
+    listed = {f"name_{room.id}" for room in rooms}
+    other_name_errors = [m for k, m in form.get("name_errors", {}).items() if k not in listed]
+    rejected_topic = settings.mqtt_base_topic_rejected
     return templates.TemplateResponse(
         request,
         "settings.html",
@@ -988,11 +1086,16 @@ def _settings_response(
             "hub_ready": settings.is_configured(),
             "hub_ip_error": None if settings.hub_ip_on_lan else _off_lan_warning(settings.hub_ip),
             **_mqtt_view(),
+            "mqtt_base_topic_error": None if rejected_topic is None else (
+                f"The saved base topic {rejected_topic} is not valid, so HearthMage uses "
+                f"{_mqtt_default_topic}. Enter a valid base topic."
+            ),
+            "name_other_errors": other_name_errors,
             "mqtt_host_error": (
                 None if settings.mqtt_host_on_lan
                 else _off_lan_warning(settings.mqtt_config()["host"])
             ),
-            **(form or {}),
+            **form,
         },
         status_code=status_code,
     )
@@ -1042,6 +1145,19 @@ def save_mqtt(
                 "mqtt_base_topic": base_topic,
                 "mqtt_host_error": str(exc),
                 "focus": "mqtt_host",
+            },
+            status_code=400,
+        )
+    except InvalidSetting as exc:
+        return _settings_response(
+            request,
+            {
+                "mqtt_host": host,
+                "mqtt_port": port_num,
+                "mqtt_username": username.strip(),
+                "mqtt_base_topic": base_topic,
+                "mqtt_base_topic_error": str(exc),
+                "focus": "mqtt_base_topic",
             },
             status_code=400,
         )
@@ -1104,11 +1220,23 @@ def save_hub(
 
 
 @app.post("/settings/names")
-async def save_names(request: Request) -> RedirectResponse:
+async def save_names(request: Request) -> Response:
     form = await request.form()
+    names: dict[str, str] = {}
     for key, value in form.items():
-        if key.startswith("name_"):
-            settings.set_zone_name(key[len("name_"):], str(value))
+        zone_id = key[len("name_"):]
+        if key.startswith("name_") and zone_id.isascii() and zone_id.isdigit():
+            names[zone_id] = str(value)  # any other name_* field is not ours; keys are checked below
+    try:
+        settings.set_zone_names(names)  # one save, one backup snapshot
+    except InvalidSetting as exc:
+        # Nothing was saved. Show what was typed and mark the field.
+        return await run_in_threadpool(
+            _settings_response,
+            request,
+            {"name_values": names, "name_errors": {exc.field: str(exc)}, "focus": exc.field},
+            400,
+        )
     set_names = getattr(_client, "set_names", None)
     if set_names is not None:
         set_names(settings.zone_names)
@@ -1171,37 +1299,57 @@ def export_backup() -> Response:
     )
 
 
+_IMPORT_CHUNK = 64 * 1024
+
+
+async def _read_capped(upload: UploadFile, limit: int) -> bytes | None:
+    """The upload's bytes, or None if it is longer than ``limit``. Reads in
+    chunks and never more than ``limit + 1`` bytes in total."""
+    chunks: list[bytes] = []
+    remaining = limit + 1
+    while remaining > 0:
+        chunk = await upload.read(min(_IMPORT_CHUNK, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    return None if len(data) > limit else data
+
+
+def _restore_upload(raw: bytes) -> str | None:
+    """Restore the bundle and reload the live stores; the error text, or None.
+    Holds both stores' locks across restore and reload, and reloads the same
+    objects in place: a save already running on either one finishes first and a
+    later one writes the restored data, so nothing overwrites the import.
+    Blocking file work: call it from a worker thread."""
+    with settings._lock, schedules._lock:
+        try:
+            bundle = json.loads(raw.decode("utf-8"))
+            restore_bundle(bundle, settings.config_file, settings.schedules_path)
+        except AddressRejected:
+            return ("That backup was not restored: its hub or broker address is not "
+                    "on your local network.")
+        except InvalidSetting as exc:
+            return f"That backup was not restored: {exc}"
+        except (ValueError, UnicodeDecodeError):
+            return "That file is not a valid HearthMage backup."
+        settings.reload()
+        schedules.reload()
+    return None
+
+
 @app.post("/settings/import")
 async def import_backup(request: Request, backup: UploadFile = File(...)) -> Response:
     """Restore a previously exported bundle, then reload the live stores."""
-    global settings, schedules
-    raw = await backup.read()
-    error = None
-    try:
-        bundle = json.loads(raw.decode("utf-8"))
-        restore_bundle(bundle, settings.config_file, settings.schedules_path)
-    except AddressRejected:
-        error = ("That backup was not restored: its hub or broker address is not "
-                 "on your local network.")
-    except (ValueError, UnicodeDecodeError):
-        error = "That file is not a valid HearthMage backup."
+    raw = await _read_capped(backup, _MAX_IMPORT_BYTES)
+    if raw is None:
+        error = _IMPORT_TOO_LARGE
+    else:
+        error = await run_in_threadpool(_restore_upload, raw)
     if error:
-        return templates.TemplateResponse(
-            request,
-            "settings.html",
-            {
-                "hub_ip": settings.hub_ip,
-                "hub_port": settings.hub_port,
-                "rooms": [],
-                "import_error": error,
-            },
-            status_code=400,
-        )
-    # Rebuild the in-memory views from the restored files and drop the client so
-    # the next request rebuilds it against the (possibly new) hub. Reload from the
-    # same path we wrote, not the default, so a relocated config file is honoured.
-    settings = Settings(settings.config_file)
-    schedules = ScheduleStore(settings.schedules_path)
+        return await run_in_threadpool(_settings_response, request, {"import_error": error}, 400)
+    # Drop the client so the next request rebuilds it against the (possibly new) hub.
     _drop_client()
     # The restored schedules are now the source of truth: queue every zone for
     # the retry loop to push (it resolves the rebuilt client itself).
@@ -1493,12 +1641,25 @@ def _zone_energy_view(room, price: float) -> dict:
 @app.get("/energy", response_class=HTMLResponse)
 def energy_page(request: Request, client: HearthClient = Depends(get_client)) -> HTMLResponse:
     rooms, error = _safe_rooms(client)
+    return _energy_response(request, client, rooms, error)
+
+
+def _energy_response(
+    request: Request,
+    client: HearthClient | None,
+    rooms: list,
+    error: str | None,
+    form: dict | None = None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    """The energy page. ``form`` re-shows a rejected price form (``price_input``,
+    ``price_error``). Without a ``client`` no refresh is started."""
     price = settings.price_per_kwh
     zones = [_zone_energy_view(r, price) for r in rooms]
     home_today = sum(z["today_kwh"] for z in zones if z["has_data"])
     home_week = sum(z["week_kwh"] for z in zones if z["has_data"])
     # Kick off a background refresh so the next visit reflects awake radiators.
-    if rooms:
+    if rooms and client is not None:
         threading.Thread(
             target=_refresh_energy,
             args=(client, [r.id for r in rooms]),
@@ -1516,13 +1677,24 @@ def energy_page(request: Request, client: HearthClient = Depends(get_client)) ->
             "home_week_kwh": home_week,
             "home_today_cost": cost(home_today, price),
             "home_week_cost": cost(home_week, price),
+            **(form or {}),
         },
+        status_code=status_code,
     )
 
 
 @app.post("/settings/price")
-def save_price(price_per_kwh: float = Form(...)) -> RedirectResponse:
-    settings.set_price(price_per_kwh)
+def save_price(request: Request, price_per_kwh: str = Form("")) -> Response:
+    # str, then parsed: a stray value must not 422 (nan and inf parse as floats)
+    try:
+        settings.set_price(price_per_kwh.strip())
+    except InvalidSetting as exc:
+        try:
+            rooms, error = _safe_rooms(get_client())
+        except NotConfigured:
+            rooms, error = [], None
+        form = {"price_input": price_per_kwh, "price_error": str(exc)}
+        return _energy_response(request, None, rooms, error, form, status_code=400)
     return RedirectResponse("/energy", status_code=303)
 
 

@@ -1657,7 +1657,8 @@ def test_import_restores_and_reloads(tmp_path, monkeypatch):
 
 
 def test_import_rejects_foreign_file(tmp_path, monkeypatch):
-    _configured(tmp_path, monkeypatch)
+    appmod = _configured(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())  # the 400 page lists rooms
     resp = TestClient(app).post(
         "/settings/import",
         files={"backup": ("junk.json", '{"not":"a bundle"}', "application/json")},
@@ -2007,7 +2008,10 @@ def test_import_backup_queues_restored_schedules_for_the_hub(client, tmp_path, m
     from hearthmage.settings import Settings
     from hearthmage.sync_store import SyncStore
 
+    from hearthmage.schedule_store import ScheduleStore
+
     monkeypatch.setattr(appmod, "settings", Settings(str(tmp_path / "c.json"), env={}))
+    monkeypatch.setattr(appmod, "schedules", ScheduleStore(str(tmp_path / "schedules.json")))
     monkeypatch.setattr(appmod, "sync", SyncStore(str(tmp_path / "sync.json")))
     bundle = {"hearthmage_backup": 1, "schedules": {"1": {"0": [[20, 420, 540]]}}}
     resp = client.post(
@@ -2916,6 +2920,7 @@ def test_settings_page_warns_about_a_stored_broker_off_the_lan(tmp_path, monkeyp
 )
 def test_import_with_an_address_off_the_lan_is_rejected(tmp_path, monkeypatch, config):
     appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())  # the 400 page lists rooms
     appmod.settings.set_hub("10.0.0.20", 6653)
     before = (tmp_path / "c.json").read_text()
     bundle = {"hearthmage_backup": 1, "config": config}
@@ -3074,3 +3079,339 @@ def test_a_schedule_push_cut_off_by_a_client_swap_goes_to_the_new_client(tmp_pat
     appmod._sync_until_settled(Stopped(_room_fake().list_rooms()), "1")
     assert current.applied and appmod.sync.get("1") == "synced"
     assert "1" not in appmod._sync_backoff
+
+# ---- names, topic, price and import hardening ---------------------------
+
+
+def test_save_names_makes_one_snapshot_and_ignores_other_keys(tmp_path, monkeypatch):
+    from hearthmage.backups import list_backups
+
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    appmod.settings.set_hub("10.0.0.20", 6653)
+    before = len(list_backups(appmod.settings.config_file))
+    data = {f"name_{i}": f"Room {i}" for i in range(1, 8)}
+    data.update({"name_../x": "bad", "other": "x", "name_": "x", "name_1a": "x"})
+    resp = TestClient(app).post("/settings/names", data=data, follow_redirects=False)
+    assert resp.status_code == 303
+    assert appmod.settings.zone_names == {str(i): f"Room {i}" for i in range(1, 8)}
+    assert len(list_backups(appmod.settings.config_file)) == before + 1
+
+
+def test_save_names_too_long_shows_an_accessible_error_and_saves_nothing(tmp_path, monkeypatch):
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())
+    appmod.settings.set_hub("10.0.0.20", 6653)
+    resp = TestClient(app).post(
+        "/settings/names", data={"name_1": "x" * 41, "name_2": "Hall"}, follow_redirects=False
+    )
+    assert resp.status_code == 400
+    assert 'id="name_1_error" role="alert"' in resp.text
+    assert 'aria-describedby="name_1_error"' in resp.text
+    assert "longer than 40 characters" in resp.text
+    assert appmod.settings.zone_names == {}
+
+
+def test_save_mqtt_bad_base_topic_shows_an_accessible_error_and_saves_nothing(tmp_path, monkeypatch):
+    appmod, restarts = _mqtt_env(tmp_path, monkeypatch)
+    resp = TestClient(app).post(
+        "/settings/mqtt",
+        data={"host": "10.0.0.5", "port": "1883", "base_topic": "home/#"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert 'id="mqtt_base_topic_error" role="alert"' in resp.text
+    assert 'aria-describedby="mqtt_base_topic_error"' in resp.text
+    assert 'value="home/#"' in resp.text
+    assert not restarts
+    assert not appmod.settings.mqtt_enabled
+
+
+@pytest.mark.parametrize("price", ["-1", "nan", "inf", "abc", ""])
+def test_save_price_rejects_bad_values_with_a_form_error(client, tmp_path, monkeypatch, price):
+    appmod = _with_energy(tmp_path, monkeypatch)
+    appmod.settings.set_price(0.2)
+    resp = client.post("/settings/price", data={"price_per_kwh": price}, follow_redirects=False)
+    assert resp.status_code == 400
+    assert 'id="price_per_kwh_error" role="alert"' in resp.text
+    assert 'aria-describedby="price_per_kwh_error"' in resp.text
+    assert appmod.settings.price_per_kwh == 0.2
+
+
+def _import(bundle_bytes):
+    return TestClient(app).post(
+        "/settings/import",
+        files={"backup": ("b.json", bundle_bytes, "application/json")},
+        follow_redirects=False,
+    )
+
+
+def test_failed_import_renders_the_normal_settings_page(tmp_path, monkeypatch):
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch, env={"HEARTHMAGE_PASSWORD": "pw"})
+    appmod.settings.set_hub("10.0.0.20", 6653)
+    appmod.settings.set_mqtt("10.0.0.5", 1883, "hearth", "clear", "", base_topic="home/heat")
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())
+    cookie = TestClient(app).post("/login", data={"password": "pw"}, follow_redirects=False)
+    c = TestClient(app, cookies=cookie.cookies)
+    resp = c.post(
+        "/settings/import",
+        files={"backup": ("b.json", b"{}", "application/json")},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert "not a valid HearthMage backup" in resp.text
+    assert "no password set" not in resp.text  # auth state is right
+    assert 'value="10.0.0.5"' in resp.text  # MQTT fields are filled in
+    assert 'value="home/heat"' in resp.text
+    assert "Room names" in resp.text  # rooms are listed
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"mqtt": {"host": "10.0.0.5", "base_topic": "a/#"}},
+        {"zone_names": {"1": "x" * 41}},
+        {"zone_names": {"abc": "x"}},
+        {"price_per_kwh": -3},
+        {"price_per_kwh": float("inf")},
+    ],
+)
+def test_import_rejects_bad_topic_names_and_price(tmp_path, monkeypatch, config):
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())  # no real hub
+    appmod.settings.set_hub("10.0.0.20", 6653)
+    before = (tmp_path / "c.json").read_text()
+    body = json.dumps({"hearthmage_backup": 1, "config": config}).encode()
+    resp = _import(body)
+    assert resp.status_code == 400
+    assert 'role="alert"' in resp.text
+    assert (tmp_path / "c.json").read_text() == before
+
+
+def test_import_holds_the_old_settings_lock_while_it_restores_and_swaps(tmp_path, monkeypatch):
+    import threading
+
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())  # no real hub
+    old = appmod.settings
+    old.set_hub("10.0.0.20", 6653)
+    seen: list[bool] = []
+
+    def spy(bundle, config, schedules):
+        # A thread that wants the old lock must block while the import runs.
+        got: list[bool] = []
+        t = threading.Thread(target=lambda: got.append(old._lock.acquire(timeout=0.2)))
+        t.start()
+        t.join()
+        seen.append(got[0])
+        if got[0]:
+            old._lock.release()
+        raise ValueError("stop here")
+
+    monkeypatch.setattr(appmod, "restore_bundle", spy)
+    _import(b'{"hearthmage_backup": 1}')
+    assert seen == [False]
+
+
+def test_import_over_one_mebibyte_is_rejected_without_reading_it_all(tmp_path, monkeypatch):
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())
+    appmod.settings.set_hub("10.0.0.20", 6653)
+    before = (tmp_path / "c.json").read_text()
+    resp = _import(b" " * (1024 * 1024 + 1))
+    assert resp.status_code == 400
+    assert "That file is too large to be a HearthMage backup." in resp.text
+    assert (tmp_path / "c.json").read_text() == before
+
+
+def test_import_reads_at_most_the_limit_plus_one_byte(tmp_path, monkeypatch):
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())
+
+    class Upload:
+        total = 0
+
+        async def read(self, size=-1):
+            assert size > 0, "must read in chunks"
+            self.total += size
+            return b"x" * size
+
+    upload = Upload()
+
+    async def run():
+        from starlette.requests import Request
+
+        scope = {"type": "http", "method": "POST", "path": "/settings/import", "headers": [],
+                 "query_string": b"", "server": ("testserver", 80), "scheme": "http"}
+        return await appmod.import_backup(Request(scope), upload)
+
+    import asyncio
+
+    resp = asyncio.run(run())
+    assert resp.status_code == 400
+    assert upload.total == 1024 * 1024 + 1
+
+
+def test_a_real_export_is_far_below_the_upload_limit(tmp_path, monkeypatch):
+    appmod = _configured(tmp_path, monkeypatch)
+    body = TestClient(app).get("/settings/export").content
+    assert len(body) < 64 * 1024
+
+
+# ---- review round -------------------------------------------------------
+
+
+
+def test_import_with_a_huge_content_length_gets_the_settings_page_at_413(tmp_path, monkeypatch):
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())
+    resp = TestClient(app).post(
+        "/settings/import",
+        files={"backup": ("b.json", b" " * (2 * 1024 * 1024), "application/json")},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 413
+    assert "Content-Security-Policy" in resp.headers
+    assert "That file is too large to be a HearthMage backup." in resp.text
+    assert 'aria-describedby="import_error"' in resp.text
+
+
+@pytest.mark.parametrize("path", ["/settings/price", "/settings/names"])
+def test_other_posts_are_capped_at_64_kib(tmp_path, monkeypatch, path):
+    _mqtt_env(tmp_path, monkeypatch)
+    resp = TestClient(app).post(path, content=b"name_1=" + b"A" * (70 * 1024),
+                                headers={"content-type": "application/x-www-form-urlencoded"})
+    assert resp.status_code == 413
+    assert "Content-Security-Policy" in resp.headers
+
+
+def _drive_cap(path, chunk_size=65536, content_length=None):
+    """Run _UploadCap over an app that reads the whole body, feeding endless
+    chunks. Returns (sent messages, chunks read, inner app finished)."""
+    import asyncio
+
+    import hearthmage.app as appmod
+
+    state = {"chunks": 0, "inner_done": False}
+
+    async def inner(scope, receive, send):
+        # Like FastAPI: a body error becomes its own 400 response.
+        try:
+            while True:
+                msg = await receive()
+                if msg["type"] == "http.disconnect":
+                    raise RuntimeError("client disconnected")
+                if not msg.get("more_body"):
+                    break
+        except RuntimeError:
+            await send({"type": "http.response.start", "status": 400, "headers": []})
+            await send({"type": "http.response.body", "body": b"parse error"})
+        state["inner_done"] = True
+
+    async def receive():
+        state["chunks"] += 1
+        if state["chunks"] > 10_000:
+            raise AssertionError("kept feeding the app")
+        return {"type": "http.request", "body": b"x" * chunk_size, "more_body": True}
+
+    sent: list = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    headers = [] if content_length is None else [(b"content-length", content_length)]
+    scope = {"type": "http", "method": "POST", "path": path, "headers": headers}
+    asyncio.run(appmod._UploadCap(inner)(scope, receive, send))
+    return sent, state
+
+
+def test_cap_trip_mid_body_answers_413_not_the_apps_parse_error():
+    sent, state = _drive_cap("/settings/price")
+    assert [m["status"] for m in sent if m["type"] == "http.response.start"] == [413]
+    assert state["chunks"] * 65536 <= 2 * 65536 + 65536
+
+
+def test_cap_ignores_get_requests():
+    import asyncio
+
+    import hearthmage.app as appmod
+
+    seen = []
+
+    async def inner(scope, receive, send):
+        seen.append(await receive())
+
+    async def receive():
+        return {"type": "http.request", "body": b"x" * (200 * 1024), "more_body": False}
+
+    scope = {"type": "http", "method": "GET", "path": "/", "headers": []}
+    asyncio.run(appmod._UploadCap(inner)(scope, receive, lambda m: None))
+    assert seen
+
+
+def test_names_form_for_many_zones_is_far_below_the_cap():
+    body = "&".join(f"name_{i}={'x' * 40}" for i in range(1, 1000))
+    assert len(body) < 64 * 1024
+
+
+def test_import_with_a_surrogate_name_is_rejected_and_settings_still_renders(tmp_path, monkeypatch):
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())
+    appmod.settings.set_hub("10.0.0.20", 6653)
+    body = b'{"hearthmage_backup": 1, "config": {"zone_names": {"1": "\\ud800"}}}'
+    resp = _import(body)
+    assert resp.status_code == 400
+    assert TestClient(app).get("/settings").status_code == 200
+
+
+def test_import_error_names_the_field_and_the_file_input_points_at_it(tmp_path, monkeypatch):
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())
+    body = json.dumps({"hearthmage_backup": 1, "config": {"zone_names": {"3": "x" * 41}}}).encode()
+    resp = _import(body)
+    assert resp.status_code == 400
+    assert "Zone 3" in resp.text and "40 characters" in resp.text
+    assert 'id="import_error"' in resp.text
+    assert 'aria-describedby="import_error"' in resp.text
+
+
+def test_import_writes_stripped_names_to_disk(tmp_path, monkeypatch):
+    appmod = _configured(tmp_path, monkeypatch)
+    body = json.dumps({"hearthmage_backup": 1, "config": {"zone_names": {"1": "  Kitchen  "}}}).encode()
+    assert _import(body).status_code == 303
+    assert json.loads((tmp_path / "config.json").read_text())["zone_names"] == {"1": "Kitchen"}
+
+
+def test_a_name_error_for_a_zone_the_page_does_not_list_still_shows(tmp_path, monkeypatch):
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())
+    appmod.settings.set_hub("10.0.0.20", 6653)
+    resp = TestClient(app).post("/settings/names", data={"name_99": "x" * 41}, follow_redirects=False)
+    assert resp.status_code == 400
+    assert "Zone 99" in resp.text
+    assert 'role="alert"' in resp.text
+
+
+def test_settings_page_warns_about_a_stored_bad_base_topic(tmp_path, monkeypatch):
+    (tmp_path / "c.json").write_text('{"mqtt": {"host": "10.0.0.5", "base_topic": "a/#"}}')
+    _mqtt_env(tmp_path, monkeypatch)
+    resp = TestClient(app).get("/settings")
+    assert resp.status_code == 200
+    assert 'id="mqtt_base_topic_error" role="alert"' in resp.text
+    assert "a/#" in resp.text
+
+
+def test_save_price_over_the_cap_is_a_form_error(client, tmp_path, monkeypatch):
+    _with_energy(tmp_path, monkeypatch)
+    resp = client.post("/settings/price", data={"price_per_kwh": "101"}, follow_redirects=False)
+    assert resp.status_code == 400
+
+
+def test_names_that_normalise_to_the_same_zone_are_a_form_error(tmp_path, monkeypatch):
+    appmod, _ = _mqtt_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(appmod, "get_client", lambda: FakeHearthClient())
+    appmod.settings.set_hub("10.0.0.20", 6653)
+    resp = TestClient(app).post("/settings/names", data={"name_1": "A", "name_01": "B"},
+                                follow_redirects=False)
+    assert resp.status_code == 400
+    assert "twice" in resp.text
+    assert appmod.settings.zone_names == {}

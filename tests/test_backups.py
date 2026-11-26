@@ -349,3 +349,60 @@ def test_restore_bundle_accepts_lan_addresses_and_unset_ones(tmp_path):
         restore_bundle({"hearthmage_backup": 1, "config": config},
                        str(cfg), str(tmp_path / "schedules.json"))
         assert json.loads(cfg.read_text()) == config
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"mqtt": {"host": "10.0.0.5", "base_topic": "a/#"}},
+        {"mqtt": {"host": "10.0.0.5", "base_topic": "/a"}},
+        {"mqtt": {"host": "10.0.0.5", "base_topic": 5}},
+        {"zone_names": {"1": "x" * 41}},
+        {"zone_names": {"1": "bad\x00"}},
+        {"zone_names": {"abc": "Kitchen"}},
+        {"zone_names": {"1": 5}},
+        {"zone_names": ["Kitchen"]},
+        {"price_per_kwh": -1},
+        {"price_per_kwh": float("inf")},
+        {"price_per_kwh": float("nan")},
+        {"price_per_kwh": "abc"},
+        {"price_per_kwh": True},
+    ],
+)
+def test_restore_rejects_bad_config_values_and_writes_nothing(tmp_path, config):
+    cfg, sched = tmp_path / "config.json", tmp_path / "schedules.json"
+    _write(cfg, {"hub_ip": "10.0.0.20"})
+    bundle = {"hearthmage_backup": 1, "config": config, "schedules": {"1": {"0": [[20, 0, 600]]}}}
+    with pytest.raises(ValueError):
+        restore_bundle(bundle, str(cfg), str(sched))
+    assert json.loads(cfg.read_text()) == {"hub_ip": "10.0.0.20"}
+    assert not sched.exists()
+
+
+def test_restore_accepts_good_topic_names_and_price(tmp_path):
+    cfg, sched = tmp_path / "config.json", tmp_path / "schedules.json"
+    config = {"mqtt": {"host": "10.0.0.5", "base_topic": "home/heat"},
+              "zone_names": {"1": "Kitchen"}, "price_per_kwh": 0.3}
+    restore_bundle({"hearthmage_backup": 1, "config": config}, str(cfg), str(sched))
+    assert json.loads(cfg.read_text())["zone_names"] == {"1": "Kitchen"}
+
+
+def test_restore_writes_the_validated_stripped_names(tmp_path):
+    cfg, sched = tmp_path / "config.json", tmp_path / "schedules.json"
+    config = {"zone_names": {"01": "  Kitchen  ", "2": "   "}}
+    restore_bundle({"hearthmage_backup": 1, "config": config}, str(cfg), str(sched))
+    assert json.loads(cfg.read_text())["zone_names"] == {"1": "Kitchen"}
+
+
+def test_restore_error_names_the_failing_zone(tmp_path):
+    config = {"zone_names": {"3": "x" * 41}}
+    with pytest.raises(ValueError, match="Zone 3"):
+        restore_bundle({"hearthmage_backup": 1, "config": config},
+                       str(tmp_path / "c.json"), str(tmp_path / "s.json"))
+
+
+def test_restore_rejects_a_lone_surrogate_name(tmp_path):
+    config = {"zone_names": {"1": "\ud800"}}
+    with pytest.raises(ValueError):
+        restore_bundle({"hearthmage_backup": 1, "config": config},
+                       str(tmp_path / "c.json"), str(tmp_path / "s.json"))

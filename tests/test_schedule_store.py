@@ -175,3 +175,15 @@ def test_replace_week_validates_before_writing(tmp_path):
     with pytest.raises(ValueError):
         store.replace_week("1", {0: [Block(99, 0, 600)]})
     assert store.get_zone("1") == {0: [Block(20, 0, 600)]}  # untouched
+
+
+def test_reload_rereads_the_file_in_place(tmp_path):
+    import json
+
+    from hearthmage.schedule_store import ScheduleStore
+
+    path = tmp_path / "s.json"
+    store = ScheduleStore(str(path))
+    path.write_text(json.dumps({"2": {"3": [[18, 60, 120]]}}))
+    store.reload()
+    assert store.get_day("2", 3)[0].target == 18

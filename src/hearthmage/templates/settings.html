@@ -82,6 +82,15 @@
       </form>
     </section>
 
+    {% if name_other_errors %}
+    <section class="panel">
+      <h2 class="panel-title">Room names</h2>
+      {% for message in name_other_errors %}
+      <p class="error" role="alert">{{ message }}</p>
+      {% endfor %}
+    </section>
+    {% endif %}
+
     {% if rooms %}
     <section class="panel">
       <h2 class="panel-title">Room names</h2>
@@ -92,7 +101,14 @@
           <div class="field">
             <label class="field-label" for="name_{{ room.id }}">Zone {{ room.id }}</label>
             <input class="field-input" id="name_{{ room.id }}" name="name_{{ room.id }}"
-                   value="{{ room.name }}" placeholder="Zone {{ room.id }}">
+                   value="{{ (name_values or {}).get(room.id, room.name) }}" placeholder="Zone {{ room.id }}"
+                   maxlength="40"
+                   {% set name_error = (name_errors or {}).get('name_' ~ room.id) %}
+                   {% if name_error %}aria-invalid="true" aria-describedby="name_{{ room.id }}_error"{% endif %}
+                   {% if focus == 'name_' ~ room.id %}autofocus{% endif %}>
+            {% if name_error %}
+            <p class="error" id="name_{{ room.id }}_error" role="alert">{{ name_error }}</p>
+            {% endif %}
           </div>
           {% endfor %}
         </div>
@@ -146,7 +162,12 @@
           <div class="field">
             <label class="field-label" for="mqtt_base_topic">Base topic</label>
             <input class="field-input" id="mqtt_base_topic" name="base_topic"
-                   value="{{ mqtt_base_topic or 'hearthmage' }}">
+                   value="{{ mqtt_base_topic or 'hearthmage' }}"
+                   {% if mqtt_base_topic_error %}aria-invalid="true" aria-describedby="mqtt_base_topic_error"{% endif %}
+                   {% if focus == 'mqtt_base_topic' %}autofocus{% endif %}>
+            {% if mqtt_base_topic_error %}
+            <p class="error" id="mqtt_base_topic_error" role="alert">{{ mqtt_base_topic_error }}</p>
+            {% endif %}
           </div>
         </div>
         {% if mqtt_password_set %}
@@ -189,11 +210,12 @@
 
       <form method="post" action="/settings/import" enctype="multipart/form-data" class="restore-form">
         {% if import_error %}
-        <p class="hint" role="alert">{{ import_error }}</p>
+        <p class="error" id="import_error" role="alert">{{ import_error }}</p>
         {% endif %}
         <div class="field">
           <label class="field-label" for="backup">Restore from a backup file</label>
-          <input class="field-input" id="backup" name="backup" type="file" accept="application/json,.json" required>
+          <input class="field-input" id="backup" name="backup" type="file" accept="application/json,.json" required
+                 {% if import_error %}aria-invalid="true" aria-describedby="import_error" autofocus{% endif %}>
         </div>
         <button type="submit" class="btn btn-ghost">Restore</button>
         <p class="hint">Restoring overwrites your current hub settings and schedules.

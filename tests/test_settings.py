@@ -564,3 +564,213 @@ def test_lan_flags_are_true_when_nothing_or_a_lan_address_is_set(tmp_path):
 def test_sessions_are_stored_next_to_the_config(tmp_path):
     s = Settings(str(tmp_path / "conf" / "config.json"), env={})
     assert s.sessions_path == str(tmp_path / "conf" / "sessions.json")
+
+
+# ---- bulk zone names, topic and name rules ------------------------------
+
+
+def test_set_zone_names_applies_all_with_one_snapshot(tmp_path):
+    from hearthmage.backups import list_backups
+
+    path = str(tmp_path / "c.json")
+    s = Settings(path, env={})
+    s.set_zone_names({str(i): f"Room {i}" for i in range(1, 13)})
+    assert s.zone_names["12"] == "Room 12"
+    assert len(list_backups(path)) == 1
+
+
+def test_set_zone_names_blank_clears_and_strips(tmp_path):
+    s = Settings(str(tmp_path / "c.json"), env={})
+    s.set_zone_names({"1": "  Kitchen  ", "2": "Hall"})
+    s.set_zone_names({"1": "", "2": " Hall "})
+    assert s.zone_names == {"2": "Hall"}
+
+
+@pytest.mark.parametrize("bad", ["x" * 41, "Bed\x00room", "Bed\nroom", "a\x7fb"])
+def test_set_zone_names_rejects_a_bad_name_and_saves_nothing(tmp_path, bad):
+    from hearthmage.settings import InvalidSetting
+
+    s = Settings(str(tmp_path / "c.json"), env={})
+    s.set_zone_names({"1": "Kitchen"})
+    with pytest.raises(InvalidSetting) as err:
+        s.set_zone_names({"1": "Changed", "2": bad})
+    assert err.value.field == "name_2"
+    assert s.zone_names == {"1": "Kitchen"}
+
+
+def test_set_zone_names_accepts_exactly_40_characters(tmp_path):
+    s = Settings(str(tmp_path / "c.json"), env={})
+    s.set_zone_names({"1": "x" * 40})
+    assert s.zone_names["1"] == "x" * 40
+
+
+def test_set_zone_names_rejects_a_non_numeric_zone_key(tmp_path):
+    from hearthmage.settings import InvalidSetting
+
+    s = Settings(str(tmp_path / "c.json"), env={})
+    with pytest.raises(InvalidSetting):
+        s.set_zone_names({"../x": "Kitchen"})
+
+
+@pytest.mark.parametrize(
+    "topic", ["", "a", "hearth_mage/home-1", "A/b/C", "x" * 64]
+)
+def test_set_mqtt_accepts_a_valid_base_topic(tmp_path, topic):
+    s = Settings(str(tmp_path / "c.json"), env={})
+    s.set_mqtt("10.0.0.5", 1883, "", "clear", "", base_topic=topic)
+    assert s.mqtt_config()["base_topic"] == (topic or "hearthmage")
+
+
+@pytest.mark.parametrize(
+    "topic",
+    ["#", "a/#", "+/a", "a+b", "/a", "a/", "a//b", "a b", "a.b", "é", "x" * 65, "a\nb"],
+)
+def test_set_mqtt_rejects_a_bad_base_topic_and_saves_nothing(tmp_path, topic):
+    from hearthmage.settings import InvalidSetting
+
+    s = Settings(str(tmp_path / "c.json"), env={})
+    with pytest.raises(InvalidSetting) as err:
+        s.set_mqtt("10.0.0.5", 1883, "", "clear", "", base_topic=topic)
+    assert err.value.field == "base_topic"
+    assert not s.mqtt_enabled
+
+
+def test_a_bad_env_base_topic_falls_back_with_a_warning(tmp_path, caplog):
+    env = {"HEARTHMAGE_MQTT_HOST": "10.0.0.5", "HEARTHMAGE_MQTT_BASE_TOPIC": "a/#"}
+    with caplog.at_level("WARNING", logger="hearthmage.settings"):
+        s = Settings(str(tmp_path / "c.json"), env=env)
+    assert s.mqtt_config()["base_topic"] == "hearthmage"
+    assert "HEARTHMAGE_MQTT_BASE_TOPIC" in caplog.text
+
+
+def test_a_bad_env_node_id_falls_back_with_a_warning(tmp_path, caplog):
+    env = {"HEARTHMAGE_MQTT_HOST": "10.0.0.5", "HEARTHMAGE_MQTT_NODE_ID": "x" * 33}
+    with caplog.at_level("WARNING", logger="hearthmage.settings"):
+        s = Settings(str(tmp_path / "c.json"), env=env)
+    assert s.mqtt_config()["node_id"] == "hub"
+    assert "HEARTHMAGE_MQTT_NODE_ID" in caplog.text
+
+
+def test_valid_env_topic_and_node_id_are_used(tmp_path):
+    env = {"HEARTHMAGE_MQTT_HOST": "10.0.0.5", "HEARTHMAGE_MQTT_BASE_TOPIC": "home/heat",
+           "HEARTHMAGE_MQTT_NODE_ID": "hub_2"}
+    config = Settings(str(tmp_path / "c.json"), env=env).mqtt_config()
+    assert (config["base_topic"], config["node_id"]) == ("home/heat", "hub_2")
+
+
+@pytest.mark.parametrize("bad", [-0.1, float("nan"), float("inf"), "abc"])
+def test_set_price_rejects_negative_and_non_finite(tmp_path, bad):
+    from hearthmage.settings import InvalidSetting
+
+    s = Settings(str(tmp_path / "c.json"), env={})
+    with pytest.raises(InvalidSetting):
+        s.set_price(bad)
+    assert s.price_per_kwh == 0.0
+
+
+# ---- review round: unicode, env names, reload, topic fallback, keys -------
+
+
+@pytest.mark.parametrize(
+    "bad", ["\ud800", "", "͸", "a b", "a b", "‮evil", "a⁦b", "a⁩b"]
+)
+def test_zone_names_reject_surrogates_private_use_unassigned_and_bidi(tmp_path, bad):
+    from hearthmage.settings import InvalidSetting
+
+    s = Settings(str(tmp_path / "c.json"), env={})
+    with pytest.raises(InvalidSetting):
+        s.set_zone_names({"1": bad})
+
+
+def test_zone_names_keep_emoji_joiners_and_accents(tmp_path):
+    s = Settings(str(tmp_path / "c.json"), env={})
+    name = "👨‍👩 Café"
+    s.set_zone_names({"1": name})
+    assert s.zone_names["1"] == name
+
+
+def test_zone_keys_are_normalised_and_capped_at_three_digits(tmp_path):
+    from hearthmage.settings import InvalidSetting
+
+    s = Settings(str(tmp_path / "c.json"), env={})
+    s.set_zone_names({"007": "Bond"})
+    assert s.zone_names == {"7": "Bond"}
+    with pytest.raises(InvalidSetting):
+        s.set_zone_names({"1234": "Too many"})
+
+
+def test_the_error_names_the_zone(tmp_path):
+    from hearthmage.settings import InvalidSetting
+
+    s = Settings(str(tmp_path / "c.json"), env={})
+    with pytest.raises(InvalidSetting, match="Zone 3.*40"):
+        s.set_zone_names({"3": "x" * 41})
+
+
+def test_env_zone_names_are_validated_at_load(tmp_path, caplog):
+    env = {"HEARTHMAGE_ZONE_NAMES": "1:" + "L" * 60 + ",abc:Weird,2:Hall,005:Five"}
+    with caplog.at_level("WARNING", logger="hearthmage.settings"):
+        s = Settings(str(tmp_path / "c.json"), env=env)
+    assert s.zone_names == {"2": "Hall", "5": "Five"}
+    assert "HEARTHMAGE_ZONE_NAMES" in caplog.text
+
+
+def test_reload_rereads_the_file_in_place(tmp_path):
+    import json as _json
+
+    path = tmp_path / "c.json"
+    s = Settings(str(path), env={})
+    s.set_hub("10.0.0.20")
+    path.write_text(_json.dumps({"hub_ip": "10.0.0.99"}))
+    s.reload()
+    assert s.hub_ip == "10.0.0.99"
+    s.set_price(0.1)  # a save after the reload keeps the reloaded data
+    assert _json.loads(path.read_text())["hub_ip"] == "10.0.0.99"
+
+
+def test_a_stored_bad_base_topic_falls_back_with_a_warning(tmp_path, caplog):
+    path = tmp_path / "c.json"
+    path.write_text('{"mqtt": {"host": "10.0.0.5", "base_topic": "a/#"}}')
+    with caplog.at_level("WARNING", logger="hearthmage.settings"):
+        s = Settings(str(path), env={})
+    assert s.mqtt_config()["base_topic"] == "hearthmage"
+    assert s.mqtt_base_topic_rejected == "a/#"
+    assert "base topic" in caplog.text
+
+
+def test_price_is_capped_and_negative_zero_is_zero(tmp_path):
+    from hearthmage.settings import InvalidSetting
+
+    s = Settings(str(tmp_path / "c.json"), env={})
+    s.set_price(100)
+    with pytest.raises(InvalidSetting):
+        s.set_price(100.01)
+    s.set_price("-0")
+    assert str(s.price_per_kwh) == "0.0"
+
+
+def test_zone_zero_is_refused_like_the_message_says(tmp_path):
+    from hearthmage.settings import InvalidSetting
+
+    s = Settings(str(tmp_path / "c.json"), env={})
+    with pytest.raises(InvalidSetting):
+        s.set_zone_names({"0": "Nothing"})
+    s.set_zone_names({"999": "Last"})
+    assert s.zone_names == {"999": "Last"}
+
+
+def test_duplicate_zones_after_normalising_are_refused(tmp_path):
+    from hearthmage.settings import InvalidSetting
+
+    s = Settings(str(tmp_path / "c.json"), env={})
+    with pytest.raises(InvalidSetting, match="twice"):
+        s.set_zone_names({"1": "A", "01": "B"})
+
+
+@pytest.mark.parametrize("mark", [chr(0x200E), chr(0x200F), chr(0x061C)])
+def test_zone_names_reject_directional_marks(tmp_path, mark):
+    from hearthmage.settings import InvalidSetting
+
+    s = Settings(str(tmp_path / "c.json"), env={})
+    with pytest.raises(InvalidSetting):
+        s.set_zone_names({"1": f"a{mark}b"})

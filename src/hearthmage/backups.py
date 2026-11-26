@@ -177,6 +177,7 @@ def restore_bundle(bundle: Any, config_path: str, schedules_path: str) -> None:
         if key == "config":
             _check_ports(section)  # an import is untrusted input
             _check_addresses(section)
+            section = _clean_values(section)
             section = _restore_secrets(section, _read_json(path))
         else:
             section = validate_data(section)  # an import is untrusted input
@@ -197,6 +198,33 @@ def _check_ports(config: dict) -> None:
     for raw in ports:
         if raw is not None and parse_port(raw) is None:
             raise ValueError("backup has an unusable port number")
+
+
+def _clean_values(config: dict) -> dict:
+    """Refuse a config with a bad MQTT base topic, zone name or price, by the
+    same rules as the settings forms, and return a copy with the zone names
+    stripped and their keys normalised. Raises InvalidSetting (a ValueError)."""
+    # Imported here: settings imports this module for rotate_backup.
+    from hearthmage.settings import (
+        InvalidSetting,
+        check_price,
+        clean_zone_names,
+        valid_base_topic,
+    )
+
+    config = dict(config)
+    mqtt = config.get("mqtt")
+    topic = mqtt.get("base_topic") if isinstance(mqtt, dict) else None
+    if topic is not None and not valid_base_topic(topic):
+        raise InvalidSetting("base_topic", "The backup's MQTT base topic is not valid.")
+    names = config.get("zone_names")
+    if names is not None:
+        if not isinstance(names, dict):
+            raise ValueError("backup zone names are not an object")
+        config["zone_names"] = {zid: n for zid, n in clean_zone_names(names).items() if n}
+    if config.get("price_per_kwh") is not None:
+        config["price_per_kwh"] = check_price(config["price_per_kwh"])
+    return config
 
 
 def _check_addresses(config: dict) -> None:

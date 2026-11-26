@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import re
 import secrets
 import threading
+import unicodedata
 from typing import Mapping
 
 from hearthmage.atomicio import write_json_atomic
@@ -23,6 +26,97 @@ _BROKER_RULE = (
     "Enter a broker on your home network: a 10.x, 172.16–31.x or 192.168.x "
     "address, localhost, or a local name such as mqtt.local or homeassistant."
 )
+_DEFAULT_BASE_TOPIC = "hearthmage"
+_DEFAULT_NODE_ID = "hub"
+_MAX_TOPIC = 64
+_MAX_NODE_ID = 32
+_MAX_ZONE_NAME = 40
+# Segments of [A-Za-z0-9_-] joined by single slashes: no leading or trailing
+# slash, no empty segment, and no MQTT wildcard. \Z, not $, so "a\n" fails.
+_TOPIC_RE = re.compile(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\Z")
+_NODE_ID_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
+_ZONE_KEY_RE = re.compile(r"[0-9]{1,3}\Z", re.ASCII)
+# Cc controls, Cs surrogates (a lone one cannot be encoded as UTF-8), Co private
+# use, Cn unassigned, Zl/Zp line and paragraph separators. Other Cf (ZWJ for
+# emoji) stay; the bidi overrides and isolates do not.
+_BAD_NAME_CATEGORIES = {"Cc", "Cs", "Co", "Cn", "Zl", "Zp"}
+_BIDI_CONTROLS = (
+    set(range(0x202A, 0x202F)) | set(range(0x2066, 0x206A)) | {0x200E, 0x200F, 0x061C}
+)
+_MAX_PRICE = 100.0
+_TOPIC_RULE = (
+    f"Use up to {_MAX_TOPIC} letters, digits, dashes, underscores and slashes, "
+    "with no slash at the start or end and none doubled."
+)
+_PRICE_RULE = f"Enter a price from 0 to {_MAX_PRICE:g}."
+
+
+class InvalidSetting(ValueError):
+    """A value the app will not store. ``field`` names the form field it came
+    from, so the page can mark that field."""
+
+    def __init__(self, field: str, message: str) -> None:
+        super().__init__(message)
+        self.field = field
+
+
+def valid_base_topic(value) -> bool:
+    return (isinstance(value, str) and len(value) <= _MAX_TOPIC
+            and _TOPIC_RE.match(value) is not None)
+
+
+def valid_node_id(value) -> bool:
+    return (isinstance(value, str) and len(value) <= _MAX_NODE_ID
+            and _NODE_ID_RE.match(value) is not None)
+
+
+def _bad_name_char(ch: str) -> bool:
+    return unicodedata.category(ch) in _BAD_NAME_CATEGORIES or ord(ch) in _BIDI_CONTROLS
+
+
+def check_zone_key(zone_id) -> str:
+    """The zone id as a plain number string ("007" -> "7"), or InvalidSetting."""
+    if not isinstance(zone_id, str) or _ZONE_KEY_RE.match(zone_id) is None:
+        raise InvalidSetting(f"name_{zone_id}", f"Zone {zone_id!s:.10} is not a zone number (1 to 999).")
+    if int(zone_id) < 1:
+        raise InvalidSetting(f"name_{zone_id}", f"Zone {zone_id} is not a zone number (1 to 999).")
+    return str(int(zone_id))
+
+
+def check_zone_name(zone_id, name) -> str:
+    """The stripped name, or InvalidSetting. A blank name is fine (it clears)."""
+    field = f"name_{zone_id}"
+    if not isinstance(name, str):
+        raise InvalidSetting(field, f"Zone {zone_id}'s name must be text.")
+    name = name.strip()
+    if len(name) > _MAX_ZONE_NAME:
+        raise InvalidSetting(field, f"Zone {zone_id}'s name is longer than {_MAX_ZONE_NAME} characters.")
+    if any(_bad_name_char(ch) for ch in name):
+        raise InvalidSetting(field, f"Zone {zone_id}'s name has a control or unusable character.")
+    return name
+
+
+def clean_zone_names(names: Mapping) -> dict[str, str]:
+    """Every name stripped and every key normalised, or InvalidSetting for the
+    first bad one. Blank names stay (they clear a name)."""
+    cleaned: dict[str, str] = {}
+    for zid, name in names.items():
+        key = check_zone_key(zid)
+        if key in cleaned:
+            raise InvalidSetting(f"name_{zid}", f"Zone {key} appears twice.")
+        cleaned[key] = check_zone_name(zid, name)
+    return cleaned
+
+
+def check_price(value) -> float:
+    """The price as a float, or InvalidSetting if it is not finite and >= 0."""
+    try:
+        price = float(value) if not isinstance(value, bool) else math.nan
+    except (TypeError, ValueError, OverflowError):
+        price = math.nan
+    if not math.isfinite(price) or price < 0 or price > _MAX_PRICE:
+        raise InvalidSetting("price_per_kwh", _PRICE_RULE)
+    return price + 0.0  # -0.0 becomes 0.0
 
 
 def _env_lookup(env: Mapping[str, str], suffix: str, default: str | None = None) -> str | None:
@@ -88,15 +182,40 @@ class Settings:
         self._env = env
         self._data: dict = {}
         self._lock = threading.RLock()
-        if os.path.exists(path):
+        self._load()
+        self._env_names = self._load_env_names()
+        self._warn_about_addresses()
+
+    def _load(self) -> None:
+        data: dict = {}
+        if os.path.exists(self._path):
             try:
-                with open(path, encoding="utf-8") as handle:
+                with open(self._path, encoding="utf-8") as handle:
                     loaded = json.load(handle)
                 if isinstance(loaded, dict):
-                    self._data = loaded
+                    data = loaded
             except (OSError, ValueError):
-                self._data = {}
+                data = {}
+        with self._lock:
+            self._data = data
+
+    def reload(self) -> None:
+        """Re-read the file into this same object, under its lock. Used after a
+        backup restore, so a save racing the restore cannot write old data back."""
+        with self._lock:
+            self._load()
         self._warn_about_addresses()
+
+    def _load_env_names(self) -> dict[str, str]:
+        """HEARTHMAGE_ZONE_NAMES under the same rules as the form; an entry that
+        fails is dropped with a warning."""
+        names: dict[str, str] = {}
+        for zid, name in _parse_zone_names(_env_lookup(self._env, "ZONE_NAMES")).items():
+            try:
+                names.update(clean_zone_names({zid: name}))
+            except InvalidSetting as exc:
+                _log.warning("Ignoring HEARTHMAGE_ZONE_NAMES entry %r: %s", zid, exc)
+        return {zid: name for zid, name in names.items() if name}
 
     def _warn_about_addresses(self) -> None:
         """Log, once at load, any hub or broker address off the LAN. A bad
@@ -108,6 +227,19 @@ class Settings:
             if value and not on_lan(value):
                 _log.warning("Ignoring HEARTHMAGE_%s=%r: not an address on the local network",
                              suffix, value)
+        for suffix, valid, default in (
+            ("MQTT_BASE_TOPIC", valid_base_topic, _DEFAULT_BASE_TOPIC),
+            ("MQTT_NODE_ID", valid_node_id, _DEFAULT_NODE_ID),
+        ):
+            value = _env_lookup(self._env, suffix)
+            if value is not None and value.strip() and not valid(value.strip()):
+                _log.warning("Ignoring HEARTHMAGE_%s=%r: using %r instead. Allowed: letters, "
+                             "digits, dashes, underscores%s.", suffix, value, default,
+                             " and single slashes" if suffix == "MQTT_BASE_TOPIC" else "")
+        rejected = self.mqtt_base_topic_rejected
+        if rejected is not None:
+            _log.warning("Stored MQTT base topic %r is not valid; using %r instead. Enter a "
+                         "valid base topic in Settings.", rejected, _DEFAULT_BASE_TOPIC)
         if not self.hub_ip_on_lan:
             _log.warning("Stored hub address %r is not a private LAN IPv4 address; still "
                          "using it. Enter the hub's LAN address in Settings.", self.hub_ip)
@@ -149,7 +281,7 @@ class Settings:
 
     @property
     def zone_names(self) -> dict[str, str]:
-        names = _parse_zone_names(_env_lookup(self._env, "ZONE_NAMES"))
+        names = dict(self._env_names)
         with self._lock:
             stored = self._data.get("zone_names")
             if isinstance(stored, dict):
@@ -288,6 +420,8 @@ class Settings:
             username = self._clean(stored.get("username"))
             password = stored.get("password") or None
             base_topic = self._clean(stored.get("base_topic"))
+            if base_topic is not None and not valid_base_topic(base_topic):
+                base_topic = None  # logged at load, shown on the settings page
         else:
             host = self._clean(_env_lookup(self._env, "MQTT_HOST"))
             if not is_lan_broker_host(host):
@@ -296,6 +430,8 @@ class Settings:
             username = self._clean(_env_lookup(self._env, "MQTT_USERNAME"))
             password = _env_lookup(self._env, "MQTT_PASSWORD") or None
             base_topic = self._clean(_env_lookup(self._env, "MQTT_BASE_TOPIC"))
+            if base_topic is not None and not valid_base_topic(base_topic):
+                base_topic = None  # logged at load
         if not host:
             return None
         return {
@@ -303,9 +439,21 @@ class Settings:
             "port": parse_port(raw_port) or 1883,
             "username": username,
             "password": password,
-            "base_topic": base_topic or "hearthmage",
-            "node_id": _env_lookup(self._env, "MQTT_NODE_ID", "hub"),
+            "base_topic": base_topic or _DEFAULT_BASE_TOPIC,
+            "node_id": self._env_node_id(),
         }
+
+    @property
+    def mqtt_base_topic_rejected(self) -> str | None:
+        """The stored base topic when it fails the rule (saved before the rule
+        existed, or hand-edited); the bridge uses the default meanwhile."""
+        stored = self._mqtt_stored()
+        topic = self._clean(stored.get("base_topic")) if stored else None
+        return topic if topic is not None and not valid_base_topic(topic) else None
+
+    def _env_node_id(self) -> str:
+        value = _env_lookup(self._env, "MQTT_NODE_ID", _DEFAULT_NODE_ID).strip()
+        return value if valid_node_id(value) else _DEFAULT_NODE_ID
 
     @property
     def auth_password(self) -> str | None:
@@ -361,19 +509,26 @@ class Settings:
             self._save()
 
     def set_price(self, price_per_kwh: float) -> None:
+        price = check_price(price_per_kwh)  # InvalidSetting before anything changes
         with self._lock:
-            self._data["price_per_kwh"] = max(0.0, float(price_per_kwh))
+            self._data["price_per_kwh"] = price
             self._save()
 
     def set_zone_name(self, zone_id: str, name: str) -> None:
-        zone_id = str(zone_id)
-        name = (name or "").strip()
+        self.set_zone_names({str(zone_id): name or ""})
+
+    def set_zone_names(self, names: Mapping[str, str]) -> None:
+        """Apply several zone names with one save and one backup snapshot. A
+        blank name clears back to the default label. Raises InvalidSetting,
+        before anything changes, for a non-numeric zone id or a bad name."""
+        checked = clean_zone_names(names)
         with self._lock:
-            names = self._data.setdefault("zone_names", {})
-            if name:
-                names[zone_id] = name
-            else:
-                names.pop(zone_id, None)  # blank clears back to the default label
+            stored = self._data.setdefault("zone_names", {})
+            for zid, name in checked.items():
+                if name:
+                    stored[zid] = name
+                else:
+                    stored.pop(zid, None)
             self._save()
 
     def set_mqtt(
@@ -395,6 +550,9 @@ class Settings:
         object replaces the old one in a single assignment."""
         if not is_lan_broker_host(host):
             raise AddressRejected("host", _BROKER_RULE)
+        base_topic = (base_topic or "").strip() or _DEFAULT_BASE_TOPIC
+        if not valid_base_topic(base_topic):
+            raise InvalidSetting("base_topic", _TOPIC_RULE)
         with self._lock:
             if password_action == "keep" and self.mqtt_password_needs_reentry(host, port, username):
                 raise MqttPasswordReentry("enter the broker password again for a different broker")
@@ -410,7 +568,7 @@ class Settings:
                 "host": host.strip(),
                 "port": parse_port(port) or 1883,
                 "username": (username or "").strip(),
-                "base_topic": (base_topic or "").strip() or "hearthmage",
+                "base_topic": base_topic,
             }
             if password_action == "set":
                 mqtt["password"] = password
