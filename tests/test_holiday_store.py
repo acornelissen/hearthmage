@@ -8,9 +8,11 @@ def test_unknown_zone_is_none(tmp_path):
 
 def test_set_get_and_persist(tmp_path):
     path = str(tmp_path / "holiday.json")
-    HolidayStore(path).set("1", until="2026-11-05T17:30", arrival_temp=20.0, prev_setpoint=21.0)
+    HolidayStore(path).set("1", until="2026-11-05T17:30", arrival_temp=20.0, prev_setpoint=21.0,
+                           prev_active=False)
     got = HolidayStore(path).get("1")
-    assert got == {"until": "2026-11-05T17:30", "arrival_temp": 20.0, "prev_setpoint": 21.0}
+    assert got == {"until": "2026-11-05T17:30", "arrival_temp": 20.0, "prev_setpoint": 21.0,
+                   "prev_active": False}
 
 
 def test_resume_program_is_stored_as_none(tmp_path):

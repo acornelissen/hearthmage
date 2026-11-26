@@ -7,8 +7,10 @@ the setpoint to restore if the user cancels early. A convenience record, not a
 source of truth.
 
 Shape on disk: ``{"<zone>": {"until": "YYYY-MM-DDTHH:MM", "arrival_temp":
-float | null, "prev_setpoint": float | null}}``. ``until`` is local time;
-``arrival_temp`` null means "resume the weekly program". Records written
+float | null, "prev_setpoint": float | null, "prev_active": bool | null}}``.
+``until`` is local time; ``arrival_temp`` null means "resume the weekly
+program"; ``prev_active`` is the app's program on/off from before the hold
+(null: not set, or a record from before 2026-11-26), put back on cancel. Records written
 before 2026-11-01 used day/month keys (sent to the hub with the wrong fields)
 and are dropped by the app.
 """
@@ -45,12 +47,16 @@ class HolidayStore:
             value = self._data.get(str(zone_id))
             return dict(value) if value is not None else None
 
-    def set(self, zone_id: str, until: str, arrival_temp: float | None, prev_setpoint) -> None:
+    def set(
+        self, zone_id: str, until: str, arrival_temp: float | None, prev_setpoint,
+        prev_active: bool | None = None,
+    ) -> None:
         with self._lock:
             self._data[str(zone_id)] = {
                 "until": str(until),
                 "arrival_temp": float(arrival_temp) if arrival_temp is not None else None,
                 "prev_setpoint": prev_setpoint,
+                "prev_active": bool(prev_active) if prev_active is not None else None,
             }
             write_json_atomic(self._path, self._data)
 

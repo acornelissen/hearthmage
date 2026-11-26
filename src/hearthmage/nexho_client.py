@@ -82,6 +82,11 @@ _MAX_HEATERS = 16
 # Fields in an *?F status reply, the last one the firmware string (``v...``).
 # Live on all four radiators 2026-11-01; other firmware may differ (inferred).
 _STATUS_F_FIELDS = 21
+# *?F field 8 is the weekly program state (live 2026-11-26: 11 on, 253 after
+# *OFF, 11 again after *ON). Only those two values are believed: the vendor
+# reads "> 11" as off, and whether "on" is always 11 or the month is unknown.
+_STATUS_F_PROGRAM = 8
+_PROGRAM_STATES = {11: True, 253: False}
 # A zone whose status replies keep being rejected for their shape is logged at
 # most this often, so it does not look like a radiator that is simply asleep.
 _REJECTED_STATUS_LOG_EVERY = 600.0
@@ -1613,6 +1618,23 @@ class NexhoLocalClient:
         if fields[0] != "OK" or len(fields) != _STATUS_F_FIELDS or not fields[-1].startswith("v"):
             raise HearthError(f"Zone {zone} status read failed: {resp!r}")
         return resp
+
+    def read_program_active(self, room_id: str) -> bool | None:
+        """Whether the radiator is running its weekly program, from ``*?F``
+        field 8; None for a value not seen live (unknown). Believed only when
+        two reads agree, as a reply can carry the previous query's value.
+        Raises HearthError if the radiator cannot be read."""
+        first = self._program_field(room_id)
+        second = self._program_field(room_id)
+        if first != second:
+            raise HearthError(f"Zone {room_id} program state reads disagree ({first}, {second})")
+        return _PROGRAM_STATES.get(first)
+
+    def _program_field(self, room_id: str) -> int:
+        value = self.read_status_raw(room_id).split(",")[_STATUS_F_PROGRAM]
+        if not (value.isascii() and value.isdigit()):
+            raise HearthError(f"Zone {room_id} program state unreadable: {value!r}")
+        return int(value)
 
     def set_day_pattern(self, room_id: str, blocks: list[Block], days: list[int]) -> None:
         """Write a block pattern to every weekday in ``days`` (via ``*P``)."""

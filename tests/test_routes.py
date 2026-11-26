@@ -1825,8 +1825,15 @@ def _with_store(tmp_path, monkeypatch):
     from hearthmage.sync_store import SyncStore
 
     monkeypatch.setattr(appmod, "schedules", ScheduleStore(str(tmp_path / "sched.json")))
+    from hearthmage.holiday_store import HolidayStore
+
     monkeypatch.setattr(appmod, "sync", SyncStore(str(tmp_path / "sync.json")))
     monkeypatch.setattr(appmod, "_sync_backoff", {}, raising=False)  # no waits carried between tests
+    # The sync checks holiday records: never the developer's real ones.
+    monkeypatch.setattr(appmod, "holidays", HolidayStore(str(tmp_path / "holiday.json")))
+    monkeypatch.setattr(appmod, "_program_corrections", {})
+    monkeypatch.setattr(appmod, "_last_drift_check", None)
+    monkeypatch.setattr(appmod, "_PROGRAM_VERIFY_PAUSE", 0)
     return appmod
 
 
@@ -2232,6 +2239,293 @@ def test_push_verification_fails_when_a_day_cannot_be_read(tmp_path, monkeypatch
 
     appmod.schedules.set_pattern("1", [Block(20, 420, 540)], [0])
     assert appmod._resync_zone(Asleep([Room("1", "L", 19.0, 20.0, False, 5.0, 30.0)]), "1") is False
+
+
+class _StubbornProgram(FakeHearthClient):
+    """Acks *ON/*OFF but its radiator keeps the program on (as all four did
+    live on 2026-11-26 while the app recorded them off)."""
+
+    def read_program_active(self, room_id):
+        return True
+
+
+def _one_room(cls=FakeHearthClient, target=20.0):
+    return cls([Room("1", "L", 19.0, target, False, 5.0, 30.0)])
+
+
+def test_program_switch_is_verified_by_reading_the_hub_back(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_active("1", False)
+    assert appmod._resync_zone(_room_fake(), "1") is True  # read back off: synced
+    stubborn = _one_room(_StubbornProgram)
+    assert appmod._resync_zone(stubborn, "1") is False  # acked, but still on at the hub
+    assert stubborn.program_active["1"] is False  # the switch-off was still sent
+
+
+def test_a_program_read_back_that_settles_after_the_pause_counts(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    pauses = []
+    monkeypatch.setattr(appmod, "_PROGRAM_VERIFY_PAUSE", 2.0)
+    monkeypatch.setattr(appmod.time, "sleep", pauses.append)
+    reads = iter([True, False])  # still on just after the ack, off a moment later
+
+    class Slow(FakeHearthClient):
+        def read_program_active(self, room_id):
+            return next(reads)
+
+    appmod.schedules.set_active("1", False)
+    assert appmod._resync_zone(_one_room(Slow), "1") is True
+    assert pauses == [2.0]
+
+
+def test_program_switch_fails_the_sync_when_it_cannot_be_read_back(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+
+    class Unreadable(FakeHearthClient):
+        def read_program_active(self, room_id):
+            raise HearthError("asleep")
+
+    appmod.schedules.set_active("1", True)
+    assert appmod._resync_zone(_one_room(Unreadable), "1") is False
+
+
+def test_an_unknown_program_value_trusts_the_ack(tmp_path, monkeypatch):
+    # Only 11 and 253 were seen live; anything else is not taken as a verdict.
+    appmod = _with_store(tmp_path, monkeypatch)
+
+    class Unknown(FakeHearthClient):
+        def read_program_active(self, room_id):
+            return None
+
+    appmod.schedules.set_active("1", False)
+    hub = _one_room(Unknown)
+    assert appmod._resync_zone(hub, "1") is True
+    appmod.sync.set("1", "synced")
+    appmod._check_program_drift(hub)
+    assert appmod.sync.get("1") == "synced"
+
+
+def test_a_recorded_holiday_skips_the_program_read_back(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.holidays.set("1", until=_in_days(3) + "T08:00", arrival_temp=20.0, prev_setpoint=None)
+    appmod.schedules.set_active("1", False)
+    assert appmod._resync_zone(_one_room(_StubbornProgram), "1") is True
+
+
+def test_a_program_that_never_reads_back_right_is_given_up_on(tmp_path, monkeypatch):
+    # Each push can send *OFF, which moves setpoints, so it must not repeat forever.
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_active("1", False)
+    stubborn = _one_room(_StubbornProgram)
+    results = [appmod._resync_zone(stubborn, "1") for _ in range(appmod._PROGRAM_CORRECTIONS_PER_DAY + 1)]
+    assert results == [False] * appmod._PROGRAM_CORRECTIONS_PER_DAY + [True]
+    appmod.sync.set("1", "synced")
+    appmod._check_program_drift(stubborn)  # capped: not pushed again today
+    assert appmod.sync.get("1") == "synced"
+    appmod._request_sync(stubborn, "1")  # the user's own change starts the count afresh
+    _wait_for_sync()
+    assert appmod.sync.get("1") == "failed"  # it checks (and disagrees) again
+
+
+class _OffMovesSetpoint(FakeHearthClient):
+    """Like the live radiators: *OFF moves the hub's setpoint to 7, which the
+    client only learns at its next poll. Records the targets sent."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.sent = []
+
+    def set_program_active(self, room_id, active):
+        super().set_program_active(room_id, active)
+        if not active:
+            self.hub_setpoint = 7.0
+
+    def set_temperature(self, room_id, temperature):
+        self.sent.append(temperature)
+        super().set_temperature(room_id, temperature)
+
+
+def test_switching_the_program_off_puts_the_target_back(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_active("1", False)
+    hub = _one_room(_OffMovesSetpoint, target=5.0)
+    assert appmod._resync_zone(hub, "1") is True
+    assert hub.sent == [5.0]
+    # Switching it on leaves the target to the program.
+    appmod.schedules.set_active("1", True)
+    hub.sent.clear()
+    appmod._resync_zone(hub, "1")
+    assert hub.sent == []
+
+
+def test_a_target_set_during_the_program_push_is_not_overwritten(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_active("1", False)
+
+    class UserMeanwhile(_OffMovesSetpoint):
+        def set_program_active(self, room_id, active):
+            super().set_program_active(room_id, active)
+            FakeHearthClient.set_temperature(self, room_id, 22.0)  # the user, from the UI
+
+    hub = _one_room(UserMeanwhile, target=5.0)
+    appmod._resync_zone(hub, "1")
+    assert hub.sent == []
+    assert hub.list_rooms()[0].target_temp == 22.0
+
+
+def test_a_program_that_drifts_on_the_hub_is_pushed_again(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_active("1", False)
+    appmod.sync.set("1", "synced")
+    fake = _room_fake()
+    fake.program_active["1"] = True  # something switched it back on at the hub
+    appmod._check_program_drift(fake)
+    assert appmod.sync.get("1") == "pending"
+    appmod._retry_failed_syncs(fake)
+    assert fake.program_active["1"] is False
+    assert appmod.sync.get("1") == "synced"
+
+
+def test_the_drift_check_leaves_a_zone_the_user_changed_meanwhile(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_active("1", False)
+    appmod.sync.set("1", "synced")
+
+    class Hub(FakeHearthClient):
+        def read_program_active(self, room_id):
+            # While this read waits for the wire, the user switches the
+            # program on and that push completes.
+            appmod.schedules.set_active("1", True)
+            appmod._sync_gen["1"] = appmod._sync_gen.get("1", 0) + 1
+            return True
+
+    appmod._check_program_drift(_one_room(Hub))
+    assert appmod.sync.get("1") == "synced"
+
+
+def test_the_drift_check_leaves_agreeing_unreadable_and_held_zones_alone(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    for zone in ("1", "2", "3"):
+        appmod.schedules.set_active(zone, False)
+        appmod.sync.set(zone, "synced")
+    appmod.holidays.set("3", until=_in_days(3) + "T08:00", arrival_temp=20.0, prev_setpoint=None)
+    read = []
+
+    class Hub(FakeHearthClient):
+        def read_program_active(self, room_id):
+            read.append(room_id)
+            if room_id == "2":
+                raise HearthError("asleep")
+            return room_id == "3"  # zone 3 reads on, but a holiday hold is recorded
+
+    rooms = [Room(z, z, 19.0, 20.0, False, 5.0, 30.0) for z in ("1", "2", "3")]
+    appmod._check_program_drift(Hub(rooms))
+    assert read == ["1", "2"]  # the held zone is not even read
+    assert [appmod.sync.get(z) for z in ("1", "2", "3")] == ["synced"] * 3
+
+
+def test_the_drift_check_runs_at_most_hourly(tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(appmod, "_monotonic", lambda: clock["now"])
+    appmod.schedules.set_active("1", False)
+    appmod.sync.set("1", "synced")
+    reads = []
+
+    class Hub(FakeHearthClient):
+        def read_program_active(self, room_id):
+            reads.append(room_id)
+            return False
+
+    hub = _one_room(Hub)
+    appmod._check_program_drift(hub)  # the first cycle after start checks at once
+    clock["now"] += appmod._DRIFT_CHECK_EVERY - 1
+    appmod._check_program_drift(hub)
+    clock["now"] += 2
+    appmod._check_program_drift(hub)
+    assert reads == ["1", "1"]
+
+
+def test_holiday_back_to_the_weekly_schedule_records_the_program_on(client, tmp_path, monkeypatch):
+    # The hub resumes the program when the hold ends (*RH ...#251); the app
+    # must agree, or its program check would switch it off again.
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_active("1", False)
+    form = {"until": _in_days(4), "until_time": "17:30", "arrival": "temp", "arrival_temp": "20"}
+    assert client.post("/zones/1/holiday", data=form, follow_redirects=False).status_code == 303
+    assert appmod.schedules.get_active("1") is False  # a fixed temperature changes nothing
+    form["arrival"] = "program"
+    assert client.post("/zones/1/holiday", data=form, follow_redirects=False).status_code == 303
+    assert appmod.schedules.get_active("1") is True
+
+
+def test_cancelling_a_back_to_the_schedule_holiday_undoes_it(client, tmp_path, monkeypatch):
+    # The program was off and the hold switched it on; cancelling early puts
+    # it back off and restores the target the zone had, not the hold level.
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_active("1", False)
+    fake = app.dependency_overrides[get_client]()
+    fake.set_temperature("1", 21.0)
+    form = {"until": _in_days(4), "until_time": "17:30", "arrival": "program", "arrival_temp": ""}
+    assert client.post("/zones/1/holiday", data=form, follow_redirects=False).status_code == 303
+    fake.set_temperature("1", 7.0)  # the zone sits at its hold level
+    assert client.post("/zones/1/holiday/cancel", follow_redirects=False).status_code == 303
+    _wait_for_sync()
+    assert appmod.schedules.get_active("1") is False
+    assert fake.list_rooms()[0].target_temp == 21.0
+    assert fake.program_active["1"] is False  # the hub's clear resumed it; ours was pushed
+
+
+def test_a_schedule_holiday_leaves_a_never_set_program_unmanaged(client, tmp_path, monkeypatch):
+    # A zone whose program the app never set (run from the vendor app) must not
+    # become one the app's program check starts switching; cancel still
+    # restores its target.
+    appmod = _with_store(tmp_path, monkeypatch)
+    assert appmod.schedules.get_active("1") is None
+    fake = app.dependency_overrides[get_client]()
+    fake.set_temperature("1", 21.0)
+    form = {"until": _in_days(4), "until_time": "17:30", "arrival": "program", "arrival_temp": ""}
+    client.post("/zones/1/holiday", data=form, follow_redirects=False)
+    assert appmod.schedules.get_active("1") is None
+    fake.set_temperature("1", 7.0)  # the hold level
+    client.post("/zones/1/holiday/cancel", follow_redirects=False)
+    _wait_for_sync()
+    assert appmod.schedules.get_active("1") is None
+    assert fake.list_rooms()[0].target_temp == 21.0
+    assert "1" not in fake.program_active  # never switched
+
+
+def test_restarting_a_schedule_holiday_with_a_temperature_puts_the_flag_back(client, tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_active("1", False)
+    form = {"until": _in_days(4), "until_time": "17:30", "arrival": "program", "arrival_temp": ""}
+    client.post("/zones/1/holiday", data=form, follow_redirects=False)
+    assert appmod.schedules.get_active("1") is True
+    form.update(arrival="temp", arrival_temp="20")
+    client.post("/zones/1/holiday", data=form, follow_redirects=False)
+    assert appmod.schedules.get_active("1") is False
+    assert appmod.holidays.get("1")["prev_active"] is False
+
+
+def test_cancelling_keeps_a_program_change_made_during_the_hold(client, tmp_path, monkeypatch):
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.schedules.set_active("1", True)
+    form = {"until": _in_days(4), "until_time": "17:30", "arrival": "temp", "arrival_temp": "20"}
+    assert client.post("/zones/1/holiday", data=form, follow_redirects=False).status_code == 303
+    appmod.schedules.set_active("1", False)  # the user switched it off meanwhile
+    assert client.post("/zones/1/holiday/cancel", follow_redirects=False).status_code == 303
+    assert appmod.schedules.get_active("1") is False
+
+
+def test_no_target_is_restored_during_a_holiday_hold(tmp_path, monkeypatch):
+    # The hold level is not the user's target: re-sending it would also teach
+    # the client 7 C as the zone's last on-target.
+    appmod = _with_store(tmp_path, monkeypatch)
+    appmod.holidays.set("1", until=_in_days(3) + "T08:00", arrival_temp=20.0, prev_setpoint=21.0)
+    appmod.schedules.set_active("1", False)
+    hub = _one_room(_OffMovesSetpoint, target=7.0)
+    appmod._resync_zone(hub, "1")
+    assert hub.sent == []
 
 
 def test_load_from_radiator_previews_without_saving(client, tmp_path, monkeypatch):

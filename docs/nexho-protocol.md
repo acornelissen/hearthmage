@@ -125,8 +125,11 @@ Do not use it for block detail.
 **Program on/off (confirmed live):** `D#<zone>#<modules>#0#0*ON/` activates the
 zone's stored weekly program (the hub then drives the setpoint from the
 schedule); `…*OFF/` deactivates it and the zone holds its manual setpoint.
-Reply starts `OK`. The hub does not report the active/inactive state back over
-the LAN, so this app tracks the last state it set locally.
+Reply starts `OK`. `*OFF` moved the setpoint on all four zones it was sent to
+(2026-11-26; zone 4 from 5 to 7), so this app re-sends the zone's target after
+it. The state can be read back from `*?F` field 8 (see "Compared with the
+vendor app"); this app keeps its own as the source of truth and corrects the
+hub when they differ.
 
 **Block command / temperature (`cmd`): CONFIRMED whole °C.** A live behavioural
 test wrote a block at cmd `14` covering the current time on zone 1; the zone's
@@ -332,9 +335,14 @@ the `*RH` fields, and write handling. Other findings:
   Zone 4 (empty week) read `11`; after `*OFF` it read `253`, and after `*ON`
   `11` again. `*OFF` also moved the setpoint from 5 to 7 (its old manual
   value, inferred); `*ON` left it alone. Whether "on" is always `11` or is the
-  month (the test ran in November) is not settled, so read `253` as off and
-  anything else as on. All four radiators read `11` that day, so the hub had
-  every program on while this app recorded them all off.
+  month (the test ran in November) is not settled, so this app believes only
+  `11` (on) and `253` (off) and treats anything else as unknown. All four
+  radiators read `11` that day, so the hub had every program on while this app
+  recorded them all off. Holiday holds resume the program (`*RH…#251`, also
+  sent by the vendor's cancel), which may be how. This app now reads `[8]` back
+  after every program push and hourly afterwards, and pushes its own state
+  again when they differ, at most three times per zone per day
+  (`read_program_active`, `_check_program_drift`).
 - **Hub identity.** The vendor accepts a hub only if `OPS1`'s idA/idB/IDU match
   the paired installation. This app connects its UDP socket to the hub's
   address, so replies from other hosts are dropped; it does not pin the IDU.

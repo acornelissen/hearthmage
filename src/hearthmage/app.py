@@ -1770,6 +1770,36 @@ _RETRY_FIRST_WAIT = 60.0
 _RETRY_MAX_WAIT = 1800.0
 _sync_backoff: dict[str, tuple[int, float]] = {}  # zone -> (failures in a row, retry not before)
 _monotonic = time.monotonic  # indirection so tests can move the clock
+# A program switch that reads back wrong is read once more after this pause,
+# in case the radiator applies it a moment after its ack (untested).
+_PROGRAM_VERIFY_PAUSE = 2.0
+# How often synced zones' program state is read back from the hub, to catch a
+# radiator whose program changed behind the app's back.
+_DRIFT_CHECK_EVERY = 3600.0
+_last_drift_check: float | None = None  # monotonic; None: check on the next cycle
+# A zone whose program keeps reading back wrong is corrected at most this many
+# times a day; after that the app stops fighting it (logged) until the user
+# changes the zone's schedule. Every push can send *OFF, which moves setpoints.
+_PROGRAM_CORRECTIONS_PER_DAY = 3
+_program_corrections: dict[str, list[float]] = {}  # zone -> monotonic times; under _sync_lock
+
+
+def _program_corrections_left(zone: str) -> bool:
+    """Whether the zone is still under its daily correction cap. Caller holds
+    ``_sync_lock``."""
+    recent = [t for t in _program_corrections.get(zone, []) if _monotonic() - t < 86400]
+    _program_corrections[zone] = recent
+    return len(recent) < _PROGRAM_CORRECTIONS_PER_DAY
+
+
+def _note_program_correction(zone: str) -> bool:
+    """Count one correction; False if the cap was already reached (then the
+    app gives up on the zone's program state for now)."""
+    with _sync_lock:
+        if not _program_corrections_left(zone):
+            return False
+        _program_corrections[zone].append(_monotonic())
+        return True
 
 
 def _note_sync_result(zone: str, ok: bool) -> None:
@@ -1812,12 +1842,124 @@ def _resync_zone(client: HearthClient, zone: str) -> bool:
     toggle = getattr(client, "set_program_active", None)
     active = schedules.get_active(zone)
     if toggle is not None and active is not None:
+        # *OFF can move the setpoint (live 2026-11-26: on every zone it was
+        # sent to), so note the zone's target first and put it back after;
+        # not during a holiday hold, whose level is not the user's target.
+        held = holidays.get(zone) is not None
+        before = None if (active or held) else _target_of(client, zone)
         try:
             toggle(zone, active)
         except HearthError as exc:
             _sched_log.warning("zone %s program on/off push failed: %s", zone, exc)
             ok = False
+        else:
+            if before is not None:
+                _restore_target(client, zone, before)
+            # What a holiday hold does to the program state is not known, so
+            # it is not checked while one is recorded.
+            if ok and not held:
+                ok = _verify_program(client, zone, active)
     return ok
+
+
+def _target_of(client: HearthClient, zone: str) -> float | None:
+    """The zone's current target as the client knows it (0 for off), or None."""
+    try:
+        room = _find_room(client, zone)
+    except HearthError:
+        return None
+    if room is None or room.target_temp is None:
+        return None
+    return 0.0 if room.is_off else room.target_temp
+
+
+def _restore_target(client: HearthClient, zone: str, before: float) -> None:
+    """Re-send the target a zone had before *OFF. Skipped if the target the
+    client shows has changed meanwhile: that is a newer command (the user's),
+    which must not be overwritten."""
+    if _target_of(client, zone) != before:
+        _sched_log.info("zone %s target changed during the program push; not restoring it", zone)
+        return
+    try:
+        client.set_temperature(zone, before)
+    except HearthError as exc:
+        _sched_log.warning("zone %s target restore after *OFF failed: %s", zone, exc)
+
+
+def _verify_program(client: HearthClient, zone: str, active: bool) -> bool:
+    """Read the program state back from the hub (``*?F``), so "synced" means
+    the radiator runs its program (or not), not just that it acked."""
+    read = getattr(client, "read_program_active", None)
+    if read is None:
+        return True  # a client that cannot read back: the ack is all we have
+    try:
+        held = read(zone)
+        if held is not None and held != active:
+            time.sleep(_PROGRAM_VERIFY_PAUSE)
+            held = read(zone)
+    except HearthError as exc:
+        _sched_log.warning("zone %s program state read-back failed: %s", zone, exc)
+        return False
+    if held is None:
+        _sched_log.info("zone %s program state reads as an unknown value; trusting the ack", zone)
+        return True
+    if held == active:
+        return True
+    if not _note_program_correction(zone):
+        _sched_log.warning(
+            "zone %s program still reads %s after %d corrections today; giving up until the "
+            "schedule is changed", zone, "on" if held else "off", _PROGRAM_CORRECTIONS_PER_DAY,
+        )
+        return True
+    _sched_log.warning("zone %s program read-back mismatch: hub has it %s", zone, "on" if held else "off")
+    return False
+
+
+def _check_program_drift(client: HearthClient) -> None:
+    """At most every _DRIFT_CHECK_EVERY seconds, read each synced zone's
+    program state from the hub and queue a push for any that no longer
+    matches the app (live 2026-11-26 the hub had every program on while the
+    app had them all off). Zones being pushed, not synced, or with a holiday
+    hold recorded are left alone; a zone that cannot be read is tried next
+    time."""
+    global _last_drift_check
+    read = getattr(client, "read_program_active", None)
+    if read is None:
+        return
+    now = _monotonic()
+    if _last_drift_check is not None and now - _last_drift_check < _DRIFT_CHECK_EVERY:
+        return
+    _last_drift_check = now
+    for zone in schedules.zone_ids():
+        active = schedules.get_active(zone)
+        if active is None:
+            continue
+        with _sync_lock:
+            if (zone in _sync_running or sync.get(zone) != "synced"
+                    or not _program_corrections_left(zone)):
+                continue
+            gen = _sync_gen.get(zone, 0)
+        if holidays.get(zone) is not None:
+            continue
+        try:
+            held = read(zone)
+        except HearthError as exc:
+            _sched_log.info("zone %s program drift check skipped: %s", zone, exc)
+            continue
+        if held is None or held == active:
+            continue
+        with _sync_lock:
+            # A push that ran while we read (the user's change) has settled it.
+            if (_sync_gen.get(zone, 0) != gen or zone in _sync_running
+                    or sync.get(zone) != "synced" or schedules.get_active(zone) != active
+                    or not _program_corrections_left(zone)):
+                continue
+            _program_corrections[zone].append(_monotonic())
+            sync.set(zone, "pending")  # the retry loop pushes pending zones at once
+        _sched_log.warning(
+            "zone %s program is %s at the hub but %s here; pushing it again",
+            zone, "on" if held else "off", "on" if active else "off",
+        )
 
 
 def _verify_week(client: HearthClient, zone: str, stored: dict[int, list[Block]]) -> bool:
@@ -1878,6 +2020,7 @@ def _request_sync(client: HearthClient, zone: str) -> None:
     with _sync_lock:
         _sync_gen[zone] = _sync_gen.get(zone, 0) + 1
         _sync_backoff.pop(zone, None)  # a fresh change starts the retry wait afresh
+        _program_corrections.pop(zone, None)  # and the program correction count
         sync.set(zone, "pending")
         if zone in _sync_running:
             return
@@ -1908,7 +2051,9 @@ def _retry_loop() -> None:
         _retry_wake.clear()
         try:
             # Resolve the client each cycle so retries follow a hub change.
-            _retry_failed_syncs(get_client())
+            client = get_client()
+            _retry_failed_syncs(client)
+            _check_program_drift(client)  # a drifted zone is pushed on the next cycle
         except NotConfigured:
             pass
         except Exception:  # noqa: BLE001 - a bad retry cycle must not kill the loop
@@ -2313,8 +2458,11 @@ def start_holiday(
     # user's last request is what to restore, confirmed or not.
     room = _find_room(client, zone_id)
     prev = room.target_temp if (room and not room.is_off) else None
-    if _current_holiday(zone_id):  # a hold already runs: the room shows its level, keep the original
-        prev = holidays.get(zone_id)["prev_setpoint"]
+    prev_active = schedules.get_active(zone_id)  # put back on cancel
+    running = holidays.get(zone_id) if _current_holiday(zone_id) else None
+    if running:  # a hold already runs: the room shows its level, keep the original
+        prev = running["prev_setpoint"]
+        prev_active = running.get("prev_active")
     setter = getattr(client, "set_holiday", None)
     if setter is not None:
         try:
@@ -2325,7 +2473,19 @@ def start_holiday(
                 request, zone_id, client, _NEW_EDITOR, status_code=502,
                 holiday_error=f"The hub didn't accept the holiday: {exc}",
             )
-    holidays.set(zone_id, until=f"{until:%Y-%m-%dT%H:%M}", arrival_temp=arrival, prev_setpoint=prev)
+    holidays.set(zone_id, until=f"{until:%Y-%m-%dT%H:%M}", arrival_temp=arrival, prev_setpoint=prev,
+                 prev_active=prev_active)
+    if arrival is None and prev_active is not None:
+        # "Go back to the weekly schedule": the hub resumes the program when
+        # the hold ends, so the app records it as on too, or its program check
+        # would switch it off again afterwards (owner decision 2026-11-26). A
+        # zone whose program the app has never set stays unmanaged.
+        schedules.set_active(zone_id, True)
+    elif running and running.get("arrival_temp") is None and prev_active is not None:
+        # The hold that switched the program on is replaced by one that ends
+        # at a temperature: put the flag back. No push during the hold; the
+        # program check corrects the hub once it is over.
+        schedules.set_active(zone_id, prev_active)
     return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)
 
 
@@ -2334,6 +2494,7 @@ def cancel_holiday(
     request: Request, zone_id: str, client: HearthClient = Depends(get_client)
 ) -> Response:
     _check_zone(zone_id)
+    flag_changed = False
     clearer = getattr(client, "clear_holiday", None)
     if clearer is not None:
         try:
@@ -2345,14 +2506,24 @@ def cancel_holiday(
                 request, zone_id, client, _NEW_EDITOR, status_code=502,
                 holiday_error=f"The hub didn't cancel the holiday: {exc}. Try again shortly.",
             )
-        # Cancelling was seen live to leave the zone at its holiday level, so
-        # restore the target it had, unless a weekly program is driving it.
+        # Cancelling undoes the holiday: the program on/off goes back to what it
+        # was (starting one with "back to the weekly schedule" switched it on),
+        # and as cancelling was seen live to leave the zone at its holiday
+        # level, the target it had is restored unless a program drives it.
         record = holidays.get(zone_id)
         prev = record.get("prev_setpoint") if record else None
+        # Only a hold that switched the program on ("back to the weekly
+        # schedule") puts it back; a change the user made meanwhile stays.
+        prev_active = record.get("prev_active") if record and record.get("arrival_temp") is None else None
+        flag_changed = prev_active is not None and schedules.get_active(zone_id) != prev_active
+        if flag_changed:
+            schedules.set_active(zone_id, prev_active)
         if prev is not None and schedules.get_active(zone_id) is not True:
             try:
                 client.set_temperature(zone_id, prev)
             except HearthError:
                 pass  # the hold is cleared; the target can be set by hand
     holidays.clear(zone_id)
+    if flag_changed:
+        _request_sync(client, zone_id)  # the hub's clear resumes the program: push ours
     return RedirectResponse(f"/zones/{zone_id}/schedule", status_code=303)

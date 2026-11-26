@@ -143,6 +143,11 @@ The pattern is saved and pushed to the hub. If a radiator is asleep when you
 save, HearthMage keeps trying in the background: after a minute at first, then
 less often (up to every 30 minutes) while the radiator stays unreachable.
 
+HearthMage also checks once an hour that each radiator's program is still on
+or off the way you set it here. If something else changed it (the
+manufacturer's app, for example), HearthMage switches it back. The check is
+skipped while a holiday is set.
+
 **Why days can show "Not programmed":** the manufacturer's own app writes
 schedules in a way that can't be read back reliably over the local network. So a
 day may show as "not programmed" even if the hub is running one. Once you set a

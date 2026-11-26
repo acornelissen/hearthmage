@@ -176,8 +176,9 @@ class ScheduleStore:
             return sorted(ids, key=int)
 
     def get_active(self, zone_id: str) -> bool | None:
-        """Whether this zone's program is running, as last set from this app
-        (the hub does not report it over the LAN). None if never set."""
+        """Whether this zone's program should run, as last set from this app
+        (the source of truth; the sync reads the hub's back and corrects it).
+        None if never set."""
         with self._lock:
             val = self._data.get(_ACTIVE_KEY, {}).get(str(zone_id))
             return bool(val) if val is not None else None

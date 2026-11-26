@@ -62,7 +62,13 @@ class FakeHearthClient:
         room = self._get(room_id)
         whole = int(room.current_temp or 0)
         tenths = int(round(((room.current_temp or 0) - whole) * 10))
-        return f"OK,{whole},{tenths},{int(room.target_temp or 0)},12,0,0,0,11,50,0,0,0,0,1,0,44,244,0,30,v000000"
+        program = 11 if self.read_program_active(room_id) else 253  # *?F field 8
+        return (f"OK,{whole},{tenths},{int(room.target_temp or 0)},12,0,0,0,{program},50,"
+                "0,0,0,0,1,0,44,244,0,30,v000000")
+
+    def read_program_active(self, room_id: str) -> bool | None:
+        self._get(room_id)
+        return self.program_active.get(room_id, True)  # live radiators started with it on
 
     def read_cloud_reporting(self) -> bool:
         return self.cloud_reporting

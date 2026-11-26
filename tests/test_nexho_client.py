@@ -930,6 +930,36 @@ def test_read_status_raw_returns_the_f_reply(monkeypatch):
         make_client({"R#1#1#0#0*?F/": "ER,1"}).read_status_raw("1")
 
 
+def test_read_program_active_reads_status_field_8(monkeypatch):
+    """Live 2026-11-26, zone 4: field 8 read 11 with the program on, 253 after
+    *OFF and 11 again after *ON."""
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc.time, "sleep", lambda s: None)
+    on = "OK,5,7,5,20,18,27,3,11,58,0,0,0,0,1,0,44,244,0,61,v200110"
+    off = "OK,5,7,7,20,19,0,3,253,58,0,0,0,0,1,0,44,244,0,61,v200110"
+    assert make_client({"R#4#1#0#0*?F/": on}).read_program_active("4") is True
+    assert make_client({"R#4#1#0#0*?F/": off}).read_program_active("4") is False
+    # A value never seen live (the vendor reads "> 11" as off) is unknown.
+    unseen = off.replace(",253,", ",12,")
+    assert make_client({"R#4#1#0#0*?F/": unseen}).read_program_active("4") is None
+    with pytest.raises(HearthError):  # a non-number is not a program state
+        make_client({"R#4#1#0#0*?F/": off.replace(",253,", ",x,")}).read_program_active("4")
+
+
+def test_read_program_active_needs_two_reads_that_agree(monkeypatch):
+    import hearthmage.nexho_client as nc
+
+    monkeypatch.setattr(nc.time, "sleep", lambda s: None)
+    on = "OK,5,7,5,20,18,27,3,11,58,0,0,0,0,1,0,44,244,0,61,v200110"
+    off = "OK,5,7,7,20,19,0,3,253,58,0,0,0,0,1,0,44,244,0,61,v200110"
+    replies = iter([on, off, off, on])
+    client = make_client({})
+    client._ask = lambda cmd, *a, **k: next(replies)  # type: ignore[method-assign]
+    with pytest.raises(HearthError):
+        client.read_program_active("4")  # on, then off: no agreement
+
+
 def test_ask_only_listens_to_the_hub(monkeypatch):
     """The socket is connected to the hub, so the OS drops datagrams from any
     other address (a spoofed reply on the LAN cannot answer for the hub)."""
